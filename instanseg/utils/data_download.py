@@ -59,7 +59,7 @@ def create_processed_datasets_dir(*others) -> Path:
     return path
 
     
-def load_Cellpose(Segmentation_Dataset: dict, verbose: bool = True) -> dict:
+def load_Cellpose(Segmentation_Dataset: dict, verbose: bool = True, rescale_labels = True) -> dict:
 
     from instanseg.utils.augmentations import Augmentations
     from instanseg.utils.pytorch_utils import torch_fastremap
@@ -79,10 +79,13 @@ def load_Cellpose(Segmentation_Dataset: dict, verbose: bool = True) -> dict:
             _, area = np.unique(labels[labels > 0], return_counts=True)
             augmenter = Augmentations(shape=(2, 2))
             input_tensor, labels = augmenter.to_tensor(image, labels, normalize=False)
-            tensor, labels = augmenter.torch_rescale(input_tensor, labels, current_pixel_size=0.5 / ((np.median(area) ** 0.5) / (300 ** 0.5)), requested_pixel_size=0.5, crop=False)
+
+            if rescale_labels:
+                input_tensor, labels = augmenter.torch_rescale(input_tensor, labels, current_pixel_size=0.5 / ((np.median(area) ** 0.5) / (300 ** 0.5)), requested_pixel_size=0.5, crop=False)
+          #  input_tensor, labels = augmenter.torch_rescale(input_tensor, labels, current_pixel_size=0.5 / ((np.median(area) ** 0.5) / (300 ** 0.5)), requested_pixel_size=0.5, crop=False)
 
             item['cell_masks'] = torch_fastremap(labels).squeeze()
-            item['image'] = fastremap.refit(np.array(tensor.byte()))
+            item['image'] = fastremap.refit(np.array(input_tensor.byte()))
             item["parent_dataset"] = "cellpose"
             item['licence'] = "Non-Commercial"
             item['image_modality'] = "Fluorescence"

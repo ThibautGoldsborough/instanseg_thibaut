@@ -68,6 +68,7 @@ parser.add_argument("-f","--f", default = None, type = str, help = "ignore, this
 parser.add_argument('-rng_seed', '--rng_seed', default=None, type=int, help = "Optional seed for the random number generator")
 parser.add_argument('-use_deterministic', '--use_deterministic', default=False, type=lambda x: (str(x).lower() == 'true'), help = "Whether to use deterministic algorithms (default=False)")
 parser.add_argument('-tile', '--tile_size', default=256, type=int, help = "Tile sizes for the input images")
+parser.add_argument('-use_interp_predictor', '--use_interp_predictor', default=False, type=lambda x: (str(x).lower() == 'true'))
 
 
 def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name='output_epoch'):
@@ -220,7 +221,8 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
                         n_sigma=n_sigma,
                         cells_and_nuclei=args.cells_and_nuclei, 
                         to_centre = args.to_centre, 
-                        window_size = args.window_size, 
+                        window_size = args.window_size,
+                        tile_size=args.tile_size, 
                         dim_coords= args.dim_coords, 
                         multi_centre= args.multi_centre, 
                         feature_engineering_function=args.feature_engineering )  # binary_xloss, lovasz_hinge dice_loss general_dice_loss
@@ -244,9 +246,11 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
 
     model = build_model_from_dict(args_dict)
 
-    from instanseg.utils.models.InstanSeg_UNet import InterpolationPredictor
+    if args.use_interp_predictor:
 
-    model = InterpolationPredictor(model)
+        from instanseg.utils.models.InstanSeg_UNet import InterpolationPredictor
+
+        model = InterpolationPredictor(model)
     # from fvcore.nn import FlopCountAnalysis
     # flops = FlopCountAnalysis(model, torch.randn(1,3,256,256))
     # print("Number of flops:",flops.total()/1e9)
