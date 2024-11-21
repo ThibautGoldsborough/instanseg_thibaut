@@ -197,6 +197,45 @@ class InstanSeg_UNet(nn.Module):
         return torch.cat([decoder(x,skips) for decoder in self.decoders],dim = 1)
 
 
+
+from torch.nn.functional import interpolate
+import torchvision
+class InterpolationPredictor(nn.Module):
+    def __init__(self, instanseg):
+        super(InterpolationPredictor, self).__init__()
+        
+        self.encoder = torchvision.models.mobilenet_v3_small(weights=None)
+        self.fc1 = nn.Linear(1000, 64)
+        self.fc2 = nn.Linear(64, 1)
+        self.max_s = 2 #could increase to 4
+        self.instanseg = instanseg
+
+        self.net = nn.Sequential(
+            self.encoder,
+            self.fc1,
+            nn.ReLU(),
+            self.fc2,
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b,c,h,w = x.shape
+        scale = self.net(x) * 3 + 1 # Predict scale factor in range [1, 4]
+
+        theta = torch.tensor([[1, 0, 0], [0, 1, 0]]).to(x.device).unsqueeze(0).repeat(b, 1, 1).float()
+        grid = F.affine_grid(theta, size=(b, c, h * self.max_s, w * self.max_s), align_corners=True)
+
+        grid_down = grid.requires_grad_(True) * scale[:,:,None,None]
+        x = F.grid_sample(x, grid_down, mode='bilinear', align_corners=True, padding_mode='zeros')
+
+        x = self.instanseg(x)
+        grid_up = grid.requires_grad_(False) * (1/scale)[:,:,None,None]
+        x = F.grid_sample(x, grid_up , mode='bilinear', align_corners=True, padding_mode='zeros')
+        x = interpolate(x, size=(h,w), mode='bilinear')
+
+        return x
+    
+
 if __name__ == "__main__":
 
     import pdb
@@ -207,3 +246,6 @@ if __name__ == "__main__":
     )
 
     print(net(torch.randn(1,3,256,256)).shape)
+
+
+
