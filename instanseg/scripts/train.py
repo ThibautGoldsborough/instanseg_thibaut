@@ -67,6 +67,7 @@ parser.add_argument('-f_e', '--feature_engineering', default="0", type=str, help
 parser.add_argument("-f","--f", default = None, type = str, help = "ignore, this is for jypyter notebook compatibility")
 parser.add_argument('-rng_seed', '--rng_seed', default=None, type=int, help = "Optional seed for the random number generator")
 parser.add_argument('-use_deterministic', '--use_deterministic', default=False, type=lambda x: (str(x).lower() == 'true'), help = "Whether to use deterministic algorithms (default=False)")
+parser.add_argument('-tile', '--tile_size', default=256, type=int, help = "Tile sizes for the input images")
 
 
 def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name='output_epoch'):
