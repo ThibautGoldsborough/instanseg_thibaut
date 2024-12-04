@@ -1161,10 +1161,133 @@ def load_BSST265(Segmentation_Dataset: dict, verbose: bool = True) -> dict:
         item['licence'] = "CC0"
         item['pixel_size'] = pixel_size
         item['nuclei_channels'] = [0]  
+        item['image_modality'] = "Fluorescence"
         items.append(item)
     np.random.seed(42) 
     np.random.shuffle(items)
     Segmentation_Dataset['Train']+=items[:int(len(items)*0.8)]
     Segmentation_Dataset['Validation']+=items[int(len(items)*0.8):int(len(items)*0.9)]
     Segmentation_Dataset['Test']+=items[int(len(items)*0.9):]
+    return Segmentation_Dataset
+
+
+import json
+import numpy as np
+from shapely.geometry import shape, Polygon
+from rasterio.features import rasterize
+from skimage.io import imsave
+from pathlib import Path
+
+def geojson_to_label_image(geojson_data: dict, image_shape: tuple):
+    # Prepare an empty label image
+    label_image = np.zeros(image_shape, dtype=np.uint16)
+    
+    # Initialize label counter
+    label_id = 1
+    
+    # Iterate over each feature in the GeoJSON data
+    for feature in geojson_data['features']:
+        # Parse the geometry to get a polygon
+        polygon_geom = shape(feature['geometry'])
+        
+        # Rasterize the polygon onto the label image
+        mask = rasterize(
+            [(polygon_geom, label_id)],
+            out_shape=image_shape,
+            fill=0,
+            default_value=label_id,
+            dtype=np.uint16
+        )
+        
+        # Add the mask to the label image
+        label_image[mask > 0] = mask[mask > 0]
+        label_id += 1  # Increment label ID for the next polygon
+
+    return label_image
+    
+
+
+
+def load_HPA_Segmentation(Segmentation_Dataset: dict, verbose: bool = True) -> dict:
+
+    import json
+    hpa_dir = create_raw_datasets_dir("Cell_Segmentation", "HPA")
+    zip_file_path = hpa_dir / "HPA_Segmentation.zip"
+    download_url = "https://zenodo.org/records/4430893/files/hpa_cell_segmentation_dataset_v2_512x512_4train_159test.zip?download=1"
+    
+    
+    if not zip_file_path.exists():
+        # Download the dataset using requests
+        if verbose:
+            print(f"Downloading dataset from {download_url} to {zip_file_path}...")
+        response = requests.get(download_url, stream=True)
+        response.raise_for_status()
+        with open(zip_file_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        if verbose:
+            print("Download completed.")
+        
+        # Unzip the dataset
+        if verbose:
+            print(f"Unzipping dataset to {hpa_dir / 'HPA'}...")
+        with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
+            zip_ref.extractall(hpa_dir / 'HPA')
+        if verbose:
+            print("Unzipping completed.")
+        output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Traverse through each sample directory in the test folder
+    test_dir = hpa_dir / "HPA/hpa_dataset_v2" / "test"
+    train_dir = hpa_dir / "HPA/hpa_dataset_v2" / "train"
+    sample_dirs = [d for d in test_dir.iterdir() if d.is_dir()] + [d for d in train_dir.iterdir() if d.is_dir()]
+    
+    items = []
+    for sample_dir in tqdm(sample_dirs):
+        sample_name = sample_dir.name
+        # Load each image channel
+        channel_images = []
+        
+        # Define paths for each image channel
+        channels = [ "er.png", "microtubules.png", "nuclei.png", "protein.png"]
+        for channel in channels:
+            channel_path = sample_dir / channel
+            if channel_path.exists():
+                image = io.imread(channel_path)
+                channel_images.append(image)
+
+        # Stack channels into a single multi-channel image
+        multi_channel_image = np.stack(channel_images)
+        
+        # Load annotation.json and convert to label image
+        annotation_path = sample_dir / "annotation.json"
+        with open(annotation_path, "r",encoding="utf-8-sig") as f:
+            annotation_data = json.load(f)
+        
+        # Create label image from JSON data
+        # Assuming JSON contains a list of labeled regions, e.g., {"cells": [{"label": 1, "coordinates": [...]}, ...]}
+        label_image = geojson_to_label_image(annotation_data, multi_channel_image.shape[-2:])
+
+        item = {}
+
+        susbsammpling = 2
+        image = multi_channel_image[:,::susbsammpling,::susbsammpling]
+        masks = label_image[::-susbsammpling,::susbsammpling]
+        item['cell_masks'] = masks
+        item['image'] = image
+        item["parent_dataset"] = "HPA"
+        item['licence'] = "CC BY 4.0"
+        item['pixel_size'] = 0.08 * susbsammpling
+        item['nuclei_channels'] = [2]  
+        item['channel_names'] = ["ER", "Microtubules", "Nuclei", "Protein"]
+        item['image_modality'] = "Fluorescence"
+        items.append(item)
+    
+    # Split dataset into training, validation, and test sets
+    np.random.seed(42)
+    np.random.shuffle(items)
+    Segmentation_Dataset['Train'] += items[:int(len(items) * 0.8)]
+    Segmentation_Dataset['Validation'] += items[int(len(items) * 0.8):int(len(items) * 0.9)]
+    Segmentation_Dataset['Test'] += items[int(len(items) * 0.9):]
+    
     return Segmentation_Dataset

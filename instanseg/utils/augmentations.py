@@ -170,7 +170,11 @@ class Augmentations(object):
 
             normalizer.HERef += (torch.rand_like(normalizer.HERef) - 0.5) * normalizer.HERef * amount
             normalizer.maxCRef += (torch.rand_like(normalizer.maxCRef) - 0.5) * normalizer.maxCRef * amount
+<<<<<<< Updated upstream
             norm, H, E = normalizer.normalize(I=tensor, stains=True, Io=240)
+=======
+            norm, _, _ = normalizer.normalize(I=tensor, stains=False, Io=240, beta=0.15)
+>>>>>>> Stashed changes
         except:
             return image,labels
 
@@ -785,7 +789,10 @@ class Augmentations(object):
                 c_nuclei = self.nuclei_channel
 
             if "pixel_size" in meta.keys():
-                pixel_size = meta["pixel_size"]
+                if type(meta["pixel_size"]) == str and "pixel" in meta["pixel_size"]:
+                    pixel_size = 0.5 #bug in tissuenet
+                else: 
+                    pixel_size = float(meta["pixel_size"])
             else:
                 pixel_size = None
 
@@ -823,9 +830,10 @@ class Augmentations(object):
 
                 elif augmentation == "channel_subsample":
                     _, (min_channels, max_channels) = values
-                    image, labels, c_nuclei = self.channel_subsample(image, labels, max_channels=max_channels + 1,
+                    image, labels, c_nuclei = self.channel_subsample(image, labels, max_channels=max_channels,
                                                                      c_nuclei=c_nuclei, min_channels=min_channels,
                                                                      metadata=metadata)
+           
                 elif augmentation == "extract_nucleus_and_cytoplasm_channels":
                     image, labels, c_nuclei = self.extract_nucleus_and_cytoplasm_channels(image, labels,
                                                                                           c_nuclei=c_nuclei,
@@ -852,8 +860,14 @@ class Augmentations(object):
 
                     image, labels = getattr(self, augmentation)(image, labels, amount=amount, metadata=metadata)
 
+<<<<<<< Updated upstream
                 assert not image.isnan().any()
         
+=======
+                assert not image.isnan().any(), pdb.set_trace()
+
+      #  print("hellp")
+>>>>>>> Stashed changes
 
         image, labels = self.duplicate_grayscale_channels(image,
                                                           labels,

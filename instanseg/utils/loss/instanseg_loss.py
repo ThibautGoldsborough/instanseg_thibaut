@@ -257,8 +257,6 @@ def has_pixel_classifier_model(model):
     return False
 
 
-
-
 def merge_sparse_predictions(x: torch.Tensor, coords: torch.Tensor, mask_map: torch.Tensor, size : list[int], mask_threshold: float = 0.5, window_size = 128, min_size = 10, overlap_threshold = 0.5, mean_threshold = 0.5):
 
     # top_left = window_slices[:,0,:]
@@ -340,6 +338,61 @@ def guide_function(params: torch.Tensor,device ='cuda', width: int = 256):
     return torch.sin(xx+yy+params[:,2,None,None])[None]
 
 
+def generate_random_3d_slice(depth, height, width, device = "cuda", return_volume = False):
+
+    if return_volume:
+        # Step 1: Generate the 3D grid coordinates
+        xx = torch.linspace(0, width * 64 / 256, width, device=device).view(1, 1, -1).expand(depth, height, width)
+        yy = torch.linspace(0, height * 64 / 256, height, device=device).view(1, -1, 1).expand(depth, height, width)
+        zz = torch.linspace(0, depth * 64 / 256, depth, device=device).view(-1, 1, 1).expand(depth, height, width)
+
+        return torch.stack((xx, yy, zz), dim=0)
+
+    # Define the square corners
+    normal = torch.rand(3) - 0.5
+    normal = normal / torch.linalg.norm(normal)
+ 
+    point_on_plane = torch.ones(3)  # Center point on the plane
+ 
+    v1 = torch.rand(3) - 0.5
+    v1 = v1 - torch.dot(v1, normal) * normal  # Make v1 orthogonal to the normal
+    v1 = v1 / torch.linalg.norm(v1)
+ 
+    v2 = torch.cross(normal, v1)  # Generate orthogonal vector
+    v2 = v2 / torch.linalg.norm(v2)
+ 
+    size = 1
+    corners = torch.stack([
+        point_on_plane + size * (-v1 - v2) / 2,
+        point_on_plane + size * (v1 - v2) / 2,
+        point_on_plane + size * (v1 + v2) / 2,
+        point_on_plane + size * (-v1 + v2) / 2
+    ]).to(device)  # Shape: (4, 3)
+ 
+    # Create a meshgrid for interpolation
+    s = torch.linspace(0, 1, width, device=device)
+    t = torch.linspace(0, 1, width, device=device)
+    s, t = torch.meshgrid(s, t, indexing='ij')  # Match NumPy's 'ij' indexing
+ 
+    # Expand s, t to enable broadcasting for interpolation
+    s = s.unsqueeze(0)  # Shape: (1, width, width)
+    t = t.unsqueeze(0)  # Shape: (1, width, width)
+ 
+    # Compute the bilinear interpolation
+    meshgrid = (
+        (1 - s) * (1 - t) * corners[0].view(3, 1, 1) +  # Contribution from corner 0
+        s * (1 - t) * corners[1].view(3, 1, 1) +        # Contribution from corner 1
+        s * t * corners[2].view(3, 1, 1) +              # Contribution from corner 2
+        (1 - s) * t * corners[3].view(3, 1, 1)          # Contribution from corner 3
+    )  # Shape: (3, width, width)
+ 
+    # Convert meshgrid to float tensors (if needed for plotting later)
+    meshgrid = meshgrid.float() * torch.tensor([width* 64 / 256, height* 64 / 256, depth* 64 / 256], device=device).view(3, 1, 1)
+ 
+    return meshgrid.to(device)
+
+
+
 def generate_coordinate_map(mode: str = "linear", spatial_dim: int = 2, height: int = 256, width: int = 256, device: torch.device = torch.device(type='cuda')):
 
     if mode == "linear":
@@ -352,13 +405,20 @@ def generate_coordinate_map(mode: str = "linear", spatial_dim: int = 2, height: 
             xx = torch.linspace(0, width * 64 / 256, width, device=device).view(1, 1, -1).expand(1, height,width)
             yy = torch.linspace(0, height * 64 / 256, height, device=device).view(1, -1, 1).expand(1, height, width)
             zz = torch.zeros_like(xx).expand(spatial_dim - 2,-1,-1)
-            xxyy = torch.cat((xx, yy,zz), 0)
+
+            xxyy = torch.cat((xx, yy,zz), 0) * 0
+
+         #        xxyy = generate_random_3d_slice(spatial_dim, height, width, device, return_volume = True)
+           # xxyy = generate_random_3d_slice(height, height, width, device)
+
+           # show_images(*xxyy)
+            
+
         else:
             xxyy = torch.zeros((spatial_dim, height, width), device=device) #NOT IMPLEMENTED - THIS IS JUST A DUMMY VALUE
 
     else:
         xxyy = torch.zeros((spatial_dim, height, width), device=device) #NOT IMPLEMENTED - THIS IS JUST A DUMMY VALUE
-
 
     return xxyy
 
@@ -486,7 +546,7 @@ def feature_engineering_slow(x: torch.Tensor, c: torch.Tensor, sigma: torch.Tens
 
 
 
-def feature_engineering_2(x: torch.Tensor, xxyy: torch.Tensor, c: torch.Tensor, sigma: torch.Tensor, window_size: int,
+def feature_engineering_2(x: torch.Tensor, c: torch.Tensor, sigma: torch.Tensor, window_size: int,
                         mesh_grid_flat: torch.Tensor):
     
     # EXTRA DIFF
@@ -513,6 +573,34 @@ def feature_engineering_2(x: torch.Tensor, xxyy: torch.Tensor, c: torch.Tensor, 
     x = x.reshape((x.shape[0] * x.shape[1]), x.shape[2])  # C*H*W,E+S+1
 
     return x
+
+
+
+def feature_engineering_dist(x: torch.Tensor, c: torch.Tensor, sigma: torch.Tensor, window_size: int,
+                        mesh_grid_flat: torch.Tensor):
+    # EXTRA DIFF
+    E = x.shape[0]
+    h, w = x.shape[-2:]
+    C = c.shape[0]
+    S = sigma.shape[0]
+ 
+    x_slices = x[:, mesh_grid_flat[0], mesh_grid_flat[1]].reshape(E, C, 2 * window_size, 2 * window_size).permute(1, 0, 2,3)  # C,E,2*window_size,2*window_size
+    sigma_slices = sigma[:, mesh_grid_flat[0], mesh_grid_flat[1]].reshape(S, C, 2 * window_size, 2 * window_size).permute(1,
+                                                                                                                          0,
+                                                                                                                          2,
+                                                                                                                          3)  # C,S,2*window_size,2*window_size
+    c_shaped = c.reshape(-1, E, 1, 1)
+ 
+    norm = torch.sqrt(torch.sum(torch.pow(x_slices - c_shaped, 2) + 1e-6, dim=1, keepdim=True))  # C,1,H,W
+ 
+    x = torch.cat([norm,sigma_slices], dim=1)  # C,E+S+1,H,W
+ 
+    x = x.flatten(2).permute(0, -1, 1)  # C,H*W,E+S+1
+    x = x.reshape((x.shape[0] * x.shape[1]), x.shape[2])  # C*H*W,E+S+1
+ 
+    return x
+
+
 
 def feature_engineering_3(x: torch.Tensor, xxyy: torch.Tensor, c: torch.Tensor, sigma: torch.Tensor, window_size: int,
                         mesh_grid_flat: torch.Tensor):
@@ -578,11 +666,11 @@ def feature_engineering_generator(feature_engineering_function):
         return feature_engineering_3, 2
     elif feature_engineering_function == "10":
         return feature_engineering_10, 2
+    elif feature_engineering_function == "dist":
+        return feature_engineering_dist, 0
 
     else:
         raise NotImplementedError("Feature engineering function",feature_engineering_function,"is not implemented")
-
-
 
 
 
@@ -622,13 +710,17 @@ class InstanSeg(nn.Module):
         self.num_instance_cap = 50
         self.sort_by_eccentricity = False
 
+<<<<<<< Updated upstream
         xxyy = generate_coordinate_map(mode = "linear", spatial_dim = self.dim_coords, height = tile_size, width = tile_size, device = device)
+=======
+        
+>>>>>>> Stashed changes
 
         self.feature_engineering, self.feature_engineering_width = feature_engineering_generator(feature_engineering_function)
         self.feature_engineering_function = feature_engineering_function
 
 
-        self.register_buffer("xxyy", xxyy)
+      #  self.register_buffer("xxyy", xxyy)
 
         self.update_binary_loss(binary_loss_fn_str)
 
@@ -751,7 +843,9 @@ class InstanSeg(nn.Module):
         batch_size, height, width = prediction.size(
             0), prediction.size(2), prediction.size(3)
 
-        xxyy = self.xxyy[:, 0:height, 0:width].contiguous()  # 2 x h x w
+        xxyy = generate_coordinate_map(mode = "linear", spatial_dim = self.dim_coords, height = 256, width = 256, device = prediction.device)
+
+        xxyy = xxyy[:, 0:height, 0:width].contiguous()  # 2 x h x w
 
         loss = 0
   
@@ -956,6 +1050,8 @@ class InstanSeg(nn.Module):
 
                 xxyy = generate_coordinate_map(mode = "linear", spatial_dim = self.dim_coords, height = height, width = width, device = device)
 
+               # print(xxyy.shape)
+
                 #torch.cuda.synchronize()
 
                 if not self.to_centre:
@@ -998,7 +1094,7 @@ class InstanSeg(nn.Module):
                     continue
 
                 
-                C = fields_at_centroids.shape[0]
+                C = fields_at_centroids.shape[1]
 
                 h, w = mask_map.shape[-2:]
                 window_size = min(window_size, h, w)
@@ -1008,6 +1104,8 @@ class InstanSeg(nn.Module):
                     label = torch.zeros(mask_map.shape, dtype=int, device=mask_map.device).squeeze()
                     labels.append(label)
                     continue
+
+                #print(fields_at_centroids.shape)
 
                 #torch.cuda.synchronize()
                 crops, coords = compute_crops(fields, 

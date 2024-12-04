@@ -249,6 +249,7 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
     # from fvcore.nn import flop_count_str
     # print(flop_count_str(flops))
 
+
     if args.loss_function in ["instanseg_loss"]:
         from instanseg.utils.loss.instanseg_loss import has_pixel_classifier_model
 

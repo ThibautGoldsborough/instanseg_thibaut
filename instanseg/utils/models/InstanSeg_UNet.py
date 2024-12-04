@@ -103,11 +103,14 @@ class DecoderBlock(nn.Module):
         self.conv3 = conv_norm_act(out_channels, out_channels, 3,norm,act)
         self.conv4 = conv_norm_act(out_channels, out_channels, 3,norm,act)
 
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear')
+
         if shallow:
             self.conv3 = nn.Identity()
 
     def forward(self, x, skip=None):
-        x = F.interpolate(x, scale_factor=2, mode="nearest")
+      #  print("heehhee")
+        x = self.upsample(x)
         proj = self.conv0(x)
         x = self.conv1(x)
         x =  proj + self.conv2(x + self.conv_skip(skip))
@@ -131,6 +134,7 @@ class EncoderBlock(nn.Module):
             self.maxpool = nn.MaxPool2d(2, 2)
         else:
             self.maxpool = nn.Identity()
+
         self.conv0 = conv_norm_act(in_channels, out_channels, 1,norm,act)
         self.conv1 = conv_norm_act(in_channels, out_channels, 3,norm,act)
         self.conv2 = conv_norm_act(out_channels, out_channels, 3,norm,act)
@@ -175,7 +179,7 @@ class InstanSeg_UNet(nn.Module):
     def __init__(self,in_channels,out_channels,layers = [256,128,64,32],norm = "BATCH",dropout = 0, act = "ReLu"):
         super().__init__()
         layers = layers[::-1]
-        self.encoder = nn.ModuleList([EncoderBlock(in_channels,layers[0],pool = False,norm = norm, act = act)] + [EncoderBlock(layers[i],layers[i+1],norm = norm, act = act) for i in range(len(layers)-1)])
+        self.encoder = nn.ModuleList([EncoderBlock(in_channels ,layers[0],pool = False,norm = norm, act = act)] + [EncoderBlock(layers[i],layers[i+1],norm = norm, act = act) for i in range(len(layers)-1)])
         layers = layers[::-1]
 
         # out_channels should be a list of lists [[2,2,1],[2,2,1]] means two decoders, each with 3 output blocks. The output will be of shape 10.
@@ -188,7 +192,9 @@ class InstanSeg_UNet(nn.Module):
         self.decoders = nn.ModuleList([Decoder(layers,out_channel,norm, act) for out_channel in out_channels])
     
     def forward(self,x):
+
         skips = []
+
         for n,layer in enumerate(self.encoder):
             x = layer(x)
             if n < len(self.encoder)-1:

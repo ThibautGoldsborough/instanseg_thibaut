@@ -35,7 +35,7 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                     ("to_tensor", [1]),
                     ("normalize", [1]), #Probability
                     ("torch_rescale", [1,pixel_size, 0]),#in microns per pixel,
-                    ("channel_subsample", [0, (5 if channel_invariance else dim_in , 20 if channel_invariance else dim_in)]),  #proba,(min,max) #(1, 1)]), #
+                    ("channel_subsample", [1, (5 if channel_invariance else dim_in , 20 if channel_invariance else dim_in)]),  #proba,(min,max) #(1, 1)]), #
                     ("flips", [1]),
                     ("rotate", [1]),
                 ]) 
@@ -51,7 +51,7 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                     ("to_tensor", [1]),
                     ("normalize", [1]), #Probability
                     ("torch_rescale", [1,pixel_size, 0]),#in microns per pixel
-                    ("channel_subsample", [0, (5 if channel_invariance else dim_in , 20 if channel_invariance else dim_in)]),  #proba,(min,max)  (1, 1)]), #
+                    ("channel_subsample", [1, (5 if channel_invariance else dim_in , 20 if channel_invariance else dim_in)]),  #proba,(min,max)  (1, 1)]), #
                     ("flips", [1])
                 ])
             }
@@ -63,8 +63,13 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
             "train": {
                 "Brightfield": collections.OrderedDict([
                     ("to_tensor", [1]), #Probability
+<<<<<<< Updated upstream
                     ("normalize_HE_stains", [0.1, amount*0]), #Probability/Amount, make sure this goes in front of normalize
                     ("extract_hematoxylin_stain", [0.1, amount*0]), #Probability/Amount ,make sure this goes in front of normalize
+=======
+                    ("normalize_HE_stains", [1, amount*0]), #Probability/Amount, make sure this goes in front of normalize
+                    ("extract_eosin_stain", [1, amount*0]), #Probability/Amount ,make sure this goes in front of normalize
+>>>>>>> Stashed changes
                     ("normalize", [1]), #Probability
                     ("torch_rescale", [1,pixel_size, 0]),#in microns per pixel
                     ("randomJPEGcompression", [0.2, amount]),  #Probability/Amount

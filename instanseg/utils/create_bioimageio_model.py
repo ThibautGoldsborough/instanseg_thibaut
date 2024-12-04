@@ -71,8 +71,9 @@ def readme(model_name: str, model_dict: dict = None):
         f.write("The InstanSeg method is shared with an Apache-2.0 license.\n\n")
         f.write("""For an introduction & comparison to other approaches for nucleus segmentation in brightfield histology images, see: \n > Goldsborough, T. et al. (2024) InstanSeg: an embedding-based instance segmentation algorithm optimized for accurate, efficient and portable cell segmentation. _arXiv_. Available at: https://doi.org/10.48550/arXiv.2408.15954. \n\n To read about InstanSeg's extension to nucleus + full cell segmentation and support for fluorescence & multiplexed images, see: \n > Goldsborough, T. et al. (2024) A novel channel invariant architecture for the segmentation of cells and nuclei in multiplexed images using InstanSeg. _bioRxiv_, p. 2024.09.04.611150. Available at: https://doi.org/10.1101/2024.09.04.611150. \n""")
         f.write("\n This model was trained on the following datasets: \n")
-        
+
         if model_dict is not None and "source_dataset" in model_dict.keys():
+<<<<<<< Updated upstream
             for dataset in (model_dict["source_dataset"]).replace("[","").replace("]","").replace("'","").split(", "):
                 if dataset in dataset_dict.keys():
                     f.write(f"- {dataset} \n")
@@ -83,6 +84,17 @@ def readme(model_name: str, model_dict: dict = None):
                     f.write(f"  - License: Not specified \n")
                     f.write(f"  - URL: Not specified \n")
         
+=======
+                for dataset in (model_dict["source_dataset"]).replace("[","").replace("]","").replace("'","").split(", "):
+                    if dataset in dataset_dict.keys():
+                        f.write(f"- {dataset} \n")
+                        f.write(f"  - License: {dataset_dict[dataset][0]} \n")
+                        f.write(f"  - URL: {dataset_dict[dataset][1]} \n")
+                    else:
+                        f.write(f"- {dataset} \n")
+                        f.write(f"  - License: Not specified \n")
+                        f.write(f"  - URL: Not specified \n")
+>>>>>>> Stashed changes
 
         f.write("\n The user is responsible for ensuring that the model is used in accordance with the licenses of the source datasets. \n")
 
