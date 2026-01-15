@@ -1250,14 +1250,14 @@ class InstanSeg_Torchscript(nn.Module):
         self.index_dtype = torch.long #torch.int
 
         self.default_target_segmentation = self.params.get('target_segmentation', torch.tensor([1, 1]))
-        self.default_min_size = self.params.get('min_size', 10)
+        self.default_min_size = self.params.get('min_size', 20)
         self.default_mask_threshold = self.params.get('mask_threshold', 0.53)
         self.default_peak_distance = int(self.params.get('peak_distance', 5))
         self.default_seed_threshold = self.params.get('seed_threshold', 0.1)
         self.default_overlap_threshold = self.params.get('overlap_threshold', 0.3)
         self.default_mean_threshold = self.params.get('mean_threshold', 0.0)
         self.default_fg_threshold = self.params.get('fg_threshold', 0.5)
-        self.default_window_size = self.params.get('window_size',64) #32
+        self.default_window_size = self.params.get('window_size',32) #32
         self.default_cleanup_fragments = self.params.get('cleanup_fragments', True)
         self.default_resolve_cell_and_nucleus = self.params.get('resolve_cell_and_nucleus', True)
 
@@ -1412,16 +1412,23 @@ class InstanSeg_Torchscript(nn.Module):
 
                     x = x.reshape(C, 1, slice_size, slice_size)
 
+                    coords = mesh_grid_flat.reshape(2, C, slice_size, slice_size)
+
+                    if min_size > 0:
+                        valid_objects = (x >= mask_threshold).sum((2,3)).squeeze() > min_size
+                        x = x[valid_objects]
+                        coords = coords[:,valid_objects]
+                        mesh_grid_flat = coords.flatten(1)
+                        centroids = centroids[valid_objects]
+                        centroids_idx = centroids_idx[valid_objects]
+                        window_slices = window_slices[valid_objects]
+
                     C = x.shape[0]
 
                     if C == 0:
                         label = torch.zeros(mask_map.shape, dtype= torch.float32, device=mask_map.device).squeeze()
                         labels_list.append(label)
                         continue
-
-                    original_device = x.device
-
-                    coords = mesh_grid_flat.reshape(2, C, slice_size, slice_size)
 
                     if cleanup_fragments:
 
