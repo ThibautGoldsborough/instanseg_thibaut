@@ -8,6 +8,7 @@ from torchvision.transforms import RandomCrop, Resize, RandomPerspective
 from monai.transforms import RandGaussianNoise, AdjustContrast
 from instanseg.utils.utils import percentile_normalize, generate_colors
 import warnings
+warnings.filterwarnings("once", message="Pixel size not available.*")
 
 import time
 import fastremap
@@ -667,18 +668,37 @@ class Augmentations(object):
 
     def channel_subsample(self, image, labels=None, max_channels=None, c_nuclei=None, min_channels=1, metadata=None):
         channel_num = image.shape[0]
+        
+        def is_grayscale_tensor(img):
+            """Check if tensor image is grayscale (single channel or RGB with equal channels)."""
+            if img.shape[0] == 1:
+                return True
+            if img.shape[0] >= 3:
+                return torch.allclose(img[0], img[1]) and torch.allclose(img[1], img[2])
+            return False
 
         if channel_num > max_channels:
             if c_nuclei is None or c_nuclei > channel_num:
+                if max_channels == 1:
+                    if is_grayscale_tensor(image):
+                        # Grayscale stored as RGB, just take first channel
+                        return image[0:1], labels, 0
+                    raise ValueError(
+                        f"Image has {channel_num} channels but model expects 1 channel (dim_in=1). "
+                        "Please specify 'nuclei_channels' in the dataset metadata to indicate which channel to use.")
                 slice = np.random.choice(np.arange(channel_num), max_channels, replace=False)
             else:
                 if max_channels == 1:
                     slice = [c_nuclei]
                     c_nuclei = 0
                 else:
-
+                    # Number of extra channels besides nuclei: between (min-1) and (max-1)
+                    extra_min = max(0, min_channels - 1)
+                    extra_max = max_channels - 1
+                    n_extra = np.random.randint(extra_min, extra_max + 1) if extra_max >= extra_min else 0
+                    
                     slice = np.random.choice(np.arange(channel_num)[np.arange(channel_num) != c_nuclei],
-                                             np.random.randint(min_channels - 1, max_channels - 1), replace=False)
+                                             n_extra, replace=False)
 
                     np.random.shuffle(slice)
                     slice = np.append(slice, c_nuclei)
@@ -815,8 +835,20 @@ class Augmentations(object):
     def duplicate_grayscale_channels(self, image, labels, metadata=None):
         if self.debug:
             orig = torch.clone(image)
+        
+        def is_grayscale_tensor(img):
+            """Check if tensor image is grayscale (single channel or RGB with equal channels)."""
+            if img.shape[0] == 1:
+                return True
+            if img.shape[0] >= 3:
+                return torch.allclose(img[0], img[1]) and torch.allclose(img[1], img[2])
+            return False
+        
         if image.shape[0] == 1 and self.dim_in != 1 and not self.channel_invariant:
             image = image.repeat(self.dim_in, 1, 1)
+        elif image.shape[0] > 1 and self.dim_in == 1 and is_grayscale_tensor(image):
+            # Grayscale stored as RGB, convert to single channel
+            image = image[0:1]
         elif image.shape[0] != self.dim_in and not self.channel_invariant:
             raise ValueError(
                 "Image has {} channels, but model expects {}, check the augmentations pipeline!".format(image.shape[0],
@@ -862,15 +894,19 @@ class Augmentations(object):
             else:
                 c_nuclei = self.nuclei_channel
 
-            if "pixel_size" in meta.keys():
-                pixel_size = (meta["pixel_size"])
-            else:
-                pixel_size = None
+            pixel_size = meta.get("pixel_size")
             
-            if not isinstance((pixel_size),float):
-                import warnings
-                warnings.warn(f"Pixel size {pixel_size} is not a float {type(pixel_size)}, check metadata")
-                pixel_size = None
+            if not isinstance(pixel_size, float) or pixel_size is None:
+                avg_area = measure_average_instance_area(labels)
+                if avg_area > 0:
+                    # Cell masks are ~3x larger than nucleus masks
+                    if self.target_segmentation == "C":
+                        expected_area = 105  # ~35 µm² × 3 for cells
+                        warnings.warn("Pixel size not available, using pseudo pixel size based on average cell area (~105 µm²)")
+                    else:
+                        expected_area = 35  # ~35 µm² for nuclei
+                        warnings.warn("Pixel size not available, using pseudo pixel size based on average nucleus area (~35 µm²)")
+                    pixel_size = np.sqrt(expected_area / avg_area)
 
         if meta is not None and "channel_names" in meta.keys():
             from instanseg.utils.augmentation_config import markers_info
@@ -906,7 +942,7 @@ class Augmentations(object):
 
                 elif augmentation == "channel_subsample":
                     _, (min_channels, max_channels) = values
-                    image, labels, c_nuclei = self.channel_subsample(image, labels, max_channels=max_channels + 1,
+                    image, labels, c_nuclei = self.channel_subsample(image, labels, max_channels=max_channels,
                                                                      c_nuclei=c_nuclei, min_channels=min_channels,
                                                                      metadata=metadata)
                 elif augmentation == "extract_nucleus_and_cytoplasm_channels":
@@ -915,13 +951,14 @@ class Augmentations(object):
                                                                                           metadata=metadata)
 
                 elif augmentation == "torch_rescale":
-                    _, requested_pixel_size, diameter_range = values
-                    if not (isinstance(diameter_range, tuple) and len(diameter_range) == 3):
-                        diameter_range = None
+                    _, requested_pixel_size, pixel_size_range = values
+                    if isinstance(pixel_size_range, tuple) and len(pixel_size_range) == 2:
+                        # Randomly sample pixel size from range (min_ps, max_ps)
+                        min_ps, max_ps = pixel_size_range
+                        requested_pixel_size = min_ps + torch.rand(1).item() * (max_ps - min_ps)
                         
                     image, labels = self.torch_rescale(image, labels, current_pixel_size=None,
                                                        requested_pixel_size=requested_pixel_size, 
-                                                       diameter_range=diameter_range,
                                                        metadata=metadata)
 
                 elif augmentation == "colourize":
@@ -947,7 +984,6 @@ class Augmentations(object):
                                                           metadata=metadata)  # This will only catch single channel images fed to a multi channel network and duplicate the channel if required.
 
         if image.var() > 1e2:
-            import warnings
             image = torch.clip(image, min=-1, max=5)
             warnings.warn("Warning, variance of image is very high, check augmentations")
 

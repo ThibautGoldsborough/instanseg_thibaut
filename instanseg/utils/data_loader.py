@@ -15,6 +15,8 @@ def _keep_images(item, args):
         return False
     elif args.target_segmentation == "C" and "cell_masks" not in item.keys():
         return False
+    elif getattr(args, 'modality_filter', None) and item.get('image_modality', '').lower() != args.modality_filter.lower():
+        return False
     else:
         return True
     
@@ -272,7 +274,6 @@ def get_loaders(train_images_local, train_labels_local, val_images_local, val_la
                                               nuclei_channel=None, 
                                               amount=args.transform_intensity,
                                               pixel_size=args.requested_pixel_size,
-                                              mean_diameter=args.mean_object_diameter, 
                                               augmentation_type=args.augmentation_type)
 
     train_data = Segmentation_Dataset(train_images_local, 

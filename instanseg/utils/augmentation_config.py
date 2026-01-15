@@ -1,6 +1,6 @@
 import collections
 
-def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentation_type="minimal", mean_diameter = None):
+def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentation_type="minimal"):
 
     """
     This function returns the augmentation dictionary for the training and test sets.
@@ -19,12 +19,12 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
 
     channel_invariance = (dim_in is None or dim_in <= 0)
 
-    if mean_diameter is not None:
-         mean_diameter_heavy = (mean_diameter,2**(-2),2**(2))
-         mean_diameter_light = (mean_diameter,2**(-1),2**(1))
-    else:
-        mean_diameter_heavy = None
-        mean_diameter_light = None
+    # Pixel size range for augmentation (min_pixel_size, max_pixel_size)
+    pixel_size_range_light = (pixel_size * 0.9, pixel_size * 1.1) if pixel_size else None  # ±10%
+    pixel_size_range_heavy = (pixel_size * 0.5, pixel_size * 1.5) if pixel_size else None  # ±50%
+    
+    # Channel subsample probability: always run if dim_in==1 (to reduce multi-channel to 1), else skip
+    channel_subsample_prob = 1 if dim_in == 1 else 0
 
     if augmentation_type == "minimal":
 
@@ -33,15 +33,15 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                 "Brightfield": collections.OrderedDict([
                     ("to_tensor", [1]), #Probability
                     ("normalize", [1]), #Probability
-                    ("torch_rescale", [1,pixel_size, mean_diameter_light]),#in microns per pixel
+                    ("torch_rescale", [1,pixel_size, pixel_size_range_light]),#in microns per pixel
                     ("flips", [1]),#Probability
                     ("rotate", [1]),#Probability
                 ]),
                 "Fluorescence": collections.OrderedDict([
                     ("to_tensor", [1]),
                     ("normalize", [1]), #Probability
-                    ("torch_rescale", [1,pixel_size, mean_diameter_light]),#in microns per pixel,
-                    ("channel_subsample", [0, (5 if channel_invariance else dim_in , 20 if channel_invariance else dim_in)]),  #proba,(min,max) #(1, 1)]), #
+                    ("torch_rescale", [1,pixel_size, pixel_size_range_light]),#in microns per pixel,
+                    ("channel_subsample", [channel_subsample_prob, (dim_in, dim_in)]),  #proba,(min,max)
                     ("flips", [1]),
                     ("rotate", [1]),
                 ]) 
@@ -50,14 +50,14 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                 "Brightfield": collections.OrderedDict([
                     ("to_tensor", [1]),
                     ("normalize", [1]), #Probability
-                    ("torch_rescale", [1,pixel_size, mean_diameter_light]),#in microns per pixel
+                    ("torch_rescale", [1,pixel_size, pixel_size_range_light]),#in microns per pixel
                     ("flips", [1])
                 ]),
                 "Fluorescence": collections.OrderedDict([
                     ("to_tensor", [1]),
                     ("normalize", [1]), #Probability
-                    ("torch_rescale", [1,pixel_size, mean_diameter_light]),#in microns per pixel
-                    ("channel_subsample", [0, (5 if channel_invariance else dim_in , 20 if channel_invariance else dim_in)]),  #proba,(min,max)  (1, 1)]), #
+                    ("torch_rescale", [1,pixel_size, pixel_size_range_light]),#in microns per pixel
+                    ("channel_subsample", [channel_subsample_prob, (dim_in, dim_in)]),  #proba,(min,max)
                     ("flips", [1])
                 ])
             }
@@ -72,7 +72,7 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                 "Brightfield": collections.OrderedDict([
                     ("to_tensor", [1]), #Probability
                     ("normalize", [1]), #Probability
-                    ("torch_rescale", [1,pixel_size, mean_diameter_light]),#in microns per pixel
+                    ("torch_rescale", [1,pixel_size, pixel_size_range_light]),#in microns per pixel
                     ("flips", [1]),#Probability
                     ("rotate", [1]),#Probability
                     ("kornia_base_augmentations", [1]),
@@ -80,8 +80,8 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                 "Fluorescence": collections.OrderedDict([
                     ("to_tensor", [1]),
                     ("normalize", [1]), #Probability
-                    ("torch_rescale", [1,pixel_size, mean_diameter_light]),#in microns per pixel,
-                    ("channel_subsample", [0, (5 if channel_invariance else dim_in , 20 if channel_invariance else dim_in)]),  #proba,(min,max) #(1, 1)]), #
+                    ("torch_rescale", [1,pixel_size, pixel_size_range_light]),#in microns per pixel,
+                    ("channel_subsample", [channel_subsample_prob, (dim_in, dim_in)]),  #proba,(min,max)
                     ("flips", [1]),
                     ("rotate", [1]),
                 ]) 
@@ -90,14 +90,14 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                 "Brightfield": collections.OrderedDict([
                     ("to_tensor", [1]),
                     ("normalize", [1]), #Probability
-                    ("torch_rescale", [1,pixel_size, mean_diameter_light]),#in microns per pixel
+                    ("torch_rescale", [1,pixel_size, pixel_size_range_light]),#in microns per pixel
                     ("flips", [1])
                 ]),
                 "Fluorescence": collections.OrderedDict([
                     ("to_tensor", [1]),
                     ("normalize", [1]), #Probability
-                    ("torch_rescale", [1,pixel_size, mean_diameter_light]),#in microns per pixel
-                    ("channel_subsample", [0, (5 if channel_invariance else dim_in , 20 if channel_invariance else dim_in)]),  #proba,(min,max)  (1, 1)]), #
+                    ("torch_rescale", [1,pixel_size, pixel_size_range_light]),#in microns per pixel
+                    ("channel_subsample", [channel_subsample_prob, (dim_in, dim_in)]),  #proba,(min,max)
                     ("flips", [1])
                 ])
             }
@@ -112,7 +112,7 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                     ("normalize_HE_stains", [0.1, amount*0]), #Probability/Amount, make sure this goes in front of normalize
                     ("extract_hematoxylin_stain", [0.1, amount*0]), #Probability/Amount ,make sure this goes in front of normalize
                     ("normalize", [1]), #Probability
-                    ("torch_rescale", [1,pixel_size, mean_diameter_heavy]),#in microns per pixel
+                    ("torch_rescale", [1,pixel_size, pixel_size_range_heavy]),#in microns per pixel
                     ("randomJPEGcompression", [0.2, amount]),  #Probability/Amount
                     ("adjust_hue", [0.2, amount]),#Probability/Amount
                     ("AdjustContrast", [0.2, amount]),#Probability/Amount
@@ -125,7 +125,7 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                 "phase-contrast": collections.OrderedDict([
                     ("to_tensor", [1]), #Probability
                     ("normalize", [1]), #Probability
-                    ("torch_rescale", [1,pixel_size, mean_diameter_heavy]),#in microns per pixel
+                    ("torch_rescale", [1,pixel_size, pixel_size_range_heavy]),#in microns per pixel
                     ("flips", [1]),#Probability
                     ("rotate", [1]),#Probability
                     ("kornia_base_augmentations", [1]),
@@ -133,7 +133,8 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                 "Fluorescence": collections.OrderedDict([
                     ("to_tensor", [1]),
                     ("normalize", [1]), #Probability
-                    ("torch_rescale", [1,pixel_size, mean_diameter_heavy]),#in microns per pixel
+                    ("torch_rescale", [1,pixel_size, pixel_size_range_heavy]),#in microns per pixel
+                    ("channel_subsample", [channel_subsample_prob, (dim_in, dim_in)]),  #proba,(min,max)
                     ("pseudo_brightfield", [0, nuclei_channel]),
                     ("randomJPEGcompression", [0.2, amount]),
                     ("extract_nucleus_and_cytoplasm_channels", [0.05, amount]),
@@ -155,22 +156,22 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                 "Brightfield": collections.OrderedDict([
                     ("to_tensor", [1]),
                     ("normalize", [1]), #Probability
-                    ("torch_rescale", [1,pixel_size, mean_diameter_light]),#in microns per pixel
+                    ("torch_rescale", [1,pixel_size, pixel_size_range_light]),#in microns per pixel
                     ("flips", [1])
                 ]),
                  "phase-contrast": collections.OrderedDict([
                     ("to_tensor", [1]),
                     ("normalize", [1]), #Probability
-                    ("torch_rescale", [1,pixel_size, mean_diameter_light]),#in microns per pixel
+                    ("torch_rescale", [1,pixel_size, pixel_size_range_light]),#in microns per pixel
                     ("flips", [1])
                 ]),
                 "Fluorescence": collections.OrderedDict([
                     ("to_tensor", [1]),
                     ("normalize", [1]), #Probability
-                    ("torch_rescale", [1,pixel_size, mean_diameter_light]),#in microns per pixel
+                    ("torch_rescale", [1,pixel_size, pixel_size_range_light]),#in microns per pixel
+                    ("channel_subsample", [channel_subsample_prob, (dim_in, dim_in)]),  #proba,(min,max)
                     ("pseudo_brightfield", [0, nuclei_channel]),
                     ("extract_nucleus_and_cytoplasm_channels", [0, amount]),
-                   # ("channel_subsample", [0, (5 if channel_invariance else dim_in , 20 if channel_invariance else dim_in)]),  #proba,(min,max)  (1, 1)]), #
                     ("colourize", [0, nuclei_channel]),
                     ("flips", [1])
 
@@ -190,6 +191,7 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                     ("to_tensor", [1]),
                     ("normalize", [1]), #Probability
                     ("torch_rescale", [1,pixel_size, 0]),#in microns per pixel
+                    ("channel_subsample", [channel_subsample_prob, (dim_in, dim_in)]),  #proba,(min,max)
                     ("extract_nucleus_and_cytoplasm_channels", [1, amount]),
                     ("flips", [1]),
                     ("rotate", [1]),
@@ -203,6 +205,7 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                     ("to_tensor", [1]),
                     ("normalize", [1]), #Probability
                     ("torch_rescale", [1,pixel_size, 0]),#in microns per pixel
+                    ("channel_subsample", [channel_subsample_prob, (dim_in, dim_in)]),  #proba,(min,max)
                     ("extract_nucleus_and_cytoplasm_channels", [1, amount]),
                     ("flips", [1])
                 ])
@@ -221,6 +224,7 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                     ("to_tensor", [1]),
                     ("normalize", [1]), #Probability
                     ("torch_rescale", [1,pixel_size, 0]),#in microns per pixel
+                    ("channel_subsample", [channel_subsample_prob, (dim_in, dim_in)]),  #proba,(min,max)
                     ("colourize", [1, nuclei_channel]),
                     ("flips", [1]),
                     ("rotate", [1]),
@@ -234,6 +238,7 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                     ("to_tensor", [1]),
                     ("normalize", [1]), #Probability
                     ("torch_rescale", [1,pixel_size, 0]),#in microns per pixel
+                    ("channel_subsample", [channel_subsample_prob, (dim_in, dim_in)]),  #proba,(min,max)
                     ("colourize", [1, nuclei_channel]),
                     ("flips", [1])
                 ])
@@ -265,6 +270,7 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                         ("to_tensor", [1]),
                         ("normalize", [1]), #Probability
                         ("torch_rescale", [1,pixel_size, 0]),#in microns per pixel
+                        ("channel_subsample", [channel_subsample_prob, (dim_in, dim_in)]),  #proba,(min,max)
                         ("pseudo_brightfield", [1, nuclei_channel]),
                         ("randomJPEGcompression", [0.2, amount]),
                         ("adjust_hue", [0.2, amount]),#Probability/Amount
@@ -287,6 +293,7 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                         ("to_tensor", [1]),
                         ("normalize", [1]), #Probability
                         ("torch_rescale", [1,pixel_size, 0]),#in microns per pixel
+                        ("channel_subsample", [channel_subsample_prob, (dim_in, dim_in)]),  #proba,(min,max)
                         ("pseudo_brightfield", [1, nuclei_channel]),
                         ("flips", [1])
                     ])
@@ -294,7 +301,7 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
             }
         
     else:
-        raise ValueError("Invalid augmentation type. Options are ['minimal','heavy','brightfield_only']")
+        raise ValueError("Invalid augmentation type. Options are ['minimal', 'kornia_intensity', 'heavy', 'two_channel', 'colourize', 'brightfield_only']")
         
 
     return augmentation_dict
