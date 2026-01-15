@@ -792,15 +792,20 @@ class Augmentations(object):
             resized_labels = Resize(size=shape, interpolation=torchvision.transforms.InterpolationMode.NEAREST)(labels)
 
         while self.shape is not None and np.any(np.array(resized_data[0].shape) < self.shape[0]) and crop:
-            pad = int((self.shape[0] - min(resized_data[0].shape)) / 2) + 3
-            pad = torch.Tensor([pad, resized_data.shape[1], resized_data.shape[2]]).min().int() - 1
-
+            total_pad = int((self.shape[0] - min(resized_data[0].shape))) + 6
+            total_pad = min(total_pad, resized_data.shape[1] - 1, resized_data.shape[2] - 1)
             
-            resized_data = torch.nn.functional.pad(resized_data, (pad, pad, pad, pad), mode='constant',
+            # Randomly distribute padding between left/right and top/bottom
+            pad_left = torch.randint(0, total_pad + 1, (1,)).item()
+            pad_right = total_pad - pad_left
+            pad_top = torch.randint(0, total_pad + 1, (1,)).item()
+            pad_bottom = total_pad - pad_top
+
+            resized_data = torch.nn.functional.pad(resized_data, (pad_left, pad_right, pad_top, pad_bottom), mode='constant',
                                                    value=image.max() if modality == "Brightfield" else resized_data.min())
 
             if labels is not None:
-                resized_labels = torch.nn.functional.pad(resized_labels, (pad, pad, pad, pad), mode='constant', value = min(abs(resized_labels.min()),0)).to(
+                resized_labels = torch.nn.functional.pad(resized_labels, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value = min(abs(resized_labels.min()),0)).to(
                     labels.dtype)
                 
               
