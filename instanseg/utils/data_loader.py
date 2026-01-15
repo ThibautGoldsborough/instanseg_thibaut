@@ -6,6 +6,10 @@ def _keep_images(item, args):
 
     #args.source_dataset = str(args.source_dataset).lower().replace("[","").replace("]","").replace("'","").split(",")
 
+    if item.get('parent_dataset', '').lower().lower() == "bsst265":
+        item['image_modality'] = "Fluorescence" #tmp hack for BSST265
+
+
     if args.source_dataset != ["all"] and item[
         'parent_dataset'].lower() not in args.source_dataset:  # remove items that are not of the desired dataset
         return False
