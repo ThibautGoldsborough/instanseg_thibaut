@@ -868,6 +868,13 @@ class InstanSeg(nn.Module):
 
                     onehot_labels = torch_onehot(instance).squeeze(0)  # C x h x w
 
+                    self.min_gt_instanseg_area = 10
+                    if self.min_gt_instanseg_area is not None:
+                        onehot_labels = onehot_labels[onehot_labels.sum((1,2)) > self.min_gt_instanseg_area]
+                        if onehot_labels.shape[0] == 0:
+                            loss += w_seed * seed_loss
+                            continue
+
                     if self.num_instance_cap is not None: #This is to cap the number of objects to avoid OOM errors.
                          if self.num_instance_cap < onehot_labels.shape[0]:
                             idx = torch.randperm(onehot_labels.shape[0])[:self.num_instance_cap]
@@ -1246,11 +1253,11 @@ class InstanSeg_Torchscript(nn.Module):
         self.default_min_size = self.params.get('min_size', 10)
         self.default_mask_threshold = self.params.get('mask_threshold', 0.53)
         self.default_peak_distance = int(self.params.get('peak_distance', 5))
-        self.default_seed_threshold = self.params.get('seed_threshold', 0.7)
+        self.default_seed_threshold = self.params.get('seed_threshold', 0.1)
         self.default_overlap_threshold = self.params.get('overlap_threshold', 0.3)
         self.default_mean_threshold = self.params.get('mean_threshold', 0.0)
         self.default_fg_threshold = self.params.get('fg_threshold', 0.5)
-        self.default_window_size = self.params.get('window_size',32) #32
+        self.default_window_size = self.params.get('window_size',64) #32
         self.default_cleanup_fragments = self.params.get('cleanup_fragments', True)
         self.default_resolve_cell_and_nucleus = self.params.get('resolve_cell_and_nucleus', True)
 
