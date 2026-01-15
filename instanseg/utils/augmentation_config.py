@@ -137,9 +137,9 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                     ("channel_subsample", [channel_subsample_prob, (dim_in, dim_in)]),  #proba,(min,max)
                     ("pseudo_brightfield", [0, nuclei_channel]),
                     ("randomJPEGcompression", [0.2, amount]),
-                    ("extract_nucleus_and_cytoplasm_channels", [0.05, amount]),
+                    ("extract_nucleus_and_cytoplasm_channels", [0.05 if channel_subsample_prob == 0 else 0, amount]),
                     ("pseudo_imc", [0, amount]),
-                    ("colourize", [0.1, nuclei_channel]),
+                    ("colourize", [0.1 if channel_subsample_prob == 0 else 0, nuclei_channel]),
                    # ("draw_shapes", [0.05, amount]),
                     ("flips", [1]),
                     ("rotate", [1]),
@@ -148,8 +148,8 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                     ("brightness_augment", [0.2, amount]),
                     ("RandGaussianNoise", [0.1, amount]),
                     ("HistogramNormalize", [0.1, amount]),
-                    ("add_noisy_channels", [0.3, 5]),#Probability/ max total channels
-                    ("channel_suppress", [1, 0.3]),  #proba, supression_factor
+                    ("add_noisy_channels", [0.3 if channel_subsample_prob == 0 else 0, 5]),#Probability/ max total channels
+                    ("channel_suppress", [1 if channel_subsample_prob == 0 else 0, 0.3]),  #proba, supression_factor
                 ]) 
             },
             "test": {
