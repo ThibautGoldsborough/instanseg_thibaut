@@ -53,16 +53,18 @@ class DecoderBlock(nn.Module):
             norm = "BATCH",
             act = "ReLU",
             shallow = False,
+            dropout = 0,
     ):
         super().__init__()
 
-        
+
         self.conv0 = conv_norm_act(in_channels, out_channels, 1,norm,act)
         self.conv_skip = conv_norm_act(skip_channels, out_channels, 1,norm,act)
         self.conv1 = conv_norm_act(in_channels, out_channels, 3,norm,act)
         self.conv2 = conv_norm_act(out_channels, out_channels, 3,norm,act)
         self.conv3 = conv_norm_act(out_channels, out_channels, 3,norm,act)
         self.conv4 = conv_norm_act(out_channels, out_channels, 3,norm,act)
+        self.dropout = nn.Dropout2d(p=dropout) if dropout > 0 else nn.Identity()
 
         if shallow:
             self.conv3 = nn.Identity()
@@ -71,8 +73,8 @@ class DecoderBlock(nn.Module):
         x = F.interpolate(x, scale_factor=2, mode="nearest")
         proj = self.conv0(x)
         x = self.conv1(x)
-        x =  proj + self.conv2(x + self.conv_skip(skip))
-        x = x + self.conv4(self.conv3(x))
+        x =  proj + self.dropout(self.conv2(x + self.conv_skip(skip)))
+        x = x + self.dropout(self.conv4(self.conv3(x)))
         return x
 
 
@@ -85,6 +87,7 @@ class EncoderBlock(nn.Module):
             norm = "BATCH",
             act = "ReLU",
             shallow = False,
+            dropout = 0,
     ):
         super().__init__()
 
@@ -97,6 +100,7 @@ class EncoderBlock(nn.Module):
         self.conv2 = conv_norm_act(out_channels, out_channels, 3,norm,act)
         self.conv3 = conv_norm_act(out_channels, out_channels, 3,norm,act)
         self.conv4 = conv_norm_act(out_channels, out_channels, 3,norm,act)
+        self.dropout = nn.Dropout2d(p=dropout) if dropout > 0 else nn.Identity()
 
         if shallow:
             self.conv2 = nn.Identity()
@@ -107,8 +111,8 @@ class EncoderBlock(nn.Module):
         x = self.maxpool(x)
         proj = self.conv0(x)
         x = self.conv1(x)
-        x =  proj + self.conv2(x)
-        x = x + self.conv4(self.conv3(x))
+        x =  proj + self.dropout(self.conv2(x))
+        x = x + self.dropout(self.conv4(self.conv3(x)))
         return x
     
 class Decoder(nn.Module):
@@ -117,10 +121,11 @@ class Decoder(nn.Module):
             layers,
             out_channels,
             norm,
-            act):
+            act,
+            dropout = 0):
         super().__init__()
-        
-        self.decoder = nn.ModuleList([DecoderBlock(layers[i],layers[i+1],layers[i+1],norm = norm, act =  act) for i in range(len(layers)-1)])
+
+        self.decoder = nn.ModuleList([DecoderBlock(layers[i],layers[i+1],layers[i+1],norm = norm, act =  act, dropout = dropout) for i in range(len(layers)-1)])
         
         self.final_block = nn.ModuleList([conv_norm_act(layers[-1],out_channel,1, norm = norm if (norm is not None) and norm.lower() != "instance" else None,act = None) for out_channel in out_channels])
         
@@ -136,7 +141,7 @@ class InstanSeg_UNet(nn.Module):
     def __init__(self,in_channels,out_channels,layers = [256,128,64,32],norm = "BATCH",dropout = 0, act = "ReLu"):
         super().__init__()
         layers = layers[::-1]
-        self.encoder = nn.ModuleList([EncoderBlock(in_channels,layers[0],pool = False,norm = norm, act = act)] + [EncoderBlock(layers[i],layers[i+1],norm = norm, act = act) for i in range(len(layers)-1)])
+        self.encoder = nn.ModuleList([EncoderBlock(in_channels,layers[0],pool = False,norm = norm, act = act, dropout = dropout)] + [EncoderBlock(layers[i],layers[i+1],norm = norm, act = act, dropout = dropout) for i in range(len(layers)-1)])
         layers = layers[::-1]
 
         # out_channels should be a list of lists [[2,2,1],[2,2,1]] means two decoders, each with 3 output blocks. The output will be of shape 10.
@@ -146,7 +151,7 @@ class InstanSeg_UNet(nn.Module):
         if type(out_channels[0]) == int:
             out_channels = [out_channels]
             
-        self.decoders = nn.ModuleList([Decoder(layers,out_channel,norm, act) for out_channel in out_channels])
+        self.decoders = nn.ModuleList([Decoder(layers,out_channel,norm, act, dropout = dropout) for out_channel in out_channels])
     
     def forward(self,x):
         skips = []
