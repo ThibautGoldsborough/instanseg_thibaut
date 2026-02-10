@@ -185,7 +185,10 @@ def export_bioimageio(torchsript: torch.jit._script.RecursiveScriptModule,
     input_crop,_ = Augmenter.torch_rescale(input_tensor,labels=None,current_pixel_size=pixel_size,requested_pixel_size=model_pixel_size_tmp,crop = True, random_seed=1)
     input_crop = input_crop.unsqueeze(0) # add batch dimension
     if input_crop.shape[1] != dim_in and not model_dict["channel_invariant"]:
-        input_crop = torch.zeros((1,dim_in,input_crop.shape[2],input_crop.shape[3]),dtype=torch.float32, device = input_crop.device)
+        if dim_in == 1:
+            input_crop = input_crop[:,1:2]
+        else:
+            input_crop = torch.zeros((1,dim_in,input_crop.shape[2],input_crop.shape[3]),dtype=torch.float32, device = input_crop.device)
 
     print("Input tensor shape: ", input_crop.shape)
 

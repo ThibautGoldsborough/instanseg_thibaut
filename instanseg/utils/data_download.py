@@ -1322,6 +1322,7 @@ def load_BSST265(Segmentation_Dataset: dict, verbose: bool = True) -> dict:
         item["parent_dataset"] = "BSST265"
         item['licence'] = "CC0"
         item['pixel_size'] = pixel_size
+        item['image_modality'] = "Fluorescence"
         item['nuclei_channels'] = [0]  
         items.append(item)
     np.random.seed(42) 

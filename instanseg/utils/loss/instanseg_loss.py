@@ -209,7 +209,7 @@ def compute_crops( x: torch.Tensor,
 
     x = feature_engineering(x, c, sigma, window_size //2 , mesh_grid_flat)
 
-    x = pixel_classifier(x)  # C*H*W,1
+    x = pixel_classifier(x, seed_emb=c, window_size=window_size)  # C*H*W,1
 
     x = x.view(C, 1, window_size, window_size)
     idx = torch.arange(1, C + 1, device=x.device, dtype = mesh_grid_flat.dtype)
@@ -320,7 +320,7 @@ def has_pixel_classifier_model(model):
     for module in model.modules():
         if isinstance(module, torch.nn.Module):
             module_class = module.__class__.__name__
-            if 'ProbabilityNet' in module_class:
+            if 'ProbabilityNet' in module_class or 'AttentionPixelClassifier' in module_class:
                 return True
     return False
 
@@ -416,18 +416,78 @@ def guide_function(params: torch.Tensor,device ='cuda', width: int = 256):
 
 def generate_coordinate_map(mode: str = "linear", spatial_dim: int = 2, height: int = 256, width: int = 256, device: torch.device = torch.device(type='cuda')):
 
+    if mode == "rope":
+        # 2D sinusoidal position encoding: half dims for y, half for x
+        # Each half uses (sin, cos) pairs at exponentially spaced frequencies
+        half = spatial_dim // 2
+        n_freqs = half // 2  # sin+cos pairs per axis
+        if n_freqs == 0:
+            return torch.zeros((spatial_dim, height, width), device=device)
+        theta = 100.0
+        freqs = 1.0 / (theta ** (torch.arange(0, n_freqs, dtype=torch.float32, device=device) / max(n_freqs, 1)))
+
+        y_pos = torch.arange(height, dtype=torch.float32, device=device)
+        x_pos = torch.arange(width, dtype=torch.float32, device=device)
+
+        # [n_freqs, height] and [n_freqs, width]
+        angles_y = torch.outer(y_pos, freqs)  # [height, n_freqs]
+        angles_x = torch.outer(x_pos, freqs)  # [width, n_freqs]
+
+        # Interleave sin/cos: [height, half] and [width, half]
+        pe_y = torch.stack([angles_y.sin(), angles_y.cos()], dim=-1).reshape(height, half)
+        pe_x = torch.stack([angles_x.sin(), angles_x.cos()], dim=-1).reshape(width, half)
+
+        # Broadcast to [half, H, W]
+        pe_y = pe_y.T.unsqueeze(-1).expand(half, height, width)   # [half, H, W]
+        pe_x = pe_x.T.unsqueeze(-2).expand(half, height, width)   # [half, H, W]
+
+        # Handle odd spatial_dim: extra dim goes to y
+        if spatial_dim % 2 == 1:
+            extra = torch.zeros(1, height, width, device=device)
+            return torch.cat([pe_y, pe_x, extra], dim=0)
+        return torch.cat([pe_y, pe_x], dim=0)
+
     if mode == "linear":
         if spatial_dim ==2:
             xx = torch.linspace(0, width * 64 / 256, width, device=device).view(1, 1, -1).expand(1, height,width)
             yy = torch.linspace(0, height * 64 / 256, height, device=device).view(1, -1, 1).expand(1, height, width)
             xxyy = torch.cat((xx, yy), 0)
+            return xxyy
+            
+        elif spatial_dim == 3:
 
-        elif spatial_dim >= 3:
-            xx = torch.linspace(0, width * 64 / 256, width, device=device).view(1, 1, -1).expand(1, height,width)
-            yy = torch.linspace(0, height * 64 / 256, height, device=device).view(1, -1, 1).expand(1, height, width)
-            zz = torch.zeros_like(xx).expand(spatial_dim - 2,-1,-1)
-            xxyy = torch.cat((xx, yy,zz), 0)
-        
+            # Pseudo-3D for 2D images: randomly select orthogonal plane
+            # Randomly choose which coordinate to keep constant (0=x, 1=y, 2=z)
+            plane_choice = torch.randint(0, 3, (1,), device=device).item()
+
+            # Generate base coordinates for the 2D slice
+            xx_2d = torch.linspace(0, width * 64 / 256, width, device=device).view(1, -1).expand(height, width)
+            yy_2d = torch.linspace(0, height * 64 / 256, height, device=device).view(-1, 1).expand(height, width)
+
+            # Choose a random constant value for the fixed dimension (between 0 and 64)
+            const_val = torch.rand(1, device=device).item() * 64
+            const_2d = torch.full((height, width), const_val, device=device)
+
+            if plane_choice == 0:
+                # YZ plane: x is constant, y and z vary
+                xx = const_2d
+                yy = xx_2d
+                zz = yy_2d
+            elif plane_choice == 1:
+                # XZ plane: y is constant, x and z vary
+                xx = xx_2d
+                yy = const_2d
+                zz = yy_2d
+            else:  # plane_choice == 2
+                # XY plane: z is constant, x and y vary
+                xx = xx_2d
+                yy = yy_2d
+                zz = const_2d
+
+            # Stack into (3, H, W)
+            xxyy = torch.stack((xx, yy, zz), dim=0)
+            return xxyy
+
         else:
             xxyy = torch.zeros((spatial_dim, height, width), device=device) #NOT IMPLEMENTED - THIS IS JUST A DUMMY VALUE
 
@@ -437,6 +497,56 @@ def generate_coordinate_map(mode: str = "linear", spatial_dim: int = 2, height: 
     return xxyy
 
 
+def precompute_rope_freqs_2d(head_dim, theta=10000.0):
+    """Precompute rotation frequencies for 2D RoPE.
+    head_dim split in half: first half for y, second half for x."""
+    half = head_dim // 2
+    freqs = 1.0 / (theta ** (torch.arange(0, half, 2).float() / half))
+    return freqs  # shape: [half // 2]
+
+
+def apply_rope_2d(x, positions, freqs):
+    """Apply 2D rotary position embeddings.
+    x: [*, num_heads, seq_len, head_dim]
+    positions: [*, seq_len, 2] — (y, x) relative coords
+    freqs: [quarter_dim] — precomputed frequencies
+    """
+    head_dim = x.shape[-1]
+    half = head_dim // 2
+    quarter = half // 2
+
+    # Split into y-half and x-half
+    x_y = x[..., :half]
+    x_x = x[..., half:]
+
+    # Compute angles: pos * freq for each pair
+    pos_y = positions[..., 0:1]  # [*, seq_len, 1]
+    pos_x = positions[..., 1:2]  # [*, seq_len, 1]
+
+    # freqs: [quarter] -> angles: [*, seq_len, quarter]
+    angles_y = pos_y * freqs.to(x.device)  # [*, seq_len, quarter]
+    angles_x = pos_x * freqs.to(x.device)
+
+    # Expand for num_heads dimension
+    while angles_y.dim() < x_y.dim():
+        angles_y = angles_y.unsqueeze(-3)
+        angles_x = angles_x.unsqueeze(-3)
+
+    # Rotate pairs (2i, 2i+1) using sin/cos
+    cos_y, sin_y = angles_y.cos(), angles_y.sin()
+    cos_x, sin_x = angles_x.cos(), angles_x.sin()
+
+    def rotate_pairs(t, cos_a, sin_a):
+        t1 = t[..., 0::2]
+        t2 = t[..., 1::2]
+        return torch.stack([t1 * cos_a - t2 * sin_a, t1 * sin_a + t2 * cos_a], dim=-1).flatten(-2)
+
+    x_y_rot = rotate_pairs(x_y, cos_y, sin_y)
+    x_x_rot = rotate_pairs(x_x, cos_x, sin_x)
+
+    return torch.cat([x_y_rot, x_x_rot], dim=-1)
+
+
 class ProbabilityNet(nn.Module):
     def __init__(self, embedding_dim=4, width = 5):
         super().__init__()
@@ -444,7 +554,7 @@ class ProbabilityNet(nn.Module):
         self.fc2 = nn.Linear(width, width)
         self.fc3 = nn.Linear(width, 1)
 
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         # x is C*H*W,E+S+1 (H,W is the window of the crop used here, e.g 100x100, not the image)
       #  with torch.cuda.amp.autocast():
         x = self._relu_non_empty(self.fc1(x))
@@ -486,7 +596,7 @@ class ConvProbabilityNet(nn.Module):
 
     
 
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         # x is C*H*W,E+S+1 (H,W is the window of the crop used here, e.g 100x100, not the image)
 
         positional_embedding = guide_function(self.positional_embedding_params, width = 100)
@@ -497,7 +607,95 @@ class ConvProbabilityNet(nn.Module):
         output = self.layer3(torch.cat((x,one,two),dim=1))
 
         return output
-    
+
+
+class AttentionPixelClassifier(nn.Module):
+    def __init__(self, embedding_dim, num_heads=4, head_dim=8, n_sigma=1):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.n_sigma = n_sigma
+        dim_coords = embedding_dim - n_sigma
+
+        self.q_proj = nn.Linear(dim_coords, num_heads * head_dim, bias=False)
+        self.k_proj = nn.Linear(embedding_dim, num_heads * head_dim, bias=False)
+        self.out_proj = nn.Linear(num_heads, 1)
+
+    def forward(self, x, seed_emb=None, window_size=None, **kwargs):
+        # x: [C, E+S, H, W] from feature_engineering_attention
+        # seed_emb: [C, E] centroid spatial embeddings (dim_coords only)
+        C, ES, H, W = x.shape
+
+        # Flatten pixels: [C, H*W, E+S]
+        pixel_features = x.permute(0, 2, 3, 1).reshape(C, H * W, ES)
+
+        # Q from seed embedding: [C, 1, dim_coords]
+        q = self.q_proj(seed_emb.unsqueeze(1))  # [C, 1, num_heads * head_dim]
+        q = q.view(C, 1, self.num_heads, self.head_dim).transpose(1, 2)  # [C, num_heads, 1, head_dim]
+
+        # K from pixel features: [C, H*W, E+S]
+        k = self.k_proj(pixel_features)  # [C, H*W, num_heads * head_dim]
+        k = k.view(C, H * W, self.num_heads, self.head_dim).transpose(1, 2)  # [C, num_heads, H*W, head_dim]
+
+        # Plain cross-attention scores (no softmax — raw logits)
+        scale = self.head_dim ** 0.5
+        scores = torch.matmul(q, k.transpose(-2, -1)) / scale  # [C, num_heads, 1, H*W]
+        scores = scores.squeeze(-2)  # [C, num_heads, H*W]
+
+        # Multi-head -> single logit
+        scores = scores.permute(0, 2, 1)  # [C, H*W, num_heads]
+        logits = self.out_proj(scores)  # [C, H*W, 1]
+        logits = logits.reshape(C * H * W, 1)
+
+        return logits
+
+
+class RelativeAttentionPixelClassifier(nn.Module):
+    def __init__(self, embedding_dim, num_heads=4, head_dim=8, n_sigma=1, max_window=256):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.n_sigma = n_sigma
+        dim_coords = embedding_dim - n_sigma
+
+        self.q_proj = nn.Linear(dim_coords, num_heads * head_dim, bias=False)
+        self.k_proj = nn.Linear(embedding_dim, num_heads * head_dim, bias=False)
+        self.out_proj = nn.Linear(num_heads, 1)
+        self.rel_pos_bias = nn.Parameter(torch.zeros(num_heads, max_window, max_window))
+
+    def forward(self, x, seed_emb=None, window_size=None, **kwargs):
+        # x: [C, E+S, H, W] from feature_engineering_attention
+        # seed_emb: [C, E] centroid spatial embeddings (dim_coords only)
+        C, ES, H, W = x.shape
+
+        # Flatten pixels: [C, H*W, E+S]
+        pixel_features = x.permute(0, 2, 3, 1).reshape(C, H * W, ES)
+
+        # Q from seed embedding: [C, 1, dim_coords]
+        q = self.q_proj(seed_emb.unsqueeze(1))  # [C, 1, num_heads * head_dim]
+        q = q.view(C, 1, self.num_heads, self.head_dim).transpose(1, 2)  # [C, num_heads, 1, head_dim]
+
+        # K from pixel features: [C, H*W, E+S]
+        k = self.k_proj(pixel_features)  # [C, H*W, num_heads * head_dim]
+        k = k.view(C, H * W, self.num_heads, self.head_dim).transpose(1, 2)  # [C, num_heads, H*W, head_dim]
+
+        # Attention scores
+        scale = self.head_dim ** 0.5
+        scores = torch.matmul(q, k.transpose(-2, -1)) / scale  # [C, num_heads, 1, H*W]
+        scores = scores.squeeze(-2)  # [C, num_heads, H*W]
+
+        # Relative position bias: learned [num_heads, H, W] centered on seed
+        bias = self.rel_pos_bias  # [num_heads, max_window, max_window]
+        if bias.shape[1] != H or bias.shape[2] != W:
+            bias = F.interpolate(bias.unsqueeze(0), size=(H, W), mode='bilinear', align_corners=True).squeeze(0)
+        scores = scores + bias.reshape(self.num_heads, H * W).unsqueeze(0)  # broadcast over C
+
+        # Multi-head -> single logit
+        scores = scores.permute(0, 2, 1)  # [C, H*W, num_heads]
+        logits = self.out_proj(scores)  # [C, H*W, 1]
+        logits = logits.reshape(C * H * W, 1)
+
+        return logits
 
 
 def feature_engineering(x: torch.Tensor, c: torch.Tensor, sigma: torch.Tensor, window_size: int,
@@ -626,6 +824,22 @@ def feature_engineering_10(x: torch.Tensor, xxyy: torch.Tensor, c: torch.Tensor,
 
     return x
 
+
+def feature_engineering_attention(x: torch.Tensor, c: torch.Tensor, sigma: torch.Tensor, window_size: int,
+                                  mesh_grid_flat: torch.Tensor):
+    """Extract crop embeddings WITHOUT subtracting centroids.
+    Returns 4D tensor [C, E+S, H, W] for use with AttentionPixelClassifier.
+    RoPE handles relative positioning instead of explicit subtraction."""
+    E = x.shape[0]
+    C = c.shape[0]
+    S = sigma.shape[0]
+    x = torch.cat([x, sigma])[:, mesh_grid_flat[0], mesh_grid_flat[1]]
+    x = rearrange(x, '(E) (C H W) -> C (E) H W',
+                  E=E + S, C=C, H=2 * window_size, W=2 * window_size)
+    # NO centroid subtraction — RoPE encodes relative position
+    return x
+
+
 def feature_engineering_generator(feature_engineering_function):
 
     if feature_engineering_function == "0" or feature_engineering_function == "7":
@@ -636,6 +850,10 @@ def feature_engineering_generator(feature_engineering_function):
         return feature_engineering_3, 2
     elif feature_engineering_function == "10":
         return feature_engineering_10, 2
+    elif feature_engineering_function == "attention":
+        return feature_engineering_attention, 2
+    elif feature_engineering_function == "attention_relative":
+        return feature_engineering_attention, 2
 
     else:
         raise NotImplementedError("Feature engineering function",feature_engineering_function,"is not implemented")
@@ -675,6 +893,7 @@ class InstanSeg(nn.Module):
 
         self.feature_engineering, self.feature_engineering_width = feature_engineering_generator(feature_engineering_function)
         self.feature_engineering_function = feature_engineering_function
+        self.coord_mode = "rope" if feature_engineering_function == "attention" else "linear"  # attention_relative uses linear
 
         self.update_binary_loss(binary_loss_fn_str)
         self.update_seed_loss(seed_loss_fn)
@@ -786,8 +1005,22 @@ class InstanSeg(nn.Module):
         else:
             if MLP_input_dim is None:
                 MLP_input_dim = self.feature_engineering_width + self.n_sigma -2 + self.dim_coords
-            model.pixel_classifier = ProbabilityNet( MLP_input_dim, width = MLP_width)
-            if self.feature_engineering_function != "10":
+            if self.feature_engineering_function == "attention":
+                model.pixel_classifier = AttentionPixelClassifier(
+                    embedding_dim=MLP_input_dim,
+                    num_heads=4,
+                    head_dim=8,
+                    n_sigma=self.n_sigma,
+                )
+            elif self.feature_engineering_function == "attention_relative":
+                model.pixel_classifier = RelativeAttentionPixelClassifier(
+                    embedding_dim=MLP_input_dim,
+                    num_heads=4,
+                    head_dim=8,
+                    n_sigma=self.n_sigma,
+                    max_window=self.window_size,
+                )
+            elif self.feature_engineering_function != "10":
                 model.pixel_classifier = ProbabilityNet( MLP_input_dim, width = MLP_width)
             else:
                 model.pixel_classifier = ConvProbabilityNet( MLP_input_dim, width = MLP_width)
@@ -803,7 +1036,7 @@ class InstanSeg(nn.Module):
         batch_size, height, width = prediction.size(
             0), prediction.size(2), prediction.size(3)
         
-        xxyy = generate_coordinate_map(mode = "linear", spatial_dim = self.dim_coords, height = height, width = width, device = prediction.device)
+        xxyy = generate_coordinate_map(mode = self.coord_mode, spatial_dim = self.dim_coords, height = height, width = width, device = prediction.device)
 
         loss = 0
   
@@ -996,7 +1229,7 @@ class InstanSeg(nn.Module):
 
                 height, width = prediction_i.size(1), prediction_i.size(2)
 
-                xxyy = generate_coordinate_map(mode = "linear", spatial_dim = self.dim_coords, height = height, width = width, device = device)
+                xxyy = generate_coordinate_map(mode = self.coord_mode, spatial_dim = self.dim_coords, height = height, width = width, device = device)
 
                 fields = (torch.sigmoid(prediction_i[0:self.dim_coords])-0.5) * 8
 

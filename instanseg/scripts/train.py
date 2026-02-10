@@ -216,20 +216,25 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         from instanseg.utils.loss.instanseg_loss import InstanSeg
 
 
-        method = InstanSeg(binary_loss_fn_str=args.binary_loss_fn, 
-                        seed_loss_fn = args.seed_loss_fn, 
+        if args.dim_seeds == 2 and args.seed_loss_fn != "distance_and_binary_loss":
+            import warnings
+            warnings.warn(f"dim_seeds is 2, switching seed_loss_fn from '{args.seed_loss_fn}' to 'distance_and_binary_loss'")
+            args.seed_loss_fn = "distance_and_binary_loss"
+
+        method = InstanSeg(binary_loss_fn_str=args.binary_loss_fn,
+                        seed_loss_fn = args.seed_loss_fn,
                         device = device,
                         n_sigma=n_sigma,
-                        cells_and_nuclei=args.cells_and_nuclei, 
-                        window_size = args.window_size, 
+                        cells_and_nuclei=args.cells_and_nuclei,
+                        window_size = args.window_size,
                         dim_coords= args.dim_coords,
-                        dim_seeds = args.dim_seeds, 
+                        dim_seeds = args.dim_seeds,
                         feature_engineering_function=args.feature_engineering,
                         bg_weight = args.bg_weight)  # binary_xloss, lovasz_hinge dice_loss general_dice_loss
 
         def loss_fn(*args, **kwargs):
             return method.forward(*args, **kwargs)
-        
+
         dim_out = method.dim_out
 
     else:
@@ -358,6 +363,10 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
             os.mkdir(args.output_path)
         if not os.path.exists(args.output_path / "epoch_outputs"):
             os.mkdir(args.output_path / "epoch_outputs")
+        else:
+            import glob
+            for f in glob.glob(str(args.output_path / "epoch_outputs" / "*.png")):
+                os.remove(f)
 
 
     pd.DataFrame.from_dict(args_dict, orient='index').to_csv(args.output_path / "experiment_log.csv",
@@ -367,14 +376,16 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
 
     if args.hotstart_training > 0:
         hot_epochs = args.hotstart_training
-        print("Hotstart for "+str(hot_epochs)+" epochs with binary_xloss and dice_loss")
-        if args.seed_loss_fn != "distance_and_binary_loss":
+        seed_loss_str = "distance_and_binary_loss" if args.dim_seeds == 2 else "binary_xloss"
+        print("Hotstart for "+str(hot_epochs)+" epochs with "+seed_loss_str+" and dice_loss")
+        if args.dim_seeds != 2:
             method.update_seed_loss("binary_xloss")
         method.update_binary_loss("dice_loss")
         model, train_losses, test_losses, f1_list, f1_list_cells = main(model, loss_fn, train_loader, test_loader, num_epochs=hot_epochs, epoch_name='hotstart_epoch')
 
         print("Starting main training loop with",args.seed_loss_fn, "and", args.binary_loss_fn)
-        method.update_seed_loss(args.seed_loss_fn)
+        if args.dim_seeds != 2:
+            method.update_seed_loss(args.seed_loss_fn)
         method.update_binary_loss(args.binary_loss_fn)
 
     model, train_losses, test_losses, f1_list, f1_list_cells = main(model, loss_fn, train_loader, test_loader, num_epochs=num_epochs)
