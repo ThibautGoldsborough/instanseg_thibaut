@@ -936,13 +936,12 @@ class InstanSeg(nn.Module):
             binary_loss = torch.nn.BCEWithLogitsLoss(reduction='none')
 
             def seed_loss(x, y, mask=None):
+                fg_mask = (y > 0).float()
                 if mask is not None:
-                    mask = mask.float()
-                    loss = binary_loss(x, (y > 0).float())
-                    masked_loss = loss * mask
-                    return masked_loss.sum() / mask.sum()
-                else:
-                    return binary_loss(x, (y > 0).float()).mean()
+                    fg_mask = fg_mask * mask.float()
+                loss = binary_loss(x, (y > 0).float())
+                masked_loss = loss * fg_mask
+                return masked_loss.sum() / fg_mask.sum().clamp(min=1)
 
             self.seed_loss = seed_loss
 
@@ -956,18 +955,12 @@ class InstanSeg(nn.Module):
 
             def seed_loss(x, y, mask=None):
                 edt = (instance_wise_edt(y.float(), edt_type='edt') - 0.5) * 15
-                loss = distance_loss((x), (edt[None]))
-
-                if self.bg_weight is not None:
-                    weights = torch.where(edt < 0, self.bg_weight, 1.0)
-                    loss = loss * weights
-
+                fg_mask = (y > 0).float()
                 if mask is not None:
-                    mask = mask.float()
-                    masked_loss = loss * mask
-                    return masked_loss.sum() / mask.sum()
-                else:
-                    return loss.mean()
+                    fg_mask = fg_mask * mask.float()
+                loss = distance_loss((x), (edt[None]))
+                masked_loss = loss * fg_mask
+                return masked_loss.sum() / fg_mask.sum().clamp(min=1)
 
             self.seed_loss = seed_loss
 
