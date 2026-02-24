@@ -13,30 +13,42 @@ import warnings
 
 
 global_step = 0
-def train_epoch(train_model, 
-                train_device, 
-                train_dataloader, 
-                train_loss_fn, 
-                train_optimizer, 
+def train_epoch(train_model,
+                train_device,
+                train_dataloader,
+                train_loss_fn,
+                train_optimizer,
                 args,
+                scaler=None,
                 ):
-    
+
     global global_step
     start = time.time()
     train_model.train()
     train_loss = []
+    use_amp = scaler is not None
+
     for image_batch, labels_batch, _ in tqdm(train_dataloader, disable=args.on_cluster):
 
         image_batch = image_batch.to(train_device)
         labels = labels_batch.to(train_device)
-        output = train_model(image_batch)
-        loss = train_loss_fn(output, labels.clone()).mean()
+
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+            output = train_model(image_batch)
+            loss = train_loss_fn(output, labels.clone()).mean()
+
         train_optimizer.zero_grad()
-        loss.backward()
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(train_optimizer)
+            torch.nn.utils.clip_grad_norm_(train_model.parameters(), args.clip)
+            scaler.step(train_optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(train_model.parameters(), args.clip)
+            train_optimizer.step()
 
-        torch.nn.utils.clip_grad_norm_(train_model.parameters(), args.clip)
-
-        train_optimizer.step()
         train_loss.append(loss.detach().cpu().numpy())
 
     end = time.time()
@@ -45,18 +57,19 @@ def train_epoch(train_model,
     
 
 global_step_test = 0
-def test_epoch(test_model, 
-               test_device, 
-               test_dataloader, 
-               test_loss_fn, 
+def test_epoch(test_model,
+               test_device,
+               test_dataloader,
+               test_loss_fn,
                args,
                postprocessing_fn,
                method,
                iou_threshold,
-               debug=False, 
-               save_str=None, 
+               debug=False,
+               save_str=None,
                save_bool=False,
-               best_f1=None):
+               best_f1=None,
+               use_amp=False):
     global global_step_test
     start = time.time()
 
@@ -67,14 +80,14 @@ def test_epoch(test_model,
     with torch.no_grad():
         for image_batch, labels_batch, _ in tqdm(test_dataloader, disable=args.on_cluster):
             image_batch = image_batch.to(test_device)
-            labels = labels_batch.to(test_device) 
-            output = test_model(image_batch)  
-            loss = test_loss_fn(output, labels.clone()).mean()
+            labels = labels_batch.to(test_device)
+            with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                output = test_model(image_batch)
+                loss = test_loss_fn(output, labels.clone()).mean()
             test_loss.append(loss.detach().cpu().numpy())
 
             if type(output) == list:
                 output = output[0]
-
 
             if labels.type() != 'torch.cuda.FloatTensor' and labels.type() != 'torch.FloatTensor':
                 predicted_labels = torch.stack([postprocessing_fn(out) for out in output])
