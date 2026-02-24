@@ -30,7 +30,8 @@ parser.add_argument('-pixel_size', '--requested_pixel_size', default=None, type=
 #advanced usage
 parser.add_argument("-bs", "--batch_size", type=int, default=3)
 parser.add_argument("-e", "--num_epochs", type=int, default=500)
-parser.add_argument('-len_epoch', '--length_of_epoch', default=1000, type=int, help = "Number of samples per epoch")
+parser.add_argument('-len_epoch', '--length_of_epoch', default=1000, type=int, help = "Number of training samples per epoch")
+parser.add_argument('-len_eval', '--length_of_eval', default=200, type=int, help = "Number of validation samples per epoch")
 parser.add_argument("-lr", "--lr", type=float, default=0.001, help = "Learning rate")
 parser.add_argument("-optim", "--optimizer", type=str, default="adam", help = "Optimizer to use, adam, sgd or adamw")
 parser.add_argument("-m", "--model_str", type=str, default="InstanSeg_UNet", help = "Model backbone to use")

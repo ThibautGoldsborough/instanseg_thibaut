@@ -302,15 +302,13 @@ def get_loaders(train_images_local, train_labels_local, val_images_local, val_la
                                      target_segmentation=args.target_segmentation,
                                      channel_invariant = args.channel_invariant)
 
-    test_sampler = RandomSampler(test_data,num_samples=int(
-                args.length_of_epoch * 0.2))
+    test_sampler = RandomSampler(test_data,num_samples=args.length_of_eval)
 
 
     if not args.weight:
         if args.length_of_epoch is not None:
             train_sampler = RandomSampler(train_data, num_samples=args.length_of_epoch)
-            test_sampler = RandomSampler(test_data, num_samples=int(
-                args.length_of_epoch * 0.2))  # This is relates to the standard 80/20 split
+            test_sampler = RandomSampler(test_data, num_samples=args.length_of_eval)  # This is relates to the standard 80/20 split
         else:
             train_sampler = RandomSampler(train_data)
 
@@ -335,7 +333,7 @@ def get_loaders(train_images_local, train_labels_local, val_images_local, val_la
         rel_freq = (freq / sum(freq))
 
         if args.length_of_epoch is not None:
-            test_sampler = WeightedRandomSampler(rel_freq, int(args.length_of_epoch * 0.2))
+            test_sampler = WeightedRandomSampler(rel_freq, args.length_of_eval)
         else:
             test_sampler = WeightedRandomSampler(rel_freq, len(freq))
 
