@@ -341,11 +341,21 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
             args.model_folder = ""
 
         model, model_dict = load_model_weights(model, path=args.model_path, folder=args.model_folder, device=device, dict = args_dict)
-        
+
+        # Enable LoRA before creating optimizer if needed
+        if args.lora_rank > 0 and hasattr(model, 'enable_lora'):
+            model.freeze_backbone()
+            model.enable_lora(rank=args.lora_rank)
+            model.unfreeze_backbone()
 
         if not args.channel_invariant:
-            optimizer = get_optimizer(model.parameters(),args)
-            optimizer.load_state_dict(model_dict['optimizer_state_dict'])
+            if args.lora_rank > 0 and hasattr(model, 'enable_lora'):
+                optimizer = get_optimizer(filter(lambda p: p.requires_grad, model.parameters()), args)
+                # Skip loading optimizer state dict — LoRA changes parameter groups
+                print("LoRA enabled: skipping optimizer state dict (parameter groups changed)")
+            else:
+                optimizer = get_optimizer(model.parameters(),args)
+                optimizer.load_state_dict(model_dict['optimizer_state_dict'])
 
         print("Resuming training from epoch", model_dict['epoch'])
 
