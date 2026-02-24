@@ -435,7 +435,7 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
 
     print(f"CUDA devices visible: {torch.cuda.device_count()}")
     for i in range(torch.cuda.device_count()):
-        print(f"  GPU {i}: {torch.cuda.get_device_name(i)} ({torch.cuda.get_device_properties(i).total_mem / 1e9:.1f} GB)")
+        print(f"  GPU {i}: {torch.cuda.get_device_name(i)} ({torch.cuda.get_device_properties(i).total_memory / 1e9:.1f} GB)")
 
     if args.sampling_mode is not None:
         from instanseg.utils.sampling import run_sampling
