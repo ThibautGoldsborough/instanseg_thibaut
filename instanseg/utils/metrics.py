@@ -181,30 +181,38 @@ def _robust_f1_mean_calculator(nan_list: Union[list, np.ndarray]):
         return np.nanmean(nan_list)
 
 
+def _to_matching_format(tensor):
+    """Convert tensor for matching: keep on GPU as int32 for torch, or move to CPU numpy for stardist."""
+    if use_stardist:
+        return tensor.detach().cpu().numpy().astype(np.int32)
+    else:
+        return tensor.detach().int()
+
+
 def _robust_average_precision(labels, predicted, threshold):
 
     for i in range(len(labels)):
         if labels[i].min() < 0 and not (labels[i] < 0).all():
             labels[i][labels[i] < 0] = 0 #sparse labels
-            predicted[i][labels[i] < 0] = 0 
+            predicted[i][labels[i] < 0] = 0
 
 
     if labels[0].shape[0] != 2: #cells or nuclei
-        labels = [labels[i].detach().cpu().numpy().astype(np.int32) for i, l in enumerate(labels) if labels[i].min() >= 0 and labels[i].max() > 0]
-        predicted = [predicted[i].detach().cpu().numpy().astype(np.int32) for i, l in enumerate(labels) if labels[i].min() >= 0 and labels[i].max() > 0]
+        labels = [_to_matching_format(labels[i]) for i, l in enumerate(labels) if labels[i].min() >= 0 and labels[i].max() > 0]
+        predicted = [_to_matching_format(predicted[i]) for i, l in enumerate(labels) if labels[i].min() >= 0 and labels[i].max() > 0]
 
         if len(labels)==0:
             return np.nan
-        
+
         stats = matching([l for l in labels], [p for p in predicted], thresh=threshold, show_progress = False)
         f1i = [stat.f1 for stat in stats]
 
         return _robust_f1_mean_calculator(f1i)
     else:
-        f1is = [] 
+        f1is = []
         for i, _ in enumerate(["nuclei", "cells"]):
-            labels_tmp = [(labels[j][i].detach().cpu().numpy()).squeeze().astype(np.int32) for j, l in enumerate(labels) if labels[j][i].min() >= 0 and labels[j][i].max() > 0]
-            predicted_tmp = [(predicted[j][i].detach().cpu().numpy()).squeeze().astype(np.int32) for j, l in enumerate(labels) if labels[j][i].min() >= 0 and labels[j][i].max() > 0]
+            labels_tmp = [_to_matching_format(labels[j][i].squeeze()) for j, l in enumerate(labels) if labels[j][i].min() >= 0 and labels[j][i].max() > 0]
+            predicted_tmp = [_to_matching_format(predicted[j][i].squeeze()) for j, l in enumerate(labels) if labels[j][i].min() >= 0 and labels[j][i].max() > 0]
 
             if len(labels_tmp)==0:
                 f1is.append(np.nan)

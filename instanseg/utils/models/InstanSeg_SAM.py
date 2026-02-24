@@ -16,8 +16,9 @@ class LoRALinear(nn.Module):
         # Freeze the original weights
         for p in self.original.parameters():
             p.requires_grad = False
-        self.lora_A = nn.Parameter(torch.randn(original.in_features, rank) * (1 / rank))
-        self.lora_B = nn.Parameter(torch.zeros(rank, original.out_features))
+        device = original.weight.device
+        self.lora_A = nn.Parameter(torch.randn(original.in_features, rank, device=device) * (1 / rank))
+        self.lora_B = nn.Parameter(torch.zeros(rank, original.out_features, device=device))
 
     def forward(self, x):
         return self.original(x) + (x @ self.lora_A) @ self.lora_B

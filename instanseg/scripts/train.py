@@ -73,6 +73,7 @@ parser.add_argument('-tile', '--tile_size', default=256, type=int, help = "Tile 
 parser.add_argument('-modality', '--modality_filter', default=None, type=str, help = "Filter datasets by image modality (e.g. 'Brightfield', 'Fluorescence'). Default None uses all modalities.")
 parser.add_argument('-sampling_mode', '--sampling_mode', default=None, type=str, help="Run embedding clustering instead of training. Options: leiden_dino, leiden_sam")
 parser.add_argument('-lora_rank', '--lora_rank', default=0, type=int, help="LoRA rank for SAM/DINO backbone. 0 = disabled, 16 is a good default.")
+parser.add_argument('-fp16', '--fp16', default=False, type=lambda x: (str(x).lower() == 'true'), help="Enable mixed precision (float16) training")
 
 
 def save_training_plot(train_losses, test_losses, f1_list, f1_list_cells, output_path, cells_and_nuclei=False, hotstart_epoch=None):
@@ -115,7 +116,8 @@ def save_training_plot(train_losses, test_losses, f1_list, f1_list_cells, output
 
 
 def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name='output_epoch',
-         prior_train_losses=None, prior_test_losses=None, prior_f1_list=None, prior_f1_list_cells=None, hotstart_epoch=None):
+         prior_train_losses=None, prior_test_losses=None, prior_f1_list=None, prior_f1_list_cells=None, hotstart_epoch=None,
+         scaler=None):
     from instanseg.utils.AI_utils import optimize_hyperparameters, train_epoch, test_epoch
     global best_f1_score, device, method, iou_threshold, args, optimizer, scheduler
 
@@ -130,7 +132,7 @@ def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name=
 
         print("Epoch:", epoch)
 
-        train_loss, train_time = train_epoch(model, device, train_loader, loss_fn, optimizer, args = args)
+        train_loss, train_time = train_epoch(model, device, train_loader, loss_fn, optimizer, args=args, scaler=scaler)
 
         if epoch <= 5 and not args.model_folder:  # Training is just starting AND we are not loading a model
             save_epoch_outputs = True
@@ -140,10 +142,11 @@ def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name=
         test_loss, f1_score, test_time = test_epoch(model, device, test_loader, loss_fn, debug=False,
                                                     best_f1=best_f1_score,
                                                     save_bool=save_epoch_outputs,
-                                                    args = args,
-                                                    postprocessing_fn = method.postprocessing,
-                                                    method = method,
-                                                    iou_threshold = iou_threshold,
+                                                    args=args,
+                                                    postprocessing_fn=method.postprocessing,
+                                                    method=method,
+                                                    iou_threshold=iou_threshold,
+                                                    use_amp=scaler is not None,
                                                     save_str=str(
                                                         args.output_path / str(
                                                             f"epoch_outputs/{epoch_name}_" + str(epoch))))
@@ -460,6 +463,10 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
     
     iou_threshold = np.linspace(0.5, 1.0, 10)
 
+    scaler = torch.amp.GradScaler() if args.fp16 else None
+    if args.fp16:
+        print("Mixed precision (fp16) training enabled")
+
     if args.hotstart_training > 0:
         hot_epochs = args.hotstart_training
         hotstart_lr = 1e-3
@@ -480,7 +487,7 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         else:
             optimizer = get_optimizer(model.parameters(), args, lr=hotstart_lr)
 
-        model, train_losses, test_losses, f1_list, f1_list_cells = main(model, loss_fn, train_loader, test_loader, num_epochs=hot_epochs, epoch_name='hotstart_epoch')
+        model, train_losses, test_losses, f1_list, f1_list_cells = main(model, loss_fn, train_loader, test_loader, num_epochs=hot_epochs, epoch_name='hotstart_epoch', scaler=scaler)
 
         # Unfreeze backbone weights after hotstart
         if _backbone_frozen:
@@ -505,9 +512,9 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         model, train_losses, test_losses, f1_list, f1_list_cells = main(model, loss_fn, train_loader, test_loader, num_epochs=num_epochs,
             prior_train_losses=train_losses, prior_test_losses=test_losses,
             prior_f1_list=f1_list, prior_f1_list_cells=f1_list_cells,
-            hotstart_epoch=args.hotstart_training)
+            hotstart_epoch=args.hotstart_training, scaler=scaler)
     else:
-        model, train_losses, test_losses, f1_list, f1_list_cells = main(model, loss_fn, train_loader, test_loader, num_epochs=num_epochs)
+        model, train_losses, test_losses, f1_list, f1_list_cells = main(model, loss_fn, train_loader, test_loader, num_epochs=num_epochs, scaler=scaler)
 
     from instanseg.utils.model_loader import load_model
     model, model_dict = load_model(folder="", path=args.output_path) #Load model from checkpoint
