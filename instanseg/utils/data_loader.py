@@ -263,6 +263,7 @@ def _read_images_from_pth(data_path= "../datasets", dataset = "segmentation", da
 
 
 def get_loaders(train_images_local, train_labels_local, val_images_local, val_labels_local, train_meta, val_meta, args):
+    from pathlib import Path
     from torch.utils.data.sampler import RandomSampler, WeightedRandomSampler
     from instanseg.utils.augmentation_config import get_augmentation_dict
     from instanseg.utils.AI_utils import Segmentation_Dataset, collate_fn
@@ -314,17 +315,29 @@ def get_loaders(train_images_local, train_labels_local, val_images_local, val_la
 
     else:
 
-        datasets_train = [meta["parent_dataset"] for meta in train_meta]
-        datasets,counts = np.unique(datasets_train,return_counts=True)
-        dict_datasets = dict(zip(datasets,counts / sum(counts)))
-        freq = [ 1/ dict_datasets[dataset] for dataset in datasets_train]
-        rel_freq = (freq / sum(freq))
+        leiden_path = Path(args.output_path) / "embeddings.pkl"
+        if leiden_path.exists():
+            import pickle
+            with open(leiden_path, "rb") as f:
+                leiden_data = pickle.load(f)
+            leiden_labels = leiden_data["leiden_labels"]
+            labels, counts = np.unique(leiden_labels, return_counts=True)
+            dict_labels = dict(zip(labels, counts / sum(counts)))
+            freq = [1 / dict_labels[l] for l in leiden_labels]
+            rel_freq = np.array(freq) / sum(freq)
+            print("Leiden cluster distribution:", dict_labels)
+        else:
+            datasets_train = [meta["parent_dataset"] for meta in train_meta]
+            datasets,counts = np.unique(datasets_train,return_counts=True)
+            dict_datasets = dict(zip(datasets,counts / sum(counts)))
+            freq = [ 1/ dict_datasets[dataset] for dataset in datasets_train]
+            rel_freq = (freq / sum(freq))
+            print(dict_datasets)
+
         if args.length_of_epoch is not None:
             train_sampler = WeightedRandomSampler(rel_freq, args.length_of_epoch)
         else:
-            train_sampler = WeightedRandomSampler(rel_freq, len(freq))
-
-        print(dict_datasets)
+            train_sampler = WeightedRandomSampler(rel_freq, len(rel_freq))
 
         datasets_val = [meta["parent_dataset"] for meta in val_meta]
         datasets,counts = np.unique(datasets_val,return_counts=True)

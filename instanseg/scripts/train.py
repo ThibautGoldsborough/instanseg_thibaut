@@ -71,6 +71,8 @@ parser.add_argument('-rng_seed', '--rng_seed', default=None, type=int, help = "O
 parser.add_argument('-use_deterministic', '--use_deterministic', default=False, type=lambda x: (str(x).lower() == 'true'), help = "Whether to use deterministic algorithms (default=False)")
 parser.add_argument('-tile', '--tile_size', default=256, type=int, help = "Tile sizes for the input images")
 parser.add_argument('-modality', '--modality_filter', default=None, type=str, help = "Filter datasets by image modality (e.g. 'Brightfield', 'Fluorescence'). Default None uses all modalities.")
+parser.add_argument('-sampling_mode', '--sampling_mode', default=None, type=str, help="Run embedding clustering instead of training. Options: leiden_dino, leiden_sam")
+parser.add_argument('-lora_rank', '--lora_rank', default=0, type=int, help="LoRA rank for SAM/DINO backbone. 0 = disabled, 16 is a good default.")
 
 
 def save_training_plot(train_losses, test_losses, f1_list, f1_list_cells, output_path, cells_and_nuclei=False, hotstart_epoch=None):
@@ -345,7 +347,14 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         print("Resuming training from epoch", model_dict['epoch'])
 
     else:
-        optimizer =get_optimizer(model.parameters(),args)
+        # Enable LoRA before creating optimizer (when no hotstart to handle it)
+        if args.lora_rank > 0 and args.hotstart_training == 0 and hasattr(model, 'enable_lora'):
+            model.freeze_backbone()
+            model.enable_lora(rank=args.lora_rank)
+            model.unfreeze_backbone()
+            optimizer = get_optimizer(filter(lambda p: p.requires_grad, model.parameters()), args)
+        else:
+            optimizer = get_optimizer(model.parameters(), args)
 
     if args.channel_invariant:
         from instanseg.utils.models.ChannelInvariantNet import AdaptorNetWrapper, has_AdaptorNet
@@ -424,6 +433,13 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
 
     model.to(device)
 
+    if args.sampling_mode is not None:
+        from instanseg.utils.sampling import run_sampling
+        run_sampling(args, train_loader, train_meta, device)
+        # Rebuild loaders with Leiden-weighted sampling and continue to training
+        args.weight = True
+        train_loader, test_loader = get_loaders(train_images, train_labels, val_images, val_labels, train_meta, val_meta, args)
+
     if args.save:
         if not os.path.exists(args.output_path):
             os.mkdir(args.output_path)
@@ -444,9 +460,9 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         hot_epochs = args.hotstart_training
         hotstart_lr = 1e-3
         mask_str = f", mask_loss=ce" if args.mask_loss_fn is not None else ""
-        print(f"Hotstart for {hot_epochs} epochs with seed_loss=ce, instance_loss=dice_loss{mask_str}, lr={hotstart_lr}")
+        print(f"Hotstart for {hot_epochs} epochs with seed_loss=l1_distance, instance_loss=dice_loss{mask_str}, lr={hotstart_lr}")
 
-        method.update_seed_loss("ce")
+        method.update_seed_loss("l1_distance")
         method.update_instance_loss("dice_loss")
         if args.mask_loss_fn is not None:
             method.update_mask_loss("ce")
@@ -464,10 +480,15 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
 
         # Unfreeze backbone weights after hotstart
         if _backbone_frozen:
-            print("Unfreezing backbone weights for main training")
-            model.unfreeze_backbone()
+            if args.lora_rank > 0 and hasattr(model, 'enable_lora'):
+                print(f"Enabling LoRA (rank={args.lora_rank}) for main training")
+                model.enable_lora(rank=args.lora_rank)
+                model.unfreeze_backbone()
+            else:
+                print("Unfreezing backbone weights for main training")
+                model.unfreeze_backbone()
 
-        optimizer = get_optimizer(model.parameters(), args)
+        optimizer = get_optimizer(filter(lambda p: p.requires_grad, model.parameters()), args)
 
         mask_str = f", mask_loss={args.mask_loss_fn}" if args.mask_loss_fn is not None else ""
         print(f"Starting main training with seed_loss={args.seed_loss_fn}, instance_loss={args.instance_loss_fn}{mask_str}, lr={args.lr}")

@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from instanseg.utils.models.InstanSeg_UNet import EncoderBlock, Decoder
+from instanseg.utils.models.InstanSeg_SAM import LoRALinear, _inject_lora
 
 
 class InstanSeg_DINO(nn.Module):
@@ -77,15 +78,31 @@ class InstanSeg_DINO(nn.Module):
             [Decoder(layers, out_channel, norm, act, dropout=dropout) for out_channel in out_channels]
         )
 
+        self._has_lora = False
+
     def freeze_backbone(self):
         """Freeze all pretrained DINOv2 weights."""
         for param in self.dino_encoder.parameters():
             param.requires_grad = False
 
     def unfreeze_backbone(self):
-        """Unfreeze all DINOv2 weights."""
-        for param in self.dino_encoder.parameters():
-            param.requires_grad = True
+        """Unfreeze all DINOv2 weights (or just LoRA params if LoRA has been injected)."""
+        if self._has_lora:
+            for module in self.dino_encoder.modules():
+                if isinstance(module, LoRALinear):
+                    module.lora_A.requires_grad = True
+                    module.lora_B.requires_grad = True
+        else:
+            for param in self.dino_encoder.parameters():
+                param.requires_grad = True
+
+    def enable_lora(self, rank: int = 16):
+        """Inject LoRA adapters into DINOv2 attention layers (qkv and proj)."""
+        _inject_lora(self.dino_encoder, ("qkv", "proj"), rank=rank)
+        self._has_lora = True
+        trainable = sum(p.numel() for p in self.dino_encoder.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.dino_encoder.parameters())
+        print(f"LoRA enabled (rank={rank}): {trainable/1e6:.1f}M / {total/1e6:.1f}M DINO params trainable")
 
     def _run_dino_blocks(self, x):
         """Run DINOv2 patch embed + blocks, extracting intermediate features."""

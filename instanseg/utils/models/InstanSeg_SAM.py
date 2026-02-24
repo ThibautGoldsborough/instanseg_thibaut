@@ -7,6 +7,32 @@ from pathlib import Path
 from instanseg.utils.models.InstanSeg_UNet import EncoderBlock, Decoder
 
 
+class LoRALinear(nn.Module):
+    """Low-rank adaptation wrapper for nn.Linear layers."""
+
+    def __init__(self, original: nn.Linear, rank: int = 16):
+        super().__init__()
+        self.original = original
+        # Freeze the original weights
+        for p in self.original.parameters():
+            p.requires_grad = False
+        self.lora_A = nn.Parameter(torch.randn(original.in_features, rank) * (1 / rank))
+        self.lora_B = nn.Parameter(torch.zeros(rank, original.out_features))
+
+    def forward(self, x):
+        return self.original(x) + (x @ self.lora_A) @ self.lora_B
+
+
+def _inject_lora(model: nn.Module, target_names: tuple[str, ...], rank: int = 16):
+    """Replace target nn.Linear layers with LoRALinear wrappers in-place."""
+    for name, module in model.named_modules():
+        for attr in target_names:
+            if hasattr(module, attr):
+                original = getattr(module, attr)
+                if isinstance(original, nn.Linear):
+                    setattr(module, attr, LoRALinear(original, rank=rank))
+
+
 class InstanSeg_SAM(nn.Module):
     def __init__(
         self,
@@ -94,6 +120,8 @@ class InstanSeg_SAM(nn.Module):
             [Decoder(layers, out_channel, norm, act, dropout=dropout) for out_channel in out_channels]
         )
 
+        self._has_lora = False
+
         # Load pretrained SAM weights
         self._load_sam_weights(sam_checkpoint)
 
@@ -126,9 +154,24 @@ class InstanSeg_SAM(nn.Module):
             param.requires_grad = False
 
     def unfreeze_backbone(self):
-        """Unfreeze all SAM weights."""
-        for param in self.sam_encoder.parameters():
-            param.requires_grad = True
+        """Unfreeze all SAM weights (or just LoRA params if LoRA has been injected)."""
+        if self._has_lora:
+            # Only unfreeze LoRA parameters, keep original weights frozen
+            for module in self.sam_encoder.modules():
+                if isinstance(module, LoRALinear):
+                    module.lora_A.requires_grad = True
+                    module.lora_B.requires_grad = True
+        else:
+            for param in self.sam_encoder.parameters():
+                param.requires_grad = True
+
+    def enable_lora(self, rank: int = 16):
+        """Inject LoRA adapters into SAM attention layers (qkv and proj)."""
+        _inject_lora(self.sam_encoder, ("qkv", "proj"), rank=rank)
+        self._has_lora = True
+        trainable = sum(p.numel() for p in self.sam_encoder.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.sam_encoder.parameters())
+        print(f"LoRA enabled (rank={rank}): {trainable/1e6:.1f}M / {total/1e6:.1f}M SAM params trainable")
 
     def _run_sam_blocks(self, x):
         """Run SAM patch embed + blocks, extracting intermediate features."""
