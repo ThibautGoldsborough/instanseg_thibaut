@@ -120,7 +120,8 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                     ("rotate", [1]),#Probability
                     ("brightness_augment", [0.2, amount]),#Probability/Amount
                     ("RandGaussianNoise", [0.2, amount]),#Probability/Amount
-                    ("perspective", [0, amount]),#Probability/Amount
+                    ("perspective", [0.2, amount]),#Probability/Amount
+                    ("elastic", [0.2, amount]),#Probability/Amount
                 ]),
                 "phase-contrast": collections.OrderedDict([
                     ("to_tensor", [1]), #Probability
@@ -137,20 +138,21 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                     ("channel_subsample", [channel_subsample_prob, (dim_in, dim_in)]),  #proba,(min,max)
                     ("pseudo_brightfield", [0, nuclei_channel]),
                     ("randomJPEGcompression", [0.2, amount]),
-                    ("extract_nucleus_and_cytoplasm_channels", [0.05 if channel_subsample_prob == 0 else 0, amount]),
+                    ("extract_nucleus_and_cytoplasm_channels", [0.05 if channel_invariance else 0, amount]),
                     ("pseudo_imc", [0, amount]),
-                    ("colourize", [0.1 if channel_subsample_prob == 0 else 0, nuclei_channel]),
+                    ("colourize", [0.1 if channel_invariance else 0, nuclei_channel]),
                    # ("draw_shapes", [0.05, amount]),
                     ("flips", [1]),
                     ("rotate", [1]),
-                    ("perspective", [0, amount]),
+                    ("perspective", [0.2, amount]),
+                    ("elastic", [0.2, amount]),#Probability/Amount
                     ("add_gradient", [0.05, amount]),
                     ("brightness_augment", [0.2, amount]),
                     ("RandGaussianNoise", [0.1, amount]),
                     ("HistogramNormalize", [0.1, amount]),
-                    ("add_noisy_channels", [0.3 if channel_subsample_prob == 0 else 0, 5]),#Probability/ max total channels
-                    ("channel_suppress", [1 if channel_subsample_prob == 0 else 0, 0.3]),  #proba, supression_factor
-                ]) 
+                    ("add_noisy_channels", [0.3 if channel_invariance else 0, 5]),#Probability/ max total channels
+                    ("channel_suppress", [1 if channel_invariance else 0, 0.3]),  #proba, supression_factor
+                ])
             },
             "test": {
                 "Brightfield": collections.OrderedDict([
@@ -170,9 +172,9 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                     ("normalize", [1]), #Probability
                     ("torch_rescale", [1,pixel_size, pixel_size_range_light]),#in microns per pixel
                     ("channel_subsample", [channel_subsample_prob, (dim_in, dim_in)]),  #proba,(min,max)
-                    ("pseudo_brightfield", [0, nuclei_channel]),
+                    ("pseudo_brightfield", [0 if not channel_invariance else 0, nuclei_channel]),
                     ("extract_nucleus_and_cytoplasm_channels", [0, amount]),
-                    ("colourize", [0, nuclei_channel]),
+                    ("colourize", [0 if not channel_invariance else 0, nuclei_channel]),
                     ("flips", [1])
 
                 ])

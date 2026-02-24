@@ -451,6 +451,45 @@ class Augmentations(object):
             show_images([orig, out, labels], )
         return out, labels
 
+    def elastic(self, image, labels, amount=0, metadata=None):
+        from scipy.ndimage import gaussian_filter
+        import torch.nn.functional as F
+
+        if self.debug:
+            orig = torch.clone(image)
+
+        _, H, W = image.shape
+        alpha = amount * 50.0  # displacement magnitude scales with amount
+        sigma = 5.0
+
+        dx = gaussian_filter(np.random.randn(H, W).astype(np.float32), sigma) * alpha
+        dy = gaussian_filter(np.random.randn(H, W).astype(np.float32), sigma) * alpha
+
+        grid_y, grid_x = torch.meshgrid(
+            torch.linspace(-1, 1, H), torch.linspace(-1, 1, W), indexing='ij'
+        )
+        grid_x = grid_x + torch.from_numpy(dx) * (2.0 / W)
+        grid_y = grid_y + torch.from_numpy(dy) * (2.0 / H)
+        grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)  # (1, H, W, 2)
+
+        # Use modality-appropriate padding: max for brightfield, min for fluorescence
+        is_brightfield = metadata is not None and metadata.get("image_modality") == "Brightfield"
+        img_pad_value = float(image.max() if is_brightfield else image.min())
+
+        out = F.grid_sample(image.unsqueeze(0).float(), grid.to(image.device),
+                            mode='bilinear', padding_mode='border', align_corners=True).squeeze(0)
+        # Identify out-of-bounds pixels and fill with the appropriate value
+        oob = (grid.squeeze(0)[..., 0].abs() > 1) | (grid.squeeze(0)[..., 1].abs() > 1)
+        out[:, oob] = img_pad_value
+
+        labels = F.grid_sample(labels.unsqueeze(0).float(), grid.to(labels.device),
+                               mode='nearest', padding_mode='zeros', align_corners=True).squeeze(0).to(labels.dtype)
+
+        if self.debug:
+            print("elastic")
+            show_images([orig, out, labels])
+        return out, labels
+
     def invert(self, image, labels, amount=0, metadata=None):
 
         out = 1 - image

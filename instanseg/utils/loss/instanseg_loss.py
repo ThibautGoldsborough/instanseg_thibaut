@@ -417,35 +417,14 @@ def guide_function(params: torch.Tensor,device ='cuda', width: int = 256):
 def generate_coordinate_map(mode: str = "linear", spatial_dim: int = 2, height: int = 256, width: int = 256, device: torch.device = torch.device(type='cuda')):
 
     if mode == "rope":
-        # 2D sinusoidal position encoding: half dims for y, half for x
-        # Each half uses (sin, cos) pairs at exponentially spaced frequencies
-        half = spatial_dim // 2
-        n_freqs = half // 2  # sin+cos pairs per axis
-        if n_freqs == 0:
-            return torch.zeros((spatial_dim, height, width), device=device)
-        theta = 100.0
-        freqs = 1.0 / (theta ** (torch.arange(0, n_freqs, dtype=torch.float32, device=device) / max(n_freqs, 1)))
-
-        y_pos = torch.arange(height, dtype=torch.float32, device=device)
-        x_pos = torch.arange(width, dtype=torch.float32, device=device)
-
-        # [n_freqs, height] and [n_freqs, width]
-        angles_y = torch.outer(y_pos, freqs)  # [height, n_freqs]
-        angles_x = torch.outer(x_pos, freqs)  # [width, n_freqs]
-
-        # Interleave sin/cos: [height, half] and [width, half]
-        pe_y = torch.stack([angles_y.sin(), angles_y.cos()], dim=-1).reshape(height, half)
-        pe_x = torch.stack([angles_x.sin(), angles_x.cos()], dim=-1).reshape(width, half)
-
-        # Broadcast to [half, H, W]
-        pe_y = pe_y.T.unsqueeze(-1).expand(half, height, width)   # [half, H, W]
-        pe_x = pe_x.T.unsqueeze(-2).expand(half, height, width)   # [half, H, W]
-
-        # Handle odd spatial_dim: extra dim goes to y
-        if spatial_dim % 2 == 1:
-            extra = torch.zeros(1, height, width, device=device)
-            return torch.cat([pe_y, pe_x, extra], dim=0)
-        return torch.cat([pe_y, pe_x], dim=0)
+        # RoPE needs raw linear coordinates — rotary encoding is applied
+        # inside the attention mechanism, not in the coordinate map.
+        if spatial_dim == 2:
+            xx = torch.linspace(0, width * 64 / 256, width, device=device).view(1, 1, -1).expand(1, height, width)
+            yy = torch.linspace(0, height * 64 / 256, height, device=device).view(1, -1, 1).expand(1, height, width)
+            return torch.cat((xx, yy), 0)
+        else:
+            raise NotImplementedError(f"RoPE coordinate map not implemented for spatial_dim={spatial_dim}")
 
     if mode == "linear":
         if spatial_dim ==2:
@@ -610,7 +589,7 @@ class ConvProbabilityNet(nn.Module):
 
 
 class AttentionPixelClassifier(nn.Module):
-    def __init__(self, embedding_dim, num_heads=4, head_dim=8, n_sigma=1):
+    def __init__(self, embedding_dim, num_heads=4, head_dim=8, n_sigma=1, rope_theta=10000.0):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -620,6 +599,9 @@ class AttentionPixelClassifier(nn.Module):
         self.q_proj = nn.Linear(dim_coords, num_heads * head_dim, bias=False)
         self.k_proj = nn.Linear(embedding_dim, num_heads * head_dim, bias=False)
         self.out_proj = nn.Linear(num_heads, 1)
+
+        # Precompute RoPE frequencies (non-learned, moves with model device)
+        self.register_buffer('rope_freqs', precompute_rope_freqs_2d(head_dim, theta=rope_theta))
 
     def forward(self, x, seed_emb=None, window_size=None, **kwargs):
         # x: [C, E+S, H, W] from feature_engineering_attention
@@ -637,7 +619,22 @@ class AttentionPixelClassifier(nn.Module):
         k = self.k_proj(pixel_features)  # [C, H*W, num_heads * head_dim]
         k = k.view(C, H * W, self.num_heads, self.head_dim).transpose(1, 2)  # [C, num_heads, H*W, head_dim]
 
-        # Plain cross-attention scores (no softmax — raw logits)
+        # Build relative positions: pixel positions relative to crop center (centroid)
+        # The crop is always centered on the centroid, so centroid is at (H//2, W//2)
+        ys = torch.arange(H, device=x.device, dtype=x.dtype) - H // 2  # [-H//2, ..., H//2-1]
+        xs = torch.arange(W, device=x.device, dtype=x.dtype) - W // 2
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        # pixel_pos: [H*W, 2] — (y, x) relative to centroid
+        pixel_pos = torch.stack([grid_y.flatten(), grid_x.flatten()], dim=-1)  # [H*W, 2]
+        # Q position is (0, 0) — centroid relative to itself
+        q_pos = torch.zeros(1, 2, device=x.device, dtype=x.dtype)  # [1, 2]
+
+        # Apply RoPE rotations to Q and K
+        freqs = self.rope_freqs
+        q = apply_rope_2d(q, q_pos, freqs)   # [C, num_heads, 1, head_dim]
+        k = apply_rope_2d(k, pixel_pos, freqs)  # [C, num_heads, H*W, head_dim]
+
+        # Cross-attention scores (no softmax — raw logits)
         scale = self.head_dim ** 0.5
         scores = torch.matmul(q, k.transpose(-2, -1)) / scale  # [C, num_heads, 1, H*W]
         scores = scores.squeeze(-2)  # [C, num_heads, H*W]
@@ -827,16 +824,18 @@ def feature_engineering_10(x: torch.Tensor, xxyy: torch.Tensor, c: torch.Tensor,
 
 def feature_engineering_attention(x: torch.Tensor, c: torch.Tensor, sigma: torch.Tensor, window_size: int,
                                   mesh_grid_flat: torch.Tensor):
-    """Extract crop embeddings WITHOUT subtracting centroids.
-    Returns 4D tensor [C, E+S, H, W] for use with AttentionPixelClassifier.
-    RoPE handles relative positioning instead of explicit subtraction."""
+    """Extract crop embeddings with centroid subtraction, returning 4D tensor
+    [C, E+S, H, W] for use with AttentionPixelClassifier.
+    RoPE in the classifier provides additional relative position encoding."""
     E = x.shape[0]
     C = c.shape[0]
     S = sigma.shape[0]
     x = torch.cat([x, sigma])[:, mesh_grid_flat[0], mesh_grid_flat[1]]
     x = rearrange(x, '(E) (C H W) -> C (E) H W',
                   E=E + S, C=C, H=2 * window_size, W=2 * window_size)
-    # NO centroid subtraction — RoPE encodes relative position
+    # Subtract centroid embeddings from spatial channels (not sigma)
+    c_shaped = c.view(-1, E, 1, 1)
+    x[:, :E] -= c_shaped
     return x
 
 
@@ -861,17 +860,18 @@ def feature_engineering_generator(feature_engineering_function):
 class InstanSeg(nn.Module):
 
     def __init__(self,
-                 n_sigma: int = 1, 
-                 instance_weight: float = 1.5, 
-                 device: str = 'cuda', 
-                 binary_loss_fn_str: str = "lovasz_hinge", 
-                 seed_loss_fn = "binary_xloss", 
-                 cells_and_nuclei: bool = False, 
-                 window_size = 256, 
+                 n_sigma: int = 1,
+                 instance_weight: float = 1.5,
+                 device: str = 'cuda',
+                 instance_loss_fn_str: str = "lovasz_hinge",
+                 seed_loss_fn = "ce",
+                 cells_and_nuclei: bool = False,
+                 window_size = 256,
                  feature_engineering_function = "0",
                  bg_weight = None,
                  dim_coords = 2,
-                 dim_seeds = 1,):
+                 dim_seeds = 1,
+                 mask_loss_fn = None,):
         
         super().__init__()
         self.n_sigma = n_sigma
@@ -895,53 +895,55 @@ class InstanSeg(nn.Module):
         self.feature_engineering_function = feature_engineering_function
         self.coord_mode = "rope" if feature_engineering_function == "attention" else "linear"  # attention_relative uses linear
 
-        self.update_binary_loss(binary_loss_fn_str)
+        self.update_instance_loss(instance_loss_fn_str)
         self.update_seed_loss(seed_loss_fn)
+        self.update_mask_loss(mask_loss_fn)
 
-    def update_binary_loss(self,binary_loss_fn_str):
+    def update_instance_loss(self, instance_loss_fn_str):
 
-        if binary_loss_fn_str == "lovasz_hinge":
+        if instance_loss_fn_str == "lovasz_hinge":
             from instanseg.utils.loss.lovasz_losses import lovasz_hinge
-            def binary_loss_fn(pred, gt, **kwargs):
-                return lovasz_hinge((pred.squeeze(1)), gt,per_image = True)
+            def instance_loss_fn(pred, gt, **kwargs):
+                return lovasz_hinge((pred.squeeze(1)), gt, per_image=True)
 
-        elif binary_loss_fn_str == "binary_xloss":
-            self.binary_loss_fn = torch.nn.BCEWithLogitsLoss()
+        elif instance_loss_fn_str == "ce":
+            self.instance_loss_fn = torch.nn.BCEWithLogitsLoss()
+            return
 
-        elif binary_loss_fn_str == "dicefocal_loss":
+        elif instance_loss_fn_str == "dicefocal_loss":
             from monai.losses import DiceFocalLoss
-            binary_loss_fn_ = DiceFocalLoss(sigmoid=True)
-            def binary_loss_fn(pred, gt, **kwargs):
-                l = binary_loss_fn_(pred[None,:,0], gt.unsqueeze(0)) * 1.5
+            instance_loss_fn_ = DiceFocalLoss(sigmoid=True)
+            def instance_loss_fn(pred, gt, **kwargs):
+                l = instance_loss_fn_(pred[None,:,0], gt.unsqueeze(0)) * 1.5
                 return l
-        elif binary_loss_fn_str == "dice_loss":
+        elif instance_loss_fn_str == "dice_loss":
             from monai.losses import DiceLoss
-            binary_loss_fn_ = DiceLoss(sigmoid=True)
-            def binary_loss_fn(pred, gt, **kwargs):
-                l = binary_loss_fn_(pred[None,:,0], gt.unsqueeze(0)) * 1.5
+            instance_loss_fn_ = DiceLoss(sigmoid=True)
+            def instance_loss_fn(pred, gt, **kwargs):
+                l = instance_loss_fn_(pred[None,:,0], gt.unsqueeze(0)) * 1.5
                 return l
 
-        elif binary_loss_fn_str == "general_dice_loss":
+        elif instance_loss_fn_str == "general_dice_loss":
             from monai.losses import GeneralizedDiceLoss
-            def binary_loss_fn(pred, gt):
+            def instance_loss_fn(pred, gt):
                 return GeneralizedDiceLoss(sigmoid=True)(pred, gt.unsqueeze(1))
         else:
-            raise NotImplementedError("Binary loss function",binary_loss_fn,"is not implemented")
-        self.binary_loss_fn = binary_loss_fn
+            raise NotImplementedError(f"Instance loss function '{instance_loss_fn_str}' is not implemented")
+        self.instance_loss_fn = instance_loss_fn
 
-    def update_seed_loss(self,seed_loss_fn):
-        if seed_loss_fn in ["binary_xloss"]:
+    def update_seed_loss(self, seed_loss_fn):
+        if seed_loss_fn in ["ce"]:
             binary_loss = torch.nn.BCEWithLogitsLoss(reduction='none')
 
-            def seed_loss(x,y, mask = None):
+            def seed_loss(x, y, mask=None):
                 if mask is not None:
-                    mask = mask.float()  # Ensure the mask is float for multiplication
-                    loss = binary_loss(x, (y > 0).float())  # Calculate the element-wise binary loss
-                    masked_loss = loss * mask  # Apply the mask to the loss
+                    mask = mask.float()
+                    loss = binary_loss(x, (y > 0).float())
+                    masked_loss = loss * mask
                     return masked_loss.sum() / mask.sum()
                 else:
                     return binary_loss(x, (y > 0).float()).mean()
-                
+
             self.seed_loss = seed_loss
 
         elif seed_loss_fn in ["l1_distance", "l2_distance"]:
@@ -951,13 +953,13 @@ class InstanSeg(nn.Module):
                 distance_loss = torch.nn.L1Loss(reduction='none')
             elif seed_loss_fn == "l2_distance":
                 distance_loss = torch.nn.MSELoss(reduction='none')
-            
-            def seed_loss(x,y, mask = None):
-                edt = (instance_wise_edt(y.float(), edt_type= 'edt') - 0.5 ) * 15 #This is to mimick the range of CELoss
+
+            def seed_loss(x, y, mask=None):
+                edt = (instance_wise_edt(y.float(), edt_type='edt') - 0.5) * 15
                 loss = distance_loss((x), (edt[None]))
 
                 if self.bg_weight is not None:
-                    weights = torch.where(edt < 0,self.bg_weight, 1.0)  # Assign lower weight to targets below 0
+                    weights = torch.where(edt < 0, self.bg_weight, 1.0)
                     loss = loss * weights
 
                 if mask is not None:
@@ -966,32 +968,35 @@ class InstanSeg(nn.Module):
                     return masked_loss.sum() / mask.sum()
                 else:
                     return loss.mean()
-                
-            self.seed_loss = seed_loss
 
-        elif seed_loss_fn in ["distance_and_binary_loss"]:
-            distance_loss = torch.nn.MSELoss(reduction='none')
-            binary_loss = torch.nn.BCEWithLogitsLoss(reduction='none')
-            from instanseg.utils.pytorch_utils import instance_wise_edt
-            def seed_loss(x,y, mask = None):
-                seed_map = x[0][None]
-                binary_map = x[1][None]
-
-                edt = (instance_wise_edt(y.float(), edt_type= 'edt')[None] - 0.5) * 15 #This is to mimick the range of CELoss
-                loss = (distance_loss(seed_map,edt) * (y>0)) + binary_loss(binary_map, (y > 0).float())
-
-                if mask is not None:
-                    mask = mask.float()
-                    masked_loss = loss * mask
-                    return masked_loss.sum() / mask.sum()
-                else:
-                    return loss.mean()
-    
-            
             self.seed_loss = seed_loss
 
         else:
-            raise NotImplementedError("Seedloss function",seed_loss_fn,"is not implemented")
+            raise NotImplementedError(f"Seed loss function '{seed_loss_fn}' is not implemented")
+
+    def update_mask_loss(self, mask_loss_fn):
+        self.mask_loss_fn_str = mask_loss_fn
+        if mask_loss_fn is None:
+            self.mask_loss = None
+        elif mask_loss_fn == "ce":
+            bce = torch.nn.BCEWithLogitsLoss(reduction='none')
+            def mask_loss(x, y, mask=None, bg_weight=None):
+                loss = bce(x, (y > 0).float())
+                if bg_weight is not None:
+                    loss = loss * torch.where(y == 0, bg_weight, 1.0)
+                if mask is not None:
+                    mask = mask.float()
+                    return (loss * mask).sum() / (mask.sum() + 1e-4)
+                return loss.mean()
+            self.mask_loss = mask_loss
+        elif mask_loss_fn == "dice":
+            from monai.losses import DiceLoss
+            dice = DiceLoss(sigmoid=True)
+            def mask_loss(x, y, mask=None, bg_weight=None):
+                return dice(x, (y > 0).float())
+            self.mask_loss = mask_loss
+        else:
+            raise NotImplementedError(f"Mask loss function '{mask_loss_fn}' is not implemented")
 
     def initialize_pixel_classifier(self, model, MLP_width = 10, MLP_input_dim = None):
 
@@ -1081,7 +1086,11 @@ class InstanSeg(nn.Module):
                     mask = None
 
             
-                seed_loss_tmp = self.seed_loss(seed_map,instance, mask = mask)
+                if self.mask_loss is not None and self.dim_seeds == 2:
+                    seed_loss_tmp = self.seed_loss(seed_map[0:1], instance, mask=mask)
+                    seed_loss_tmp += self.mask_loss(seed_map[1:2], instance, mask=mask, bg_weight=self.bg_weight)
+                else:
+                    seed_loss_tmp = self.seed_loss(seed_map, instance, mask=mask)
 
                 seed_loss += seed_loss_tmp
 
@@ -1148,7 +1157,7 @@ class InstanSeg(nn.Module):
                     
 
                     crop = onehot_labels.squeeze(1)[coords[0], coords[1], coords[2]].reshape(-1,window_size, window_size)
-                    instance_loss = instance_loss + self.binary_loss_fn(dist,crop.float(), sigma = sigma[0])
+                    instance_loss = instance_loss + self.instance_loss_fn(dist, crop.float(), sigma=sigma[0])
 
                 loss += w_inst * instance_loss + w_seed * seed_loss
 

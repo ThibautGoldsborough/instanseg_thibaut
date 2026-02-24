@@ -146,6 +146,60 @@ def build_model_from_dict(build_model_dictionary, random_seed = None):
                             dropout=build_model_dictionary["dropprob"])
             
 
+    elif build_model_dictionary["model_str"].lower() == "instanseg_sam":
+            from instanseg.utils.models.InstanSeg_SAM import InstanSeg_SAM
+            print("Generating InstanSeg_SAM")
+            multihead = build_model_dictionary["multihead"]
+
+            if build_model_dictionary["cells_and_nuclei"]:
+                n_seeds = build_model_dictionary["dim_seeds"]
+                if not multihead:
+                    from itertools import chain
+                    out_channels = [[build_model_dictionary["dim_coords"], build_model_dictionary["n_sigma"],n_seeds] for i in range(2)]
+                    out_channels = list(chain(*out_channels))
+
+                else:
+                    out_channels = [[build_model_dictionary["dim_coords"], build_model_dictionary["n_sigma"],n_seeds] for i in range(2)]
+            else:
+                n_seeds = build_model_dictionary["dim_seeds"]
+                if not multihead:
+                    out_channels = [[build_model_dictionary["dim_coords"], build_model_dictionary["n_sigma"],n_seeds]]
+                else:
+                    out_channels = [[build_model_dictionary["dim_coords"]], [build_model_dictionary["n_sigma"]],[n_seeds]]
+
+            model = InstanSeg_SAM(in_channels=dim_in,
+                            layers = np.array(build_model_dictionary["layers"])[::-1],
+                            out_channels=out_channels,
+                            norm  = build_model_dictionary["norm"],
+                            dropout=build_model_dictionary["dropprob"])
+
+    elif build_model_dictionary["model_str"].lower() == "instanseg_dino":
+            from instanseg.utils.models.InstanSeg_DINO import InstanSeg_DINO
+            print("Generating InstanSeg_DINO")
+            multihead = build_model_dictionary["multihead"]
+
+            if build_model_dictionary["cells_and_nuclei"]:
+                n_seeds = build_model_dictionary["dim_seeds"]
+                if not multihead:
+                    from itertools import chain
+                    out_channels = [[build_model_dictionary["dim_coords"], build_model_dictionary["n_sigma"],n_seeds] for i in range(2)]
+                    out_channels = list(chain(*out_channels))
+
+                else:
+                    out_channels = [[build_model_dictionary["dim_coords"], build_model_dictionary["n_sigma"],n_seeds] for i in range(2)]
+            else:
+                n_seeds = build_model_dictionary["dim_seeds"]
+                if not multihead:
+                    out_channels = [[build_model_dictionary["dim_coords"], build_model_dictionary["n_sigma"],n_seeds]]
+                else:
+                    out_channels = [[build_model_dictionary["dim_coords"]], [build_model_dictionary["n_sigma"]],[n_seeds]]
+
+            model = InstanSeg_DINO(in_channels=dim_in,
+                            layers = np.array(build_model_dictionary["layers"])[::-1],
+                            out_channels=out_channels,
+                            norm  = build_model_dictionary["norm"],
+                            dropout=build_model_dictionary["dropprob"])
+
     elif build_model_dictionary["model_str"].lower() == "cellposesam":
         from instanseg.utils.models.CellposeSam import CellposeSam
         print("Generating CellposeSam")

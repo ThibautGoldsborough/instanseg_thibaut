@@ -184,14 +184,15 @@ if __name__ == "__main__":
     if parser_args.loss_function.lower() == "instanseg_loss":
         from instanseg.utils.loss.instanseg_loss import InstanSeg
 
-        method = InstanSeg(binary_loss_fn_str=model_dict["binary_loss_fn"], 
+        method = InstanSeg(instance_loss_fn_str=model_dict.get("instance_loss_fn", model_dict.get("binary_loss_fn", "lovasz_hinge")),
                            seed_loss_fn=model_dict["seed_loss_fn"],
                            n_sigma=model_dict["n_sigma"],
                            cells_and_nuclei=model_dict["cells_and_nuclei"],
-                           window_size=parser_args.window_size, 
+                           window_size=parser_args.window_size,
                            dim_coords=model_dict["dim_coords"],
-                           dim_seeds= model_dict["dim_seeds"],
-                           feature_engineering_function=model_dict["feature_engineering"])
+                           dim_seeds=model_dict["dim_seeds"],
+                           feature_engineering_function=model_dict["feature_engineering"],
+                           mask_loss_fn=model_dict.get("mask_loss_fn", None))
 
         if parser_args.target_segmentation is None:
             parser_args.cells_and_nuclei = model_dict["cells_and_nuclei"]

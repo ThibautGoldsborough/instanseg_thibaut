@@ -43,16 +43,17 @@ parser.add_argument("-layers", "--layers", type=str, default="[32, 64, 128, 256]
 parser.add_argument("-slice", "--data_slice", type=int, default=None, help = "Slice of the dataset to use, useful for debugging (e.g. only train on 1 image)")
 parser.add_argument("-clip", "--clip", type=float, default=20, help ="Gradient clipping value")
 parser.add_argument("-decay", "--weight_decay", type=float, default=0.000, help = "Weight decay")
-parser.add_argument("-drop", "--dropprob", type=float, default=0., help = "Dropout probability, Not implemented for InstanSeg_UNet")
+parser.add_argument("-drop", "--dropprob", type=float, default=0., help = "Dropout probability applied to encoder/decoder blocks (Dropout2d)")
 parser.add_argument("-tf", "--transform_intensity", type=float, default=0.5, help = "Intensity transformation factor")
 parser.add_argument("-dim_in", "--dim_in", type=int, default=3,help="Number of channels that the (backbone) model expects. This is also the number of channels a channel invariant model would output.")
 parser.add_argument("-dummy", "--dummy", default=False, type=lambda x: (str(x).lower() == 'true'),help="Use the training set as a validation set, this will trigger a warning message. use only for debugging")
 parser.add_argument('-bg_weight', '--bg_weight', default=None, type= float, help = "Weight to assign to the background class in the loss function")
-parser.add_argument('-binary_loss_fn', '--binary_loss_fn', default="lovasz_hinge", type=str, help = "Loss function to use for instance segmentation: lovasz_hinge or dice_loss are supported. lovasz_hinge is a lot slower to start converging")
-parser.add_argument('-seed_loss_fn', '--seed_loss_fn', default="l1_distance", type=str, help = "Loss function to use for seed selection, only binary_xloss and l1_distance are supported. Binary_xloss is much faster, but l1_distance is usually more accurate")
+parser.add_argument('-instance_loss_fn', '--instance_loss_fn', default="lovasz_hinge", type=str, help = "Loss function to use for instance segmentation: lovasz_hinge or dice_loss are supported. lovasz_hinge is a lot slower to start converging")
+parser.add_argument('-seed_loss_fn', '--seed_loss_fn', default="l1_distance", type=str, help = "Loss function to use for seed selection, only ce and l1_distance are supported. ce is much faster, but l1_distance is usually more accurate")
+parser.add_argument('-mask_loss_fn', '--mask_loss_fn', default=None, type=str, help = "Loss function to use for the mask channel when dim_seeds=2: ce or dice are supported. If set, dim_seeds is forced to 2.")
 parser.add_argument('-anneal', '--cosineannealing', default=False, type=lambda x: (str(x).lower() == 'true'), help = "Whether to use cosine annealing for the learning rate")
 parser.add_argument('-o_h', '--optimize_hyperparameters', default=False, type=lambda x: (str(x).lower() == 'true'), help = "Whether to optimize hyperparameters every 10 epochs")
-parser.add_argument('-hotstart', '--hotstart_training', default=10, type=int, help = "Number of epochs to train the model with binary_xloss before starting the main training loop (default=10)")
+parser.add_argument('-hotstart', '--hotstart_training', default=10, type=int, help = "Number of epochs to train the model with ce before starting the main training loop (default=10)")
 parser.add_argument('-window', '--window_size', default=128, type=int, help = "Size of the window containing each instance")
 parser.add_argument('-multihead', '--multihead', default= False, type=lambda x: (str(x).lower() == 'true'), help = "Whether to branch the decoder into multiple heads.")
 parser.add_argument('-dim_coords', '--dim_coords', default=2, type=int, help = "Dimensionality of the coordinate system. Little support for anything but 2")
@@ -60,9 +61,9 @@ parser.add_argument('-dim_seeds', '--dim_seeds', default=1, type=int, help = "Nu
 parser.add_argument('-norm', '--norm', default="BATCH", type=str, help = "Norm layer to use: None, INSTANCE, INSTANCE_INVARIANT, BATCH")
 parser.add_argument('-mlp_w', '--mlp_width', default=5, type=int, help = "Width of the MLP hidden dim")
 parser.add_argument('-augmentation_type', '--augmentation_type', default="minimal", type=str, help = "'minimal' or 'heavy' or 'brightfield_only'")
+parser.add_argument('-show_augmentations', '--show_augmentations', default=False, type=lambda x: (str(x).lower() == 'true'), help = "Save 10 example augmented image+label pairs to the output folder")
 parser.add_argument('-adaptor_net', '--adaptor_net_str', default="1", type=str, help = "Adaptor net to use")
 parser.add_argument('-freeze', '--freeze_main_model', default=False, type=lambda x: (str(x).lower() == 'true'), help = "Whether to freeze the main model")
-parser.add_argument('-freeze_sam', '--freeze_sam', default=False, type=lambda x: (str(x).lower() == 'true'), help = "Whether to freeze the SAM weights")
 parser.add_argument('-f_e', '--feature_engineering', default="0", type=str, help = "Feature engineering function to use")
 parser.add_argument("-f","--f", default = None, type = str, help = "ignore, this is for jypyter notebook compatibility")
 parser.add_argument('-rng_seed', '--rng_seed', default=None, type=int, help = "Optional seed for the random number generator")
@@ -71,16 +72,56 @@ parser.add_argument('-tile', '--tile_size', default=256, type=int, help = "Tile 
 parser.add_argument('-modality', '--modality_filter', default=None, type=str, help = "Filter datasets by image modality (e.g. 'Brightfield', 'Fluorescence'). Default None uses all modalities.")
 
 
-def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name='output_epoch'):
+def save_training_plot(train_losses, test_losses, f1_list, f1_list_cells, output_path, cells_and_nuclei=False, hotstart_epoch=None):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    window_size = max(len(train_losses) // 10 + 1, 1)
+
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+
+    clip_val = np.percentile(test_losses, [99])
+    test_clipped = np.clip(test_losses, 0, clip_val[0])
+    clip_val = np.percentile(train_losses, [99])
+    train_clipped = np.clip(train_losses, 0, clip_val[0])
+
+    ax1.plot(np.convolve(train_clipped, np.ones(window_size), 'valid') / window_size, label="train loss", color="tab:blue")
+    ax1.plot(np.convolve(test_clipped, np.ones(window_size), 'valid') / window_size, label="test loss", color="tab:orange")
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Loss")
+
+    if hotstart_epoch is not None and hotstart_epoch > 0:
+        ax1.axvline(x=hotstart_epoch, color='red', linestyle=':', linewidth=1, label="hotstart end")
+
+    ax1.legend(loc="upper left")
+
+    ax2 = ax1.twinx()
+    ax2.set_ylabel("F1 Score")
+    ax2.set_ylim(0, 1)
+
+    if cells_and_nuclei:
+        ax2.plot(f1_list, label="f1 nuclei", color="tab:green", linestyle="--")
+        ax2.plot(f1_list_cells, label="f1 cells", color="tab:red", linestyle="--")
+    else:
+        ax2.plot(f1_list, label="f1 score", color="tab:green", linestyle="--")
+    ax2.legend(loc="upper right")
+
+    fig.savefig(output_path / "training_plot.png")
+    plt.close(fig)
+
+
+def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name='output_epoch',
+         prior_train_losses=None, prior_test_losses=None, prior_f1_list=None, prior_f1_list_cells=None, hotstart_epoch=None):
     from instanseg.utils.AI_utils import optimize_hyperparameters, train_epoch, test_epoch
     global best_f1_score, device, method, iou_threshold, args, optimizer, scheduler
 
-    train_losses = []
-    test_losses = []
+    train_losses = list(prior_train_losses) if prior_train_losses else []
+    test_losses = list(prior_test_losses) if prior_test_losses else []
 
     best_f1_score = -1
-    f1_list = []
-    f1_list_cells = []
+    f1_list = list(prior_f1_list) if prior_f1_list else []
+    f1_list_cells = list(prior_f1_list_cells) if prior_f1_list_cells else []
 
     for epoch in range(num_epochs):
 
@@ -147,6 +188,9 @@ def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name=
 
         # this is where the loss gets printed
         print(", ".join(f"{k}: {v:.5g}" for k, v in dict_to_print.items()))
+
+        save_training_plot(train_losses, test_losses, f1_list, f1_list_cells,
+                           args.output_path, args.cells_and_nuclei, hotstart_epoch=hotstart_epoch)
 
     return model, train_losses, test_losses, f1_list, f1_list_cells
 
@@ -216,12 +260,16 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         from instanseg.utils.loss.instanseg_loss import InstanSeg
 
 
-        if args.dim_seeds == 2 and args.seed_loss_fn != "distance_and_binary_loss":
+        if args.mask_loss_fn is not None and args.dim_seeds != 2:
             import warnings
-            warnings.warn(f"dim_seeds is 2, switching seed_loss_fn from '{args.seed_loss_fn}' to 'distance_and_binary_loss'")
-            args.seed_loss_fn = "distance_and_binary_loss"
+            warnings.warn(f"mask_loss_fn='{args.mask_loss_fn}' requires dim_seeds=2, setting dim_seeds=2")
+            args.dim_seeds = 2
+        if args.dim_seeds == 2 and args.mask_loss_fn is None:
+            import warnings
+            warnings.warn("dim_seeds=2 but mask_loss_fn not set, defaulting to mask_loss_fn='dice'")
+            args.mask_loss_fn = "dice"
 
-        method = InstanSeg(binary_loss_fn_str=args.binary_loss_fn,
+        method = InstanSeg(instance_loss_fn_str=args.instance_loss_fn,
                         seed_loss_fn = args.seed_loss_fn,
                         device = device,
                         n_sigma=n_sigma,
@@ -230,7 +278,8 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
                         dim_coords= args.dim_coords,
                         dim_seeds = args.dim_seeds,
                         feature_engineering_function=args.feature_engineering,
-                        bg_weight = args.bg_weight)  # binary_xloss, lovasz_hinge dice_loss general_dice_loss
+                        bg_weight = args.bg_weight,
+                        mask_loss_fn = args.mask_loss_fn)
 
         def loss_fn(*args, **kwargs):
             return method.forward(*args, **kwargs)
@@ -261,16 +310,17 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
     except:
         pass
 
-    def get_optimizer(parameters, args):
+    def get_optimizer(parameters, args, lr=None):
+        lr = lr if lr is not None else args.lr
         if args.optimizer.lower() == "adam":
-            return optim.Adam(parameters, lr=args.lr, weight_decay=args.weight_decay)
+            return optim.Adam(parameters, lr=lr, weight_decay=args.weight_decay)
         elif args.optimizer.lower() == "sgd":
-            return optim.SGD(parameters, lr=args.lr, weight_decay=args.weight_decay)
+            return optim.SGD(parameters, lr=lr, weight_decay=args.weight_decay)
         elif args.optimizer.lower() == "adamw":
-            return optim.AdamW(parameters, lr=args.lr, weight_decay=args.weight_decay)
+            return optim.AdamW(parameters, lr=lr, weight_decay=args.weight_decay)
         elif args.optimizer.lower() == "adopt":
             from adopt import ADOPT
-            return ADOPT(parameters, lr=args.lr, weight_decay=args.weight_decay)
+            return ADOPT(parameters, lr=lr, weight_decay=args.weight_decay)
         else:
             raise NotImplementedError("Optimizer not recognized", args.optimizer)
 
@@ -351,7 +401,22 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
                                                                                                        complete_dataset=segmentation_dataset)
 
     train_loader, test_loader = get_loaders(train_images, train_labels, val_images, val_labels, train_meta, val_meta, args)
-    
+
+    if args.show_augmentations:
+        from instanseg.utils.visualization import show_images
+        aug_dir = args.output_path / "augmentation_examples"
+        os.makedirs(aug_dir, exist_ok=True)
+        train_dataset = train_loader.dataset
+        for i in range(min(10, len(train_dataset))):
+            raw_img = train_dataset.X[i]
+            raw_lbl = train_dataset.Y[i]
+            aug_img, aug_lbl = train_dataset[i][:2]
+            show_images(raw_img, raw_lbl, aug_img, aug_lbl,
+                        titles=["Raw image", "Raw label", "Aug image", "Aug label"],
+                        labels=[1, 3], n_cols=4,
+                        save_str=str(aug_dir / f"sample_{i:02d}"))
+        print(f"Saved {min(10, len(train_dataset))} augmentation examples to {aug_dir}")
+
     if torch.cuda.device_count() > 1:
         print("Using", torch.cuda.device_count(), "GPUs!")
         model = nn.DataParallel(model)
@@ -376,19 +441,47 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
 
     if args.hotstart_training > 0:
         hot_epochs = args.hotstart_training
-        seed_loss_str = "distance_and_binary_loss" if args.dim_seeds == 2 else "binary_xloss"
-        print("Hotstart for "+str(hot_epochs)+" epochs with "+seed_loss_str+" and dice_loss")
-        if args.dim_seeds != 2:
-            method.update_seed_loss("binary_xloss")
-        method.update_binary_loss("dice_loss")
+        hotstart_lr = 1e-3
+        mask_str = f", mask_loss=ce" if args.mask_loss_fn is not None else ""
+        print(f"Hotstart for {hot_epochs} epochs with seed_loss=ce, instance_loss=dice_loss{mask_str}, lr={hotstart_lr}")
+
+        method.update_seed_loss("ce")
+        method.update_instance_loss("dice_loss")
+        if args.mask_loss_fn is not None:
+            method.update_mask_loss("ce")
+
+        # Freeze pretrained backbone weights during hotstart
+        _backbone_frozen = hasattr(model, 'freeze_backbone')
+        if _backbone_frozen:
+            print("Freezing backbone weights for hotstart")
+            model.freeze_backbone()
+            optimizer = get_optimizer(filter(lambda p: p.requires_grad, model.parameters()), args, lr=hotstart_lr)
+        else:
+            optimizer = get_optimizer(model.parameters(), args, lr=hotstart_lr)
+
         model, train_losses, test_losses, f1_list, f1_list_cells = main(model, loss_fn, train_loader, test_loader, num_epochs=hot_epochs, epoch_name='hotstart_epoch')
 
-        print("Starting main training loop with",args.seed_loss_fn, "and", args.binary_loss_fn)
-        if args.dim_seeds != 2:
-            method.update_seed_loss(args.seed_loss_fn)
-        method.update_binary_loss(args.binary_loss_fn)
+        # Unfreeze backbone weights after hotstart
+        if _backbone_frozen:
+            print("Unfreezing backbone weights for main training")
+            model.unfreeze_backbone()
 
-    model, train_losses, test_losses, f1_list, f1_list_cells = main(model, loss_fn, train_loader, test_loader, num_epochs=num_epochs)
+        optimizer = get_optimizer(model.parameters(), args)
+
+        mask_str = f", mask_loss={args.mask_loss_fn}" if args.mask_loss_fn is not None else ""
+        print(f"Starting main training with seed_loss={args.seed_loss_fn}, instance_loss={args.instance_loss_fn}{mask_str}, lr={args.lr}")
+        method.update_seed_loss(args.seed_loss_fn)
+        method.update_instance_loss(args.instance_loss_fn)
+        if args.mask_loss_fn is not None:
+            method.update_mask_loss(args.mask_loss_fn)
+
+    if args.hotstart_training > 0:
+        model, train_losses, test_losses, f1_list, f1_list_cells = main(model, loss_fn, train_loader, test_loader, num_epochs=num_epochs,
+            prior_train_losses=train_losses, prior_test_losses=test_losses,
+            prior_f1_list=f1_list, prior_f1_list_cells=f1_list_cells,
+            hotstart_epoch=args.hotstart_training)
+    else:
+        model, train_losses, test_losses, f1_list, f1_list_cells = main(model, loss_fn, train_loader, test_loader, num_epochs=num_epochs)
 
     from instanseg.utils.model_loader import load_model
     model, model_dict = load_model(folder="", path=args.output_path) #Load model from checkpoint
