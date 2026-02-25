@@ -74,6 +74,7 @@ parser.add_argument('-modality', '--modality_filter', default=None, type=str, he
 parser.add_argument('-sampling_mode', '--sampling_mode', default=None, type=str, help="Run embedding clustering instead of training. Options: leiden_dino, leiden_sam")
 parser.add_argument('-lora_rank', '--lora_rank', default=0, type=int, help="LoRA rank for SAM/DINO backbone. 0 = disabled, 16 is a good default.")
 parser.add_argument('-fp16', '--fp16', default=False, type=lambda x: (str(x).lower() == 'true'), help="Enable mixed precision (float16) training")
+parser.add_argument('-seed_merging', '--seed_merging', default=False, type=lambda x: (str(x).lower() == 'true'), help="Enable seed-seed attention merging")
 
 
 def save_training_plot(train_losses, test_losses, f1_list, f1_list_cells, output_path, cells_and_nuclei=False, hotstart_epoch=None):
@@ -285,7 +286,8 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
                         dim_seeds = args.dim_seeds,
                         feature_engineering_function=args.feature_engineering,
                         bg_weight = args.bg_weight,
-                        mask_loss_fn = args.mask_loss_fn)
+                        mask_loss_fn = args.mask_loss_fn,
+                        seed_merging = args.seed_merging)
 
         def loss_fn(*args, **kwargs):
             return method.forward(*args, **kwargs)

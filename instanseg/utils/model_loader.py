@@ -99,6 +99,10 @@ def read_model_args_from_csv(path=r"../results/", folder=""):
         build_model_dictionary["dim_seeds"] = int(build_model_dictionary["dim_seeds"])
     else:
         build_model_dictionary["dim_seeds"] = 1
+    if "seed_merging" in build_model_dictionary.keys():
+        build_model_dictionary["seed_merging"] = bool(eval(str(build_model_dictionary["seed_merging"])))
+    else:
+        build_model_dictionary["seed_merging"] = False
 
     return build_model_dictionary
 

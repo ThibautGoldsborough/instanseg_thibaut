@@ -193,13 +193,15 @@ def _robust_average_precision(labels, predicted, threshold):
 
     for i in range(len(labels)):
         if labels[i].min() < 0 and not (labels[i] < 0).all():
-            labels[i][labels[i] < 0] = 0 #sparse labels
-            predicted[i][labels[i] < 0] = 0
+            sparse_mask = labels[i] < 0
+            labels[i][sparse_mask] = 0 #sparse labels
+            predicted[i][sparse_mask] = 0
 
 
     if labels[0].shape[0] != 2: #cells or nuclei
-        labels = [_to_matching_format(labels[i]) for i, l in enumerate(labels) if labels[i].min() >= 0 and labels[i].max() > 0]
-        predicted = [_to_matching_format(predicted[i]) for i, l in enumerate(labels) if labels[i].min() >= 0 and labels[i].max() > 0]
+        valid = [i for i in range(len(labels)) if labels[i].min() >= 0 and labels[i].max() > 0]
+        labels = [_to_matching_format(labels[i]) for i in valid]
+        predicted = [_to_matching_format(predicted[i]) for i in valid]
 
         if len(labels)==0:
             return np.nan

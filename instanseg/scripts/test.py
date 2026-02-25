@@ -192,7 +192,8 @@ if __name__ == "__main__":
                            dim_coords=model_dict["dim_coords"],
                            dim_seeds=model_dict["dim_seeds"],
                            feature_engineering_function=model_dict["feature_engineering"],
-                           mask_loss_fn=model_dict.get("mask_loss_fn", None))
+                           mask_loss_fn=model_dict.get("mask_loss_fn") if str(model_dict.get("mask_loss_fn", "nan")).lower() != "nan" else None,
+                           seed_merging=model_dict.get("seed_merging", False))
 
         if parser_args.target_segmentation is None:
             parser_args.cells_and_nuclei = model_dict["cells_and_nuclei"]

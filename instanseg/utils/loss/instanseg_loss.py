@@ -327,15 +327,16 @@ def has_pixel_classifier_model(model):
 
 
 
-def merge_sparse_predictions(x: torch.Tensor, 
+def merge_sparse_predictions(x: torch.Tensor,
                              coords: torch.Tensor,
-                               mask_map: torch.Tensor, 
-                               size : list[int], 
-                               mask_threshold: float = 0.5, 
+                               mask_map: torch.Tensor,
+                               size : list[int],
+                               mask_threshold: float = 0.5,
                                window_size = 128,
-                                min_size = 10, 
-                                overlap_threshold = 0.5, 
-                                mean_threshold = 0.5):
+                                min_size = 10,
+                                overlap_threshold = 0.5,
+                                mean_threshold = 0.5,
+                                seed_affinity: torch.Tensor = None):
 
 
     labels = convert(x, coords, size=(size[1], size[2]), mask_threshold=mask_threshold)[None]
@@ -379,11 +380,14 @@ def merge_sparse_predictions(x: torch.Tensor,
         return labels
 
     iou = fast_sparse_iou(sparse_onehot)
-   
-   # iou = fast_sparse_intersection_over_minimum_area(sparse_onehot)
-    
 
-    remapping = find_connected_components((iou>overlap_threshold).float() )
+    adjacency = (iou > overlap_threshold)
+    if seed_affinity is not None:
+        sa = seed_affinity.to(adjacency.device)
+        sym_affinity = torch.maximum(sa, sa.T)
+        adjacency = adjacency | (sym_affinity > mask_threshold)
+
+    remapping = find_connected_components(adjacency.float())
 
     if using_mps:
         device = 'mps'
@@ -839,6 +843,53 @@ def feature_engineering_attention(x: torch.Tensor, c: torch.Tensor, sigma: torch
     return x
 
 
+def compute_seed_merge_matrix(seed_embs, seed_sigmas, pixel_classifier):
+    """
+    seed_embs: [K, E] — seed embedding vectors
+    seed_sigmas: [K, S] — sigma values at seed locations
+    pixel_classifier: ProbabilityNet (same weights as pixel classification)
+    Returns: M [K, K] — sigmoid affinity matrix
+    """
+    K, E = seed_embs.shape
+    S = seed_sigmas.shape[1]
+    # Pairwise diff: seed_i - seed_j (same as pixel_emb - seed_emb)
+    diff = seed_embs.unsqueeze(1) - seed_embs.unsqueeze(0)  # [K, K, E]
+    # Use seed_j's sigma (the "key" / "pixel" role)
+    sigma_exp = seed_sigmas.unsqueeze(0).expand(K, K, S)  # [K, K, S]
+    features = torch.cat([diff, sigma_exp], dim=-1)  # [K, K, E+S]
+    logits = pixel_classifier(features.reshape(K * K, E + S))  # [K*K, 1]
+    M = torch.sigmoid(logits.reshape(K, K))  # [K, K]
+    return M
+
+
+def apply_seed_merging(dist, coords, M, h, w, window_size):
+    """
+    Apply M to predictions in global pixel space (differentiable).
+    Row-normalizes M so it acts as a weighted average, not a sum.
+    dist: [K, 1, ws, ws] — per-seed logits
+    coords: [3, K*ws*ws] — coords[0]=seed_idx, coords[1]=y, coords[2]=x
+    M: [K, K] — seed affinity matrix (sigmoid values in [0,1])
+    h, w: image dimensions
+    window_size: crop window size
+    Returns: merged dist [K, 1, ws, ws]
+    """
+    K = dist.shape[0]
+    seed_idx = coords[0].long()
+    pixel_idx = (coords[1] * w + coords[2]).long()
+
+    # Row-normalize M so each row sums to 1 (weighted average, not sum)
+    M_norm = M / M.sum(dim=1, keepdim=True).clamp(min=1e-6)
+
+    S_dense = torch.zeros(K, h * w, device=dist.device, dtype=dist.dtype)
+    S_dense[seed_idx, pixel_idx] = dist.flatten()
+
+    merged = M_norm @ S_dense  # [K, H*W]
+
+    merged_dist = merged[seed_idx, pixel_idx]
+    return merged_dist.view(K, 1, window_size, window_size)
+
+
+
 def feature_engineering_generator(feature_engineering_function):
 
     if feature_engineering_function == "0" or feature_engineering_function == "7":
@@ -871,7 +922,8 @@ class InstanSeg(nn.Module):
                  bg_weight = None,
                  dim_coords = 2,
                  dim_seeds = 1,
-                 mask_loss_fn = None,):
+                 mask_loss_fn = None,
+                 seed_merging = False,):
         
         super().__init__()
         self.n_sigma = n_sigma
@@ -890,6 +942,7 @@ class InstanSeg(nn.Module):
         self.window_size = window_size
         self.num_instance_cap = 50
         self.bg_weight = bg_weight
+        self.seed_merging = seed_merging
 
         self.feature_engineering, self.feature_engineering_width = feature_engineering_generator(feature_engineering_function)
         self.feature_engineering_function = feature_engineering_function
@@ -936,12 +989,13 @@ class InstanSeg(nn.Module):
             binary_loss = torch.nn.BCEWithLogitsLoss(reduction='none')
 
             def seed_loss(x, y, mask=None):
-                fg_mask = (y > 0).float()
                 if mask is not None:
-                    fg_mask = fg_mask * mask.float()
-                loss = binary_loss(x, (y > 0).float())
-                masked_loss = loss * fg_mask
-                return masked_loss.sum() / fg_mask.sum().clamp(min=1)
+                    mask = mask.float()
+                    loss = binary_loss(x, (y > 0).float())
+                    masked_loss = loss * mask
+                    return masked_loss.sum() / mask.sum().clamp(min=1)
+                else:
+                    return binary_loss(x, (y > 0).float()).mean()
 
             self.seed_loss = seed_loss
 
@@ -955,12 +1009,18 @@ class InstanSeg(nn.Module):
 
             def seed_loss(x, y, mask=None):
                 edt = (instance_wise_edt(y.float(), edt_type='edt') - 0.5) * 15
-                fg_mask = (y > 0).float()
-                if mask is not None:
-                    fg_mask = fg_mask * mask.float()
                 loss = distance_loss((x), (edt[None]))
-                masked_loss = loss * fg_mask
-                return masked_loss.sum() / fg_mask.sum().clamp(min=1)
+
+                if self.bg_weight is not None:
+                    weights = torch.where(edt < 0, self.bg_weight, 1.0)
+                    loss = loss * weights
+
+                if mask is not None:
+                    mask = mask.float()
+                    masked_loss = loss * mask
+                    return masked_loss.sum() / mask.sum().clamp(min=1)
+                else:
+                    return loss.mean()
 
             self.seed_loss = seed_loss
 
@@ -1080,7 +1140,10 @@ class InstanSeg(nn.Module):
 
             
                 if self.mask_loss is not None and self.dim_seeds == 2:
-                    seed_loss_tmp = self.seed_loss(seed_map[0:1], instance, mask=mask)
+                    fg_mask = (instance > 0)
+                    if mask is not None:
+                        fg_mask = fg_mask & mask
+                    seed_loss_tmp = self.seed_loss(seed_map[0:1], instance, mask=fg_mask)
                     seed_loss_tmp += self.mask_loss(seed_map[1:2], instance, mask=mask, bg_weight=self.bg_weight)
                 else:
                     seed_loss_tmp = self.seed_loss(seed_map, instance, mask=mask)
@@ -1092,6 +1155,7 @@ class InstanSeg(nn.Module):
                     continue
 
                 if instance.min() > 0:
+                    loss += w_seed * seed_loss
                     continue
 
                 instance_ids = instance.unique()
@@ -1138,16 +1202,20 @@ class InstanSeg(nn.Module):
                         continue
 
                     window_size = min(self.window_size, height, width)
-      
-                    dist, coords = compute_crops(spatial_emb, 
-                                                 centres, 
-                                                 sigma, 
-                                                 centroids, 
+
+                    dist, coords = compute_crops(spatial_emb,
+                                                 centres,
+                                                 sigma,
+                                                 centroids,
                                                  feature_engineering = self.feature_engineering,
                                                  pixel_classifier=self.pixel_classifier,
                                                  window_size = window_size)
-                    
-                    
+
+                    # Seed merging: pool predictions across seeds via M
+                    if self.seed_merging and isinstance(self.pixel_classifier, ProbabilityNet):
+                        sigma_at_seeds = sigma[:, centroids[:, 0], centroids[:, 1]].T  # [K, S]
+                        M = compute_seed_merge_matrix(centres, sigma_at_seeds, self.pixel_classifier)
+                        dist = apply_seed_merging(dist, coords, M, height, width, window_size)
 
                     crop = onehot_labels.squeeze(1)[coords[0], coords[1], coords[2]].reshape(-1,window_size, window_size)
                     instance_loss = instance_loss + self.instance_loss_fn(dist, crop.float(), sigma=sigma[0])
@@ -1221,6 +1289,7 @@ class InstanSeg(nn.Module):
         labels = []
 
         for i in range(iterations):
+            M = None
 
             if precomputed_crops is None:
 
@@ -1279,16 +1348,25 @@ class InstanSeg(nn.Module):
                     labels.append(label)
                     continue
 
-                crops, coords = compute_crops(fields, 
-                                                fields_at_centroids.T, 
-                                                sigma, 
-                                                local_centroids_idx.int(), 
+                # Seed merging: compute affinity matrix for label merging only
+                if self.seed_merging and isinstance(classifier, ProbabilityNet):
+                    sigma_at_seeds = sigma[:, local_centroids_idx[:, 0], local_centroids_idx[:, 1]].T  # [K, S]
+                    M = compute_seed_merge_matrix(fields_at_centroids.T, sigma_at_seeds, classifier)
+
+                crops, coords = compute_crops(fields,
+                                                fields_at_centroids.T,
+                                                sigma,
+                                                local_centroids_idx.int(),
                                                 feature_engineering = self.feature_engineering,
-                                                pixel_classifier=self.pixel_classifier,
+                                                pixel_classifier=classifier,
                                                 mask_threshold=mask_threshold,
                                                 cleanup_fragments= cleanup_fragments,
                                                 window_size=window_size) # about 65% of the time
-                
+
+                # Seed merging: apply soft pooling to crops (matching training)
+                if M is not None:
+                    crops = apply_seed_merging(crops, coords, M, h, w, window_size)
+
                 coords = coords[1:] # The first channel are just channel indices, not required here.
 
 
@@ -1310,15 +1388,16 @@ class InstanSeg(nn.Module):
 
             crops = torch.sigmoid(crops) 
       
-            label = merge_sparse_predictions(crops, 
-                                            coords, 
-                                            binary_map, 
+            label = merge_sparse_predictions(crops,
+                                            coords,
+                                            binary_map,
                                             size=(C,h, w),
-                                            mask_threshold=mask_threshold, 
+                                            mask_threshold=mask_threshold,
                                             window_size=window_size,
-                                            min_size=min_size, 
+                                            min_size=min_size,
                                             overlap_threshold=overlap_threshold,
-                                            mean_threshold=mean_threshold).int() #about 30% of the time
+                                            mean_threshold=mean_threshold,
+                                            seed_affinity=M).int() #about 30% of the time
             
             labels.append(label.squeeze())
 
