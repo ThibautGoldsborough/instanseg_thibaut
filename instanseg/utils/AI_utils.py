@@ -255,14 +255,15 @@ def check_mean_grad(_model):
     return losses.mean()
 
 def optimize_hyperparameters(model,postprocessing_fn,
-                              data_loader = None, 
-                              val_images = None, 
+                              data_loader = None,
+                              val_images = None,
                               val_labels = None,
-                              max_evals = 50, 
-                              verbose = False, 
-                              threshold = [0.5, 0.7, 0.9], 
-                              show_progressbar = True, 
-                              device = None):
+                              max_evals = 50,
+                              verbose = False,
+                              threshold = [0.5, 0.7, 0.9],
+                              show_progressbar = True,
+                              device = None,
+                              exclude_params = None):
 
 
     from instanseg.utils.metrics import _robust_average_precision
@@ -286,8 +287,11 @@ def optimize_hyperparameters(model,postprocessing_fn,
         'overlap_threshold': hp.uniform('overlap_threshold', 0.1, 0.9),
         #'min_size': hp.uniform('min_size', 0, 30),
         'peak_distance': hp.uniform('peak_distance', 3, 10),
-        'mean_threshold': hp.uniform('mean_threshold', 0.0, 0.5)} #the max could be increased, but may cause the method not to converge for some reason.
-    
+      #  'mean_threshold': hp.uniform('mean_threshold', 0.0, 0.5)} #the max could be increased, but may cause the method not to converge for some reason.
+        }
+    if exclude_params:
+        for p in exclude_params:
+            space.pop(p, None)
     _model = model # copy.deepcopy(model)
     _model.eval()
     predictions = []

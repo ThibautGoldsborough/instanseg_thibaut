@@ -336,7 +336,8 @@ def merge_sparse_predictions(x: torch.Tensor,
                                 min_size = 10,
                                 overlap_threshold = 0.5,
                                 mean_threshold = 0.5,
-                                seed_affinity: torch.Tensor = None):
+                                seed_affinity: torch.Tensor = None,
+                                overlap_metric: str = "iou"):
 
 
     labels = convert(x, coords, size=(size[1], size[2]), mask_threshold=mask_threshold)[None]
@@ -379,7 +380,10 @@ def merge_sparse_predictions(x: torch.Tensor,
         #This can happen at the start of training. This can cause OOM errors and is never a good sign - may aswell abort.
         return labels
 
-    iou = fast_sparse_iou(sparse_onehot)
+    if overlap_metric == "iomin":
+        iou = fast_sparse_intersection_over_minimum_area(sparse_onehot)
+    else:
+        iou = fast_sparse_iou(sparse_onehot)
 
     adjacency = (iou > overlap_threshold)
     if seed_affinity is not None:
@@ -1255,7 +1259,8 @@ class InstanSeg(nn.Module):
                         return_intermediate_objects: bool = False,
                         precomputed_crops: torch.Tensor = None,
                         precomputed_seeds: torch.Tensor = None,
-                        img=None):
+                        img=None,
+                        overlap_metric: str = "iou"):
             
 
         if device is None:
@@ -1397,7 +1402,8 @@ class InstanSeg(nn.Module):
                                             min_size=min_size,
                                             overlap_threshold=overlap_threshold,
                                             mean_threshold=mean_threshold,
-                                            seed_affinity=M).int() #about 30% of the time
+                                            seed_affinity=M,
+                                            overlap_metric=overlap_metric).int() #about 30% of the time
             
             labels.append(label.squeeze())
 

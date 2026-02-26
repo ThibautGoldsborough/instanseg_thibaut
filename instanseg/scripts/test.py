@@ -306,8 +306,10 @@ if __name__ == "__main__":
     if parser_args.optimize_hyperparameters:
         from instanseg.utils.AI_utils import optimize_hyperparameters
 
+        exclude = ["fg_threshold"] if model_dict.get("dim_seeds", 1) == 1 else None
         params = optimize_hyperparameters(model, postprocessing_fn=method.postprocessing, val_images=val_images,
-                                          val_labels=val_labels, verbose=True)
+                                          val_labels=val_labels, verbose=True, max_evals=200,
+                                          exclude_params=exclude)
         pd.DataFrame.from_dict(params, orient='index').to_csv(output_path / "best_params.csv",
                                                               header=False)
     else:

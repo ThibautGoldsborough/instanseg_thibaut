@@ -20,13 +20,14 @@ IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
 
 def _to_3ch(images: torch.Tensor) -> torch.Tensor:
-    """Convert (B, C, H, W) to (B, 3, H, W): repeat grayscale or random linear projection for >3 channels."""
+    """Convert (B, C, H, W) to (B, 3, H, W): repeat grayscale or deterministic linear projection for >3 channels."""
     C = images.shape[1]
     if C == 1:
         images = images.repeat(1, 3, 1, 1)
     elif C > 3:
-        # Random linear projection a la colourize: assign a random RGB colour per channel
-        colours = torch.rand(C, 3, device=images.device)  # (C, 3)
+        # Deterministic linear projection: assign a seeded RGB colour per channel
+        gen = torch.Generator(device=images.device).manual_seed(42)
+        colours = torch.rand(C, 3, device=images.device, generator=gen)  # (C, 3)
         # images: (B, C, H, W) -> einsum -> (B, 3, H, W)
         images = torch.einsum("bchw,ct->bthw", images, colours)
     return images
@@ -143,8 +144,9 @@ def _img_to_thumbnail(img_tensor, size=48):
     if C == 1:
         img = img.repeat(3, 1, 1)
     elif C > 3:
-        # Random linear projection to 3 channels
-        colours = torch.rand(C, 3)
+        # Deterministic linear projection to 3 channels
+        gen = torch.Generator().manual_seed(42)
+        colours = torch.rand(C, 3, generator=gen)
         img = torch.einsum("chw,ct->thw", img, colours)
     # Normalize to [0, 1]
     img = img - img.min()
@@ -164,10 +166,11 @@ def _plot_umap_thumbnails(adata, dataset, output_path, n_per_cluster=3):
     leiden_labels = adata.obs["leiden"].values
 
     # Sample n_per_cluster indices per cluster
+    rng = np.random.default_rng(42)
     sampled_indices = []
     for cluster in np.unique(leiden_labels):
         idxs = np.where(leiden_labels == cluster)[0]
-        chosen = np.random.choice(idxs, size=min(n_per_cluster, len(idxs)), replace=False)
+        chosen = rng.choice(idxs, size=min(n_per_cluster, len(idxs)), replace=False)
         sampled_indices.extend(chosen)
 
     fig, ax = plt.subplots(figsize=(14, 14))
@@ -189,6 +192,47 @@ def _plot_umap_thumbnails(adata, dataset, output_path, n_per_cluster=3):
     fig.savefig(output_path / "umap_thumbnails.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Thumbnail UMAP saved to {output_path / 'umap_thumbnails.png'}")
+
+
+def _plot_cluster_grid(adata, dataset, output_path, n_cols=10, thumb_size=64):
+    """Save an image grid: rows = Leiden clusters, columns = sample images from each cluster."""
+    import matplotlib.pyplot as plt
+
+    leiden_labels = adata.obs["leiden"].values
+    clusters = np.unique(leiden_labels)
+    # Sort clusters numerically
+    clusters = sorted(clusters, key=lambda x: int(x))
+
+    n_rows = len(clusters)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 1.2, n_rows * 1.2))
+    if n_rows == 1:
+        axes = axes[np.newaxis, :]
+    if n_cols == 1:
+        axes = axes[:, np.newaxis]
+
+    rng = np.random.default_rng(42)
+    for row, cluster in enumerate(clusters):
+        idxs = np.where(leiden_labels == cluster)[0]
+        chosen = rng.choice(idxs, size=min(n_cols, len(idxs)), replace=False)
+        for col in range(n_cols):
+            ax = axes[row, col]
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if col < len(chosen):
+                raw_img = dataset.X[chosen[col]]
+                thumb = _img_to_thumbnail(raw_img, size=thumb_size)
+                ax.imshow(thumb)
+            else:
+                ax.axis("off")
+            if col == 0:
+                ax.set_ylabel(f"C{cluster}", fontsize=8, rotation=0, labelpad=20, va="center")
+
+    fig.suptitle("Samples per Leiden cluster", fontsize=12)
+    fig.tight_layout(rect=[0.03, 0, 1, 0.97])
+    save_path = output_path / "cluster_grid.png"
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Cluster grid saved to {save_path}")
 
 
 def run_sampling(args, train_loader, train_meta, device):
@@ -241,17 +285,22 @@ def run_sampling(args, train_loader, train_meta, device):
         else:
             parent_datasets.append("unknown")
 
+    # L2-normalize embeddings (cosine similarity for kNN graph)
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms = np.clip(norms, 1e-8, None)
+    embeddings = embeddings / norms
+
     # Leiden clustering
     print("Running Leiden clustering ...")
     adata = sc.AnnData(embeddings)
     adata.obs["parent_dataset"] = parent_datasets[:len(embeddings)]
-    sc.pp.neighbors(adata, n_neighbors=15, use_rep="X")
-    sc.tl.leiden(adata, resolution=1.5)
+    sc.pp.neighbors(adata, n_neighbors=15, use_rep="X", random_state=42)
+    sc.tl.leiden(adata, resolution=2.5, random_state=42)
     print(f"Found {adata.obs['leiden'].nunique()} clusters.")
 
     # UMAP + plots
     print("Computing UMAP ...")
-    sc.tl.umap(adata)
+    sc.tl.umap(adata, random_state=42)
 
     sc.settings.figdir = str(output_path)
     sc.pl.umap(adata, color="leiden", save="_leiden.png", show=False)
@@ -259,6 +308,9 @@ def run_sampling(args, train_loader, train_meta, device):
 
     # UMAP with image thumbnails (subsample per cluster)
     _plot_umap_thumbnails(adata, train_loader.dataset, output_path, n_per_cluster=10)
+
+    # Grid: rows = clusters, columns = 10 sample images
+    _plot_cluster_grid(adata, train_loader.dataset, output_path, n_cols=10)
 
     print(f"UMAP plots saved to {output_path}/")
 
