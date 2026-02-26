@@ -454,9 +454,11 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
     # Preemptable: restore model weights from checkpoint (optimizer/scheduler restored later, phase-specifically)
     if _preemptable_resuming and _preemptable_checkpoint is not None:
         _resume_epoch = _preemptable_checkpoint['epoch'] + 1
+        _ckpt_epoch_name = _preemptable_checkpoint.get('epoch_name', 'output_epoch')
+        _was_in_hotstart = (_ckpt_epoch_name == 'hotstart_epoch')
 
         # If resuming into main training with LoRA (after hotstart), enable LoRA before loading state dict
-        if args.lora_rank > 0 and args.hotstart_training > 0 and _resume_epoch >= args.hotstart_training and hasattr(model, 'enable_lora'):
+        if args.lora_rank > 0 and args.hotstart_training > 0 and not _was_in_hotstart and hasattr(model, 'enable_lora'):
             model.freeze_backbone()
             model.enable_lora(rank=args.lora_rank)
             model.unfreeze_backbone()
@@ -481,6 +483,11 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
                                                                                                        args = args, 
                                                                                                        sets= ["Train","Validation"], 
                                                                                                        complete_dataset=segmentation_dataset)
+
+    n_gpus = torch.cuda.device_count()
+    if n_gpus > 1:
+        args.batch_size = args.batch_size * n_gpus
+        print(f"Scaling batch size to {args.batch_size} ({args.batch_size // n_gpus} per GPU x {n_gpus} GPUs)")
 
     train_loader, test_loader = get_loaders(train_images, train_labels, val_images, val_labels, train_meta, val_meta, args)
 
@@ -605,8 +612,8 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         _prior_best_f1 = _ckpt.get('f1_score', -1)
         _start = _resume_epoch
 
-        # Determine if we were in hotstart or main training phase
-        if args.hotstart_training > 0 and _start < args.hotstart_training:
+        # Determine if we were in hotstart or main training phase using the saved epoch_name
+        if args.hotstart_training > 0 and _was_in_hotstart:
             # Resume into hotstart phase: replicate hotstart setup
             print(f"[preemptable] Resuming hotstart phase from epoch {_start}")
             method.update_seed_loss("l1_distance")
