@@ -75,6 +75,7 @@ parser.add_argument('-sampling_mode', '--sampling_mode', default=None, type=str,
 parser.add_argument('-lora_rank', '--lora_rank', default=0, type=int, help="LoRA rank for SAM/DINO backbone. 0 = disabled, 16 is a good default.")
 parser.add_argument('-fp16', '--fp16', default=False, type=lambda x: (str(x).lower() == 'true'), help="Enable mixed precision (float16) training")
 parser.add_argument('-seed_merging', '--seed_merging', default=False, type=lambda x: (str(x).lower() == 'true'), help="Enable seed-seed attention merging")
+parser.add_argument('-preemptable', '--preemptable', default=False, type=lambda x: (str(x).lower() == 'true'), help="Enable preemption-safe training: saves full training state and auto-resumes from checkpoint if preempted on SLURM")
 
 
 def save_training_plot(train_losses, test_losses, f1_list, f1_list_cells, output_path, cells_and_nuclei=False, hotstart_epoch=None):
@@ -118,24 +119,24 @@ def save_training_plot(train_losses, test_losses, f1_list, f1_list_cells, output
 
 def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name='output_epoch',
          prior_train_losses=None, prior_test_losses=None, prior_f1_list=None, prior_f1_list_cells=None, hotstart_epoch=None,
-         scaler=None):
+         scaler=None, start_epoch=0, prior_best_f1=-1):
     from instanseg.utils.AI_utils import optimize_hyperparameters, train_epoch, test_epoch
     global best_f1_score, device, method, iou_threshold, args, optimizer, scheduler
 
     train_losses = list(prior_train_losses) if prior_train_losses else []
     test_losses = list(prior_test_losses) if prior_test_losses else []
 
-    best_f1_score = -1
+    best_f1_score = prior_best_f1
     f1_list = list(prior_f1_list) if prior_f1_list else []
     f1_list_cells = list(prior_f1_list_cells) if prior_f1_list_cells else []
 
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
 
         print("Epoch:", epoch)
 
         train_loss, train_time = train_epoch(model, device, train_loader, loss_fn, optimizer, args=args, scaler=scaler)
 
-        if epoch <= 5 and not args.model_folder:  # Training is just starting AND we are not loading a model
+        if epoch <= 5 and not args.model_folder and start_epoch == 0:  # Training is just starting AND we are not resuming
             save_epoch_outputs = True
         else:
             save_epoch_outputs = False
@@ -180,17 +181,47 @@ def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name=
             scheduler.step()
 
                 
-        if f1_score > best_f1_score or save_epoch_outputs:
+        _is_new_best = f1_score > best_f1_score
+        if _is_new_best or save_epoch_outputs:
             best_f1_score = np.maximum(f1_score, best_f1_score)
-
             print("Saving model, best f1_score:", best_f1_score)
 
-            torch.save({
-                'f1_score': float(best_f1_score),
-                'epoch': int(epoch),
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-            }, args.output_path / "model_weights.pth") 
+        _should_save_best = _is_new_best or save_epoch_outputs
+        if _should_save_best or args.preemptable:
+            _model_state = model.state_dict()
+            _optim_state = optimizer.state_dict()
+            _sched_state = scheduler.state_dict() if scheduler is not None else None
+
+            if _should_save_best:
+                best_checkpoint = {
+                    'f1_score': float(best_f1_score),
+                    'epoch': int(epoch),
+                    'model_state_dict': _model_state,
+                    'optimizer_state_dict': _optim_state,
+                }
+                if _sched_state is not None:
+                    best_checkpoint['scheduler_state_dict'] = _sched_state
+                torch.save(best_checkpoint, args.output_path / "model_weights.pth")
+
+            if args.preemptable:
+                resume_state = {
+                    'f1_score': float(best_f1_score),
+                    'epoch': int(epoch),
+                    'model_state_dict': _model_state,
+                    'optimizer_state_dict': _optim_state,
+                    'train_losses': train_losses,
+                    'test_losses': test_losses,
+                    'f1_list': f1_list,
+                    'f1_list_cells': f1_list_cells,
+                    'epoch_name': epoch_name,
+                }
+                if _sched_state is not None:
+                    resume_state['scheduler_state_dict'] = _sched_state
+                # Atomic save: write to temp file then rename, so SIGTERM during
+                # write can't corrupt the checkpoint and break resume
+                _tmp_path = args.output_path / "preemptable_state.pth.tmp"
+                torch.save(resume_state, _tmp_path)
+                _tmp_path.rename(args.output_path / "preemptable_state.pth")
 
 
         # this is where the loss gets printed
@@ -227,6 +258,18 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
     print("Saving results to {}".format(os.path.abspath(args.output_path)))
     if not os.path.exists(args.output_path):
         os.mkdir(args.output_path)
+
+    # Preemptable: detect existing checkpoint for auto-resume
+    _preemptable_resuming = False
+    _preemptable_checkpoint = None
+    if args.preemptable and not args.model_folder:
+        _ckpt_path = args.output_path / "preemptable_state.pth"
+        if _ckpt_path.exists():
+            print(f"[preemptable] Found existing checkpoint at {_ckpt_path}, will auto-resume")
+            _preemptable_resuming = True
+            _preemptable_checkpoint = torch.load(_ckpt_path, weights_only=False, map_location=args.device)
+        else:
+            print("[preemptable] No existing checkpoint found, starting fresh")
 
     os.environ["INSTANSEG_DATASET_PATH"] = os.environ.get("INSTANSEG_DATASET_PATH", str(args.data_path))
     os.environ["INSTANSEG_OUTPUT_PATH"] = os.environ.get("INSTANSEG_OUTPUT_PATH", str(args.output_path))
@@ -408,6 +451,20 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
     else:
         scheduler = None
 
+    # Preemptable: restore model weights from checkpoint (optimizer/scheduler restored later, phase-specifically)
+    if _preemptable_resuming and _preemptable_checkpoint is not None:
+        _resume_epoch = _preemptable_checkpoint['epoch'] + 1
+
+        # If resuming into main training with LoRA (after hotstart), enable LoRA before loading state dict
+        if args.lora_rank > 0 and args.hotstart_training > 0 and _resume_epoch >= args.hotstart_training and hasattr(model, 'enable_lora'):
+            model.freeze_backbone()
+            model.enable_lora(rank=args.lora_rank)
+            model.unfreeze_backbone()
+
+        from instanseg.utils.model_loader import remove_module_prefix_from_dict
+        _state = remove_module_prefix_from_dict(_preemptable_checkpoint['model_state_dict'])
+        model.load_state_dict(_state, strict=True)
+        print(f"[preemptable] Restored model weights, will resume from epoch {_resume_epoch}")
 
     if "[" in args.source_dataset:
  
@@ -464,7 +521,7 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
             os.mkdir(args.output_path)
         if not os.path.exists(args.output_path / "epoch_outputs"):
             os.mkdir(args.output_path / "epoch_outputs")
-        else:
+        elif not _preemptable_resuming:
             import glob
             for f in glob.glob(str(args.output_path / "epoch_outputs" / "*.png")):
                 os.remove(f)
@@ -472,14 +529,14 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
 
     pd.DataFrame.from_dict(args_dict, orient='index').to_csv(args.output_path / "experiment_log.csv",
                                                             header=False)
-    
+
     iou_threshold = np.linspace(0.5, 1.0, 10)
 
     scaler = torch.amp.GradScaler() if args.fp16 else None
     if args.fp16:
         print("Mixed precision (fp16) training enabled")
 
-    if args.hotstart_training > 0:
+    if args.hotstart_training > 0 and not _preemptable_resuming:
         hot_epochs = args.hotstart_training
         hotstart_lr = 1e-3
         mask_str = f", mask_loss=ce" if args.mask_loss_fn is not None else ""
@@ -538,7 +595,98 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         if args.mask_loss_fn is not None:
             method.update_mask_loss(args.mask_loss_fn)
 
-    if args.hotstart_training > 0:
+    if _preemptable_resuming and _preemptable_checkpoint is not None:
+        _ckpt = _preemptable_checkpoint
+        _prior_train = _ckpt.get('train_losses', [])
+        _prior_test = _ckpt.get('test_losses', [])
+        _prior_f1 = _ckpt.get('f1_list', [])
+        _prior_f1_cells = _ckpt.get('f1_list_cells', [])
+        _epoch_name = _ckpt.get('epoch_name', 'output_epoch')
+        _prior_best_f1 = _ckpt.get('f1_score', -1)
+        _start = _resume_epoch
+
+        # Determine if we were in hotstart or main training phase
+        if args.hotstart_training > 0 and _start < args.hotstart_training:
+            # Resume into hotstart phase: replicate hotstart setup
+            print(f"[preemptable] Resuming hotstart phase from epoch {_start}")
+            method.update_seed_loss("l1_distance")
+            method.update_instance_loss("dice_loss")
+            if args.mask_loss_fn is not None:
+                method.update_mask_loss("ce")
+
+            # Freeze backbone like the original hotstart does
+            _backbone_frozen = hasattr(model, 'freeze_backbone')
+            if _backbone_frozen:
+                model.freeze_backbone()
+                optimizer = get_optimizer(filter(lambda p: p.requires_grad, model.parameters()), args, lr=1e-3)
+            else:
+                optimizer = get_optimizer(model.parameters(), args, lr=1e-3)
+            optimizer.load_state_dict(_ckpt['optimizer_state_dict'])
+            # Scheduler is None during hotstart
+            scheduler = None
+
+            model, train_losses, test_losses, f1_list, f1_list_cells = main(
+                model, loss_fn, train_loader, test_loader,
+                num_epochs=args.hotstart_training, epoch_name='hotstart_epoch',
+                prior_train_losses=_prior_train, prior_test_losses=_prior_test,
+                prior_f1_list=_prior_f1, prior_f1_list_cells=_prior_f1_cells,
+                scaler=scaler, start_epoch=_start, prior_best_f1=_prior_best_f1)
+
+            # Continue to main training after hotstart completes: unfreeze backbone
+            if _backbone_frozen:
+                if args.lora_rank > 0 and hasattr(model, 'enable_lora'):
+                    model.enable_lora(rank=args.lora_rank)
+                    model.unfreeze_backbone()
+                else:
+                    model.unfreeze_backbone()
+
+            optimizer = get_optimizer(filter(lambda p: p.requires_grad, model.parameters()), args)
+            if args.model_str.lower() in ("cellposesam", "instanseg_sam", "instanseg_dino"):
+                from torch.optim.lr_scheduler import LambdaLR
+                def lr_schedule(epoch, warmup_epochs=10, max_epochs=args.num_epochs):
+                    if epoch < warmup_epochs:
+                        return (epoch + 1) / warmup_epochs
+                    elif epoch < max_epochs - 150:
+                        return 1.0
+                    elif epoch < max_epochs - 50:
+                        return 0.1
+                    else:
+                        return 0.01
+                scheduler = LambdaLR(optimizer, lr_lambda=lambda epoch: lr_schedule(epoch))
+            elif args.cosineannealing:
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100, eta_min=0.00001)
+
+            method.update_seed_loss(args.seed_loss_fn)
+            method.update_instance_loss(args.instance_loss_fn)
+            if args.mask_loss_fn is not None:
+                method.update_mask_loss(args.mask_loss_fn)
+
+            model, train_losses, test_losses, f1_list, f1_list_cells = main(
+                model, loss_fn, train_loader, test_loader, num_epochs=num_epochs,
+                prior_train_losses=train_losses, prior_test_losses=test_losses,
+                prior_f1_list=f1_list, prior_f1_list_cells=f1_list_cells,
+                hotstart_epoch=args.hotstart_training, scaler=scaler)
+        else:
+            # Resume into main training phase: recreate optimizer with correct param groups, then restore state
+            if args.channel_invariant and args.freeze_main_model:
+                _inner = model.module if isinstance(model, nn.DataParallel) else model
+                optimizer = get_optimizer(_inner.model.AdaptorNet.parameters(), args)
+            else:
+                optimizer = get_optimizer(filter(lambda p: p.requires_grad, model.parameters()), args)
+            optimizer.load_state_dict(_ckpt['optimizer_state_dict'])
+            if scheduler is not None and 'scheduler_state_dict' in _ckpt:
+                scheduler.load_state_dict(_ckpt['scheduler_state_dict'])
+
+            model, train_losses, test_losses, f1_list, f1_list_cells = main(
+                model, loss_fn, train_loader, test_loader, num_epochs=num_epochs,
+                epoch_name=_epoch_name,
+                prior_train_losses=_prior_train, prior_test_losses=_prior_test,
+                prior_f1_list=_prior_f1, prior_f1_list_cells=_prior_f1_cells,
+                hotstart_epoch=args.hotstart_training if args.hotstart_training > 0 else None,
+                scaler=scaler, start_epoch=_start, prior_best_f1=_prior_best_f1)
+
+        del _preemptable_checkpoint
+    elif args.hotstart_training > 0:
         model, train_losses, test_losses, f1_list, f1_list_cells = main(model, loss_fn, train_loader, test_loader, num_epochs=num_epochs,
             prior_train_losses=train_losses, prior_test_losses=test_losses,
             prior_f1_list=f1_list, prior_f1_list_cells=f1_list_cells,
