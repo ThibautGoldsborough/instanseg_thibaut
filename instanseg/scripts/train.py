@@ -76,6 +76,7 @@ parser.add_argument('-lora_rank', '--lora_rank', default=0, type=int, help="LoRA
 parser.add_argument('-fp16', '--fp16', default=False, type=lambda x: (str(x).lower() == 'true'), help="Enable mixed precision (float16) training")
 parser.add_argument('-seed_merging', '--seed_merging', default=False, type=lambda x: (str(x).lower() == 'true'), help="Enable seed-seed attention merging")
 parser.add_argument('-preemptable', '--preemptable', default=False, type=lambda x: (str(x).lower() == 'true'), help="Enable preemption-safe training: saves full training state and auto-resumes from checkpoint if preempted on SLURM")
+parser.add_argument('-preempt_interval', '--preempt_save_interval', default=10, type=int, help="Save preemptable checkpoint every N epochs (default=1). Higher values reduce I/O for large models at the cost of losing more progress on preemption.")
 
 
 def save_training_plot(train_losses, test_losses, f1_list, f1_list_cells, output_path, cells_and_nuclei=False, hotstart_epoch=None):
@@ -187,7 +188,8 @@ def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name=
             print("Saving model, best f1_score:", best_f1_score)
 
         _should_save_best = _is_new_best or save_epoch_outputs
-        if _should_save_best or args.preemptable:
+        _should_save_preempt = args.preemptable and (epoch % args.preempt_save_interval == 0 or epoch == num_epochs - 1)
+        if _should_save_best or _should_save_preempt:
             _model_state = model.state_dict()
             _optim_state = optimizer.state_dict()
             _sched_state = scheduler.state_dict() if scheduler is not None else None
@@ -203,7 +205,7 @@ def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name=
                     best_checkpoint['scheduler_state_dict'] = _sched_state
                 torch.save(best_checkpoint, args.output_path / "model_weights.pth")
 
-            if args.preemptable:
+            if _should_save_preempt:
                 resume_state = {
                     'f1_score': float(best_f1_score),
                     'epoch': int(epoch),
