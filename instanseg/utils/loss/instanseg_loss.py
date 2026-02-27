@@ -869,7 +869,9 @@ def compute_seed_merge_matrix(seed_embs, seed_sigmas, pixel_classifier):
 def apply_seed_merging(dist, coords, M, h, w, window_size):
     """
     Apply M to predictions in global pixel space (differentiable).
-    Row-normalizes M so it acts as a weighted average, not a sum.
+    Uses noisy-OR (probabilistic union) instead of weighted average:
+      merged_p = 1 - prod((1 - p_j)^M[i,j])
+    This preserves high-confidence predictions rather than diluting them.
     dist: [K, 1, ws, ws] — per-seed logits
     coords: [3, K*ws*ws] — coords[0]=seed_idx, coords[1]=y, coords[2]=x
     M: [K, K] — seed affinity matrix (sigmoid values in [0,1])
@@ -881,15 +883,26 @@ def apply_seed_merging(dist, coords, M, h, w, window_size):
     seed_idx = coords[0].long()
     pixel_idx = (coords[1] * w + coords[2]).long()
 
-    # Row-normalize M so each row sums to 1 (weighted average, not sum)
-    M_norm = M / M.sum(dim=1, keepdim=True).clamp(min=1e-6)
+    # Force diagonal to 1: each seed fully contributes to itself
+    M = M.clone()
+    M.fill_diagonal_(1.0)
 
-    S_dense = torch.zeros(K, h * w, device=dist.device, dtype=dist.dtype)
+    # Convert logits to probabilities
+    # Initialize to large negative logits so sigmoid → ~0 (neutral in noisy-OR)
+    S_dense = torch.full((K, h * w), -20.0, device=dist.device, dtype=dist.dtype)
     S_dense[seed_idx, pixel_idx] = dist.flatten()
+    P = torch.sigmoid(S_dense)  # [K, H*W] probabilities
 
-    merged = M_norm @ S_dense  # [K, H*W]
+    # Noisy-OR: 1 - prod((1 - p_j)^M[i,j])
+    eps = 1e-7
+    log_complement = torch.log(1 - P + eps)   # [K, H*W]
+    summed = M @ log_complement                # [K, H*W]
+    merged_prob = 1 - torch.exp(summed)        # [K, H*W]
 
-    merged_dist = merged[seed_idx, pixel_idx]
+    # Convert back to logits
+    merged_logits = torch.logit(merged_prob.clamp(eps, 1 - eps))
+
+    merged_dist = merged_logits[seed_idx, pixel_idx]
     return merged_dist.view(K, 1, window_size, window_size)
 
 
