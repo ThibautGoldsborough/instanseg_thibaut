@@ -111,6 +111,59 @@ def torch_peak_local_max(image: torch.Tensor, neighbourhood_size: int, minimum_v
     # Non-zero causes host-device synchronization, which is a bottleneck
     return torch.nonzero(peak_local_max.squeeze()).to(dtype)
 
+
+def ensure_grid_maxima(seed_map, existing_maxima, grid_size=16):
+    """Ensure at least one maximum exists in every grid_size x grid_size cell.
+
+    Takes the existing local maxima and fills in any grid cell that has no
+    maximum by picking the argmax of seed_map within that cell.
+
+    Args:
+        seed_map: [H, W] tensor — seed map values
+        existing_maxima: [K, 2] int tensor — (y, x) of already-detected maxima
+        grid_size: size of each square grid cell
+
+    Returns:
+        additional_maxima: [K', 2] int tensor — (y, x) of newly added maxima
+    """
+    H, W = seed_map.shape
+    device = seed_map.device
+
+    n_grid_y = (H + grid_size - 1) // grid_size
+    n_grid_x = (W + grid_size - 1) // grid_size
+
+    # Mark which grid cells already have a maximum
+    occupied = torch.zeros(n_grid_y, n_grid_x, dtype=torch.bool, device=device)
+    if existing_maxima.numel() > 0 and existing_maxima.shape[0] > 0:
+        gy = (existing_maxima[:, 0] // grid_size).clamp(max=n_grid_y - 1).long()
+        gx = (existing_maxima[:, 1] // grid_size).clamp(max=n_grid_x - 1).long()
+        occupied[gy, gx] = True
+
+    # Pad seed_map so it's evenly divisible by grid_size
+    pad_h = n_grid_y * grid_size - H
+    pad_w = n_grid_x * grid_size - W
+    padded = F.pad(seed_map, (0, pad_w, 0, pad_h), value=float('-inf'))
+
+    # Reshape into grid cells and find argmax within each
+    cells = padded.reshape(n_grid_y, grid_size, n_grid_x, grid_size)
+    cells = cells.permute(0, 2, 1, 3).reshape(n_grid_y, n_grid_x, grid_size * grid_size)
+    flat_idx = cells.argmax(dim=-1)  # [n_grid_y, n_grid_x]
+
+    local_y = flat_idx // grid_size
+    local_x = flat_idx % grid_size
+
+    # Convert to global coordinates
+    grid_ys = torch.arange(n_grid_y, device=device).unsqueeze(1) * grid_size
+    grid_xs = torch.arange(n_grid_x, device=device).unsqueeze(0) * grid_size
+    global_y = (grid_ys + local_y).reshape(-1)
+    global_x = (grid_xs + local_x).reshape(-1)
+
+    # Keep only unoccupied cells with valid (non-padded) coordinates
+    mask = ~occupied.reshape(-1) & (global_y < H) & (global_x < W)
+
+    return torch.stack([global_y[mask], global_x[mask]], dim=1).int()
+
+
 def torch_peak_local_max_LEGACY(image: torch.Tensor, neighbourhood_size: int, minimum_value: float, return_map: bool = False) -> torch.Tensor:
     """
     computes peak local maxima function for an image (or batch of images), returning a maxima mask
@@ -560,6 +613,82 @@ class ProbabilityNet(nn.Module):
 
 
 
+class CrossAttentionBlock(nn.Module):
+    """Pre-norm cross-attention block with feed-forward network."""
+    def __init__(self, hidden_dim, n_heads, mlp_ratio=2.0, dropout=0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.attn = nn.MultiheadAttention(hidden_dim, n_heads, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        mlp_dim = int(hidden_dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, hidden_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, q, kv):
+        q_norm = self.norm1(q)
+        kv_norm = self.norm1(kv)
+        attn_out, _ = self.attn(q_norm, kv_norm, kv_norm)
+        q = q + attn_out
+        q = q + self.mlp(self.norm2(q))
+        return q
+
+
+class SeedAffinityTransformer(nn.Module):
+    """Transformer for predicting pairwise seed affinities via cross-attention."""
+    def __init__(self, feat_dim=4, dim_coords=2, hidden_dim=64, n_heads=4, n_blocks=2, mlp_ratio=2.0, dropout=0.1):
+        super().__init__()
+        self.proj = nn.Linear(feat_dim, hidden_dim)
+        self.norm_in = nn.LayerNorm(hidden_dim)
+
+        self.blocks = nn.ModuleList([
+            CrossAttentionBlock(hidden_dim, n_heads, mlp_ratio, dropout)
+            for _ in range(n_blocks)
+        ])
+
+        self.norm_out = nn.LayerNorm(hidden_dim)
+
+        self.pair_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + dim_coords, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, features, coords):
+        """
+        features: [K, D] — seed features (embeddings + sigma)
+        coords: [K, dim_coords] — actual pixel coordinates
+        Returns: M [K, K] — sigmoid affinity matrix
+        """
+        K = features.shape[0]
+
+        q = self.norm_in(self.proj(features)).unsqueeze(0)  # [1, K, H]
+        k = q.clone()
+
+        for block in self.blocks:
+            q = block(q, k)
+            k = block(k, q)
+
+        q = self.norm_out(q).squeeze(0)  # [K, H]
+        k = self.norm_out(k).squeeze(0)  # [K, H]
+
+        # Pairwise features: concatenated representations + relative position
+        q_exp = q.unsqueeze(1).expand(-1, K, -1)
+        k_exp = k.unsqueeze(0).expand(K, -1, -1)
+        rel_pos = (coords.unsqueeze(1) - coords.unsqueeze(0)).float() / 100.0
+
+        pair_feat = torch.cat([q_exp, k_exp, rel_pos], dim=-1)
+        logits = self.pair_mlp(pair_feat).squeeze(-1)  # [K, K]
+        return torch.sigmoid(logits)
+
+
 class MyBlock(nn.Sequential):
     def __init__(self, embedding_dim, width):
         super(MyBlock, self).__init__()
@@ -847,31 +976,56 @@ def feature_engineering_attention(x: torch.Tensor, c: torch.Tensor, sigma: torch
     return x
 
 
-def compute_seed_merge_matrix(seed_embs, seed_sigmas, pixel_classifier):
+def compute_seed_merge_matrix(seed_embs, seed_sigmas, affinity_net, coords):
     """
     seed_embs: [K, E] — seed embedding vectors
     seed_sigmas: [K, S] — sigma values at seed locations
-    pixel_classifier: ProbabilityNet (same weights as pixel classification)
+    affinity_net: SeedAffinityTransformer
+    coords: [K, dim_coords] — actual pixel coordinates of seeds
     Returns: M [K, K] — sigmoid affinity matrix
     """
-    K, E = seed_embs.shape
-    S = seed_sigmas.shape[1]
-    # Pairwise diff: seed_i - seed_j (same as pixel_emb - seed_emb)
-    diff = seed_embs.unsqueeze(1) - seed_embs.unsqueeze(0)  # [K, K, E]
-    # Use seed_j's sigma (the "key" / "pixel" role)
-    sigma_exp = seed_sigmas.unsqueeze(0).expand(K, K, S)  # [K, K, S]
-    features = torch.cat([diff, sigma_exp], dim=-1)  # [K, K, E+S]
-    logits = pixel_classifier(features.reshape(K * K, E + S))  # [K*K, 1]
-    M = torch.sigmoid(logits.reshape(K, K))  # [K, K]
-    return M
+    features = torch.cat([seed_embs, seed_sigmas], dim=-1)  # [K, E+S]
+    return affinity_net(features, coords)
+
+
+def _gate_by_center_logit(dist, centroids, h, w, window_size):
+    """Gate per-seed instance logits by the MLP's own prediction at the seed center.
+
+    Computes logit(sigmoid(a) * sigmoid(b)) = a + b - log(1 + exp(a) + exp(b))
+    entirely in logit space using numerically stable ops (no sigmoid/logit roundtrip).
+    This suppresses all predictions from seeds whose center logit is low (background),
+    while leaving confident seeds unchanged.
+
+    dist: [K, 1, ws, ws] — per-seed logits from compute_crops
+    centroids: [K, 2] — (y, x) pixel coordinates of seeds
+    h, w: image dimensions
+    window_size: crop window size
+    Returns: gated dist [K, 1, ws, ws]
+    """
+    K = dist.shape[0]
+    ws = window_size
+
+    # Find each centroid's position within its crop (replicates centre_crop clamping)
+    clamped_y = centroids[:, 0].clamp(min=ws // 2, max=h - ws // 2)
+    clamped_x = centroids[:, 1].clamp(min=ws // 2, max=w - ws // 2)
+    cy = (centroids[:, 0] - (clamped_y - ws // 2)).long()
+    cx = (centroids[:, 1] - (clamped_x - ws // 2)).long()
+
+    center_logit = dist[torch.arange(K, device=dist.device), 0, cy, cx]  # [K]
+    b = center_logit.view(K, 1, 1, 1)
+
+    # logit(sigmoid(a) * sigmoid(b)) = a + b - log(1 + exp(a) + exp(b))
+    # = a + b - softplus(logaddexp(a, b))
+    return dist + b - F.softplus(torch.logaddexp(dist, b))
 
 
 def apply_seed_merging(dist, coords, M, h, w, window_size):
     """
     Apply M to predictions in global pixel space (differentiable).
-    Uses noisy-OR (probabilistic union) instead of weighted average:
-      merged_p = 1 - prod((1 - p_j)^M[i,j])
-    This preserves high-confidence predictions rather than diluting them.
+    Performs a per-pixel weighted average in logit space, only over seeds
+    that actually cover each pixel (seeds without predictions are excluded,
+    not treated as predicting background).
+    M is symmetrized and row-normalized per-pixel.
     dist: [K, 1, ws, ws] — per-seed logits
     coords: [3, K*ws*ws] — coords[0]=seed_idx, coords[1]=y, coords[2]=x
     M: [K, K] — seed affinity matrix (sigmoid values in [0,1])
@@ -883,26 +1037,20 @@ def apply_seed_merging(dist, coords, M, h, w, window_size):
     seed_idx = coords[0].long()
     pixel_idx = (coords[1] * w + coords[2]).long()
 
-    # Force diagonal to 1: each seed fully contributes to itself
-    M = M.clone()
+    # Symmetrize M and force diagonal to 1
+    M = (M + M.T) / 2
     M.fill_diagonal_(1.0)
 
-    # Convert logits to probabilities
-    # Initialize to large negative logits so sigmoid → ~0 (neutral in noisy-OR)
-    S_dense = torch.full((K, h * w), -20.0, device=dist.device, dtype=dist.dtype)
-    S_dense[seed_idx, pixel_idx] = dist.flatten()
-    P = torch.sigmoid(S_dense)  # [K, H*W] probabilities
+    # Dense logit tensor + coverage mask
+    logits = torch.zeros((K, h * w), device=dist.device, dtype=dist.dtype)
+    has_pred = torch.zeros((K, h * w), device=dist.device, dtype=dist.dtype)
+    logits[seed_idx, pixel_idx] = dist.flatten()
+    has_pred[seed_idx, pixel_idx] = 1.0
 
-    # Noisy-OR: 1 - prod((1 - p_j)^M[i,j])
-    eps = 1e-7
-    log_complement = torch.log(1 - P + eps)   # [K, H*W]
-    summed = M @ log_complement                # [K, H*W]
-    merged_prob = 1 - torch.exp(summed)        # [K, H*W]
+    # Weighted average in logit space, only over seeds that cover each pixel
+    merged = (M @ (logits * has_pred)) / (M @ has_pred).clamp(min=1e-6)
 
-    # Convert back to logits
-    merged_logits = torch.logit(merged_prob.clamp(eps, 1 - eps))
-
-    merged_dist = merged_logits[seed_idx, pixel_idx]
+    merged_dist = merged[seed_idx, pixel_idx]
     return merged_dist.view(K, 1, window_size, window_size)
 
 
@@ -940,11 +1088,16 @@ class InstanSeg(nn.Module):
                  dim_coords = 2,
                  dim_seeds = 1,
                  mask_loss_fn = None,
-                 seed_merging = False,):
-        
+                 seed_merging = False,
+                 uncertainty_weighting = False,):
+
         super().__init__()
         self.n_sigma = n_sigma
         self.instance_weight = instance_weight
+        self.uncertainty_weighting = uncertainty_weighting
+        if uncertainty_weighting:
+            self.log_var_seed = nn.Parameter(torch.zeros(1))
+            self.log_var_inst = nn.Parameter(torch.zeros(1))
         self.device = device
         self.dim_coords = dim_coords
 
@@ -972,9 +1125,9 @@ class InstanSeg(nn.Module):
     def update_instance_loss(self, instance_loss_fn_str):
 
         if instance_loss_fn_str == "lovasz_hinge":
-            from instanseg.utils.loss.lovasz_losses import lovasz_hinge
+            from instanseg.utils.loss.lovasz_losses import lovasz_hinge_batched
             def instance_loss_fn(pred, gt, **kwargs):
-                return lovasz_hinge((pred.squeeze(1)), gt, per_image=True)
+                return lovasz_hinge_batched(pred.squeeze(1), gt)
 
         elif instance_loss_fn_str == "ce":
             self.instance_loss_fn = torch.nn.BCEWithLogitsLoss()
@@ -1002,6 +1155,10 @@ class InstanSeg(nn.Module):
         self.instance_loss_fn = instance_loss_fn
 
     def update_seed_loss(self, seed_loss_fn):
+        if seed_loss_fn is None or seed_loss_fn == "none":
+            self.seed_loss = None
+            return
+
         if seed_loss_fn in ["ce"]:
             binary_loss = torch.nn.BCEWithLogitsLoss(reduction='none')
 
@@ -1030,6 +1187,27 @@ class InstanSeg(nn.Module):
 
                 if self.bg_weight is not None:
                     weights = torch.where(edt < 0, self.bg_weight, 1.0)
+                    loss = loss * weights
+
+                if mask is not None:
+                    mask = mask.float()
+                    masked_loss = loss * mask
+                    return masked_loss.sum() / mask.sum().clamp(min=1)
+                else:
+                    return loss.mean()
+
+            self.seed_loss = seed_loss
+
+        elif seed_loss_fn == "l1_poisson":
+            from instanseg.utils.pytorch_utils import instance_wise_poisson
+
+            distance_loss = torch.nn.L1Loss(reduction='none')
+
+            def seed_loss(x, y, mask=None):
+                poisson = (instance_wise_poisson(y.float()) - 0.5) * 15
+                loss = distance_loss(x, poisson[None])
+                if self.bg_weight is not None:
+                    weights = torch.where(poisson < 0, self.bg_weight, 1.0)
                     loss = loss * weights
 
                 if mask is not None:
@@ -1075,7 +1253,26 @@ class InstanSeg(nn.Module):
                 self.pixel_classifier = model.pixel_classifier
             except:
                 self.pixel_classifier = model.model.pixel_classifier  # This happens when there is an adaptornet
-        
+
+            # Load existing seed affinity net if present, or create a new one
+            if self.seed_merging:
+                try:
+                    self.seed_affinity_net = model.seed_affinity_net
+                except AttributeError:
+                    try:
+                        self.seed_affinity_net = model.model.seed_affinity_net
+                    except AttributeError:
+                        affinity_feat_dim = self.dim_coords + self.n_sigma
+                        model.seed_affinity_net = SeedAffinityTransformer(
+                            feat_dim=affinity_feat_dim,
+                            dim_coords=self.dim_coords,
+                        )
+                        self.seed_affinity_net = model.seed_affinity_net.to(self.device)
+
+            if self.uncertainty_weighting:
+                model.log_var_seed = self.log_var_seed
+                model.log_var_inst = self.log_var_inst
+
             return model
         else:
             if MLP_input_dim is None:
@@ -1101,8 +1298,22 @@ class InstanSeg(nn.Module):
                 model.pixel_classifier = ConvProbabilityNet( MLP_input_dim, width = MLP_width)
             self.pixel_classifier = model.pixel_classifier.to(self.device)
 
+            # Create separate seed affinity network if seed merging is enabled
+            if self.seed_merging:
+                affinity_feat_dim = self.dim_coords + self.n_sigma
+                model.seed_affinity_net = SeedAffinityTransformer(
+                    feat_dim=affinity_feat_dim,
+                    dim_coords=self.dim_coords,
+                )
+                self.seed_affinity_net = model.seed_affinity_net.to(self.device)
+
+            # Register uncertainty parameters on model so optimizer picks them up
+            if self.uncertainty_weighting:
+                model.log_var_seed = self.log_var_seed
+                model.log_var_inst = self.log_var_inst
+
             return model
-        
+
 
     def forward(self, prediction: torch.Tensor, instances: torch.Tensor, w_inst: float = 1.5, w_seed: float = 1.0):
 
@@ -1110,11 +1321,14 @@ class InstanSeg(nn.Module):
 
         batch_size, height, width = prediction.size(
             0), prediction.size(2), prediction.size(3)
-        
+
         xxyy = generate_coordinate_map(mode = self.coord_mode, spatial_dim = self.dim_coords, height = height, width = width, device = prediction.device)
 
-        loss = 0
-  
+        seed_loss_sum = 0
+        total_seed_loss = 0
+        all_dists = []
+        all_crops = []
+
         if self.cells_and_nuclei:
             dim_out = int(self.dim_out / 2)
         else:
@@ -1141,7 +1355,6 @@ class InstanSeg(nn.Module):
                 sigma = sigma_batch[b]
                 seed_map = seed_map_batch[b]
 
-                instance_loss = 0
                 seed_loss = 0
 
                 instance = instances_batch[b, mask_channel].unsqueeze(0)  # 1 x h x w
@@ -1155,24 +1368,27 @@ class InstanSeg(nn.Module):
                 else:
                     mask = None
 
-            
-                if self.mask_loss is not None and self.dim_seeds == 2:
-                    fg_mask = (instance > 0)
-                    if mask is not None:
-                        fg_mask = fg_mask & mask
-                    seed_loss_tmp = self.seed_loss(seed_map[0:1], instance, mask=fg_mask)
-                    seed_loss_tmp += self.mask_loss(seed_map[1:2], instance, mask=mask, bg_weight=self.bg_weight)
-                else:
-                    seed_loss_tmp = self.seed_loss(seed_map, instance, mask=mask)
 
-                seed_loss += seed_loss_tmp
+                if self.seed_loss is not None:
+                    if self.mask_loss is not None and self.dim_seeds == 2:
+                        fg_mask = (instance > 0)
+                        if mask is not None:
+                            fg_mask = fg_mask & mask
+                        seed_loss_tmp = self.seed_loss(seed_map[0:1], instance, mask=fg_mask)
+                        seed_loss_tmp += self.mask_loss(seed_map[1:2], instance, mask=mask, bg_weight=self.bg_weight)
+                    else:
+                        seed_loss_tmp = self.seed_loss(seed_map, instance, mask=mask)
+
+                    seed_loss += seed_loss_tmp
 
                 if w_inst == 0:
-                    loss += w_seed * seed_loss
+                    seed_loss_sum += w_seed * seed_loss
+                    total_seed_loss += seed_loss
                     continue
 
                 if instance.min() > 0:
-                    loss += w_seed * seed_loss
+                    seed_loss_sum += w_seed * seed_loss
+                    total_seed_loss += seed_loss
                     continue
 
                 instance_ids = instance.unique()
@@ -1188,7 +1404,8 @@ class InstanSeg(nn.Module):
                     if self.min_gt_instanseg_area is not None:
                         onehot_labels = onehot_labels[onehot_labels.sum((1,2)) > self.min_gt_instanseg_area]
                         if onehot_labels.shape[0] == 0:
-                            loss += w_seed * seed_loss
+                            seed_loss_sum += w_seed * seed_loss
+                            total_seed_loss += seed_loss
                             continue
 
                     if self.num_instance_cap is not None: #This is to cap the number of objects to avoid OOM errors.
@@ -1205,7 +1422,7 @@ class InstanSeg(nn.Module):
                     centres = spatial_emb[:,centroids[0],centroids[1]].detach().T
 
                     idx = torch.randperm(centroids.shape[1])[:self.num_instance_cap]
-            
+
                     centres = centres[idx]
                     centroids = centroids[:,idx]
 
@@ -1215,7 +1432,8 @@ class InstanSeg(nn.Module):
 
 
                     if len(centroids) == 0:
-                        loss += w_seed * seed_loss
+                        seed_loss_sum += w_seed * seed_loss
+                        total_seed_loss += seed_loss
                         continue
 
                     window_size = min(self.window_size, height, width)
@@ -1229,17 +1447,66 @@ class InstanSeg(nn.Module):
                                                  window_size = window_size)
 
                     # Seed merging: pool predictions across seeds via M
-                    if self.seed_merging and isinstance(self.pixel_classifier, ProbabilityNet):
+                    if self.seed_merging and hasattr(self, 'seed_affinity_net'):
                         sigma_at_seeds = sigma[:, centroids[:, 0], centroids[:, 1]].T  # [K, S]
-                        M = compute_seed_merge_matrix(centres, sigma_at_seeds, self.pixel_classifier)
+                        M = compute_seed_merge_matrix(centres, sigma_at_seeds, self.seed_affinity_net, centroids.float())
                         dist = apply_seed_merging(dist, coords, M, height, width, window_size)
 
+                    # No-seed-loss mode: gate predictions by center logit (AND in probability space)
+                    if self.seed_loss is None:
+                        dist = _gate_by_center_logit(dist, centroids, height, width, window_size)
+
                     crop = onehot_labels.squeeze(1)[coords[0], coords[1], coords[2]].reshape(-1,window_size, window_size)
-                    instance_loss = instance_loss + self.instance_loss_fn(dist, crop.float(), sigma=sigma[0])
+                    all_dists.append(dist)
+                    all_crops.append(crop.float())
 
-                loss += w_inst * instance_loss + w_seed * seed_loss
+                    # Grid-ensured maxima: fill empty grid cells with additional seeds
+                    if self.seed_merging and (grid_maxima := ensure_grid_maxima(seed_map_tmp.squeeze(), centroids, grid_size=16)).shape[0] > 0:
+                        grid_centres = spatial_emb[:, grid_maxima[:, 0], grid_maxima[:, 1]].detach().T
 
-        loss = loss / (b + 1)
+                        dist_grid, coords_grid = compute_crops(spatial_emb,
+                                                                grid_centres,
+                                                                sigma,
+                                                                grid_maxima,
+                                                                feature_engineering=self.feature_engineering,
+                                                                pixel_classifier=self.pixel_classifier,
+                                                                window_size=window_size)
+
+                        if self.seed_loss is None:
+                            dist_grid = _gate_by_center_logit(dist_grid, grid_maxima, height, width, window_size)
+
+                        # Build target: instance mask for FG seeds, all zeros for BG seeds
+                        labels_at_grid = instance[0, grid_maxima[:, 0], grid_maxima[:, 1]]  # [K_grid]
+                        grid_target = (instance[0:1] == labels_at_grid.view(-1, 1, 1)).float()  # [K_grid, H, W]
+                        grid_target[labels_at_grid == 0] = 0  # background seeds → predict nothing
+
+                        crop_grid = grid_target[coords_grid[0].long(), coords_grid[1].long(), coords_grid[2].long()].reshape(-1, window_size, window_size)
+                        all_dists.append(dist_grid)
+                        all_crops.append(crop_grid.float())
+
+                seed_loss_sum += w_seed * seed_loss
+                total_seed_loss += seed_loss
+
+        # Average seed loss over batch
+        avg_seed_loss = seed_loss_sum / (b + 1)
+
+        # Compute instance loss in one batched pass
+        if all_dists:
+            all_dists = torch.cat(all_dists, dim=0)
+            all_crops = torch.cat(all_crops, dim=0)
+            total_instance_loss = self.instance_loss_fn(all_dists, all_crops)
+        else:
+            total_instance_loss = 0
+
+        # Combine seed and instance losses
+        if self.uncertainty_weighting:
+            loss = 0
+            if isinstance(avg_seed_loss, torch.Tensor):
+                loss = loss + torch.exp(-self.log_var_seed) * avg_seed_loss + self.log_var_seed
+            if isinstance(total_instance_loss, torch.Tensor):
+                loss = loss + torch.exp(-self.log_var_inst) * total_instance_loss + self.log_var_inst
+        else:
+            loss = avg_seed_loss + w_inst * total_instance_loss
 
         if self.cells_and_nuclei:
             loss = loss / 2
@@ -1247,9 +1514,18 @@ class InstanSeg(nn.Module):
         if type(loss) != torch.Tensor:
             loss = spatial_emb * 0
 
+        # Store component losses for logging
+        self.last_seed_loss = float(total_seed_loss) / (b + 1)
+        self.last_instance_loss = float(total_instance_loss)
+
         return loss
     
     
+    def reset_uncertainty_weights(self):
+        if self.uncertainty_weighting:
+            self.log_var_seed.data.zero_()
+            self.log_var_inst.data.zero_()
+
     def update_hyperparameters(self,params):
         self.parameters_have_been_updated = True
         self.params = params
@@ -1263,7 +1539,7 @@ class InstanSeg(nn.Module):
                         overlap_threshold: float = 0.5,
                         mean_threshold: float = -10000,
                         fg_threshold: float = 0.5, #not used in default instanseg
-                        window_size: int = 128,
+                        window_size: int = None,
                         min_size = 10,
                         device=None,
                         classifier=None,
@@ -1276,6 +1552,8 @@ class InstanSeg(nn.Module):
                         overlap_metric: str = "iou"):
             
 
+        if window_size is None:
+            window_size = self.window_size
         if device is None:
             device = self.device
         if classifier is None:
@@ -1367,9 +1645,9 @@ class InstanSeg(nn.Module):
                     continue
 
                 # Seed merging: compute affinity matrix for label merging only
-                if self.seed_merging and isinstance(classifier, ProbabilityNet):
+                if self.seed_merging and hasattr(self, 'seed_affinity_net'):
                     sigma_at_seeds = sigma[:, local_centroids_idx[:, 0], local_centroids_idx[:, 1]].T  # [K, S]
-                    M = compute_seed_merge_matrix(fields_at_centroids.T, sigma_at_seeds, classifier)
+                    M = compute_seed_merge_matrix(fields_at_centroids.T, sigma_at_seeds, self.seed_affinity_net, local_centroids_idx.float())
 
                 crops, coords = compute_crops(fields,
                                                 fields_at_centroids.T,
@@ -1384,6 +1662,10 @@ class InstanSeg(nn.Module):
                 # Seed merging: apply soft pooling to crops (matching training)
                 if M is not None:
                     crops = apply_seed_merging(crops, coords, M, h, w, window_size)
+
+                # No-seed-loss mode: gate predictions by center logit (matching training)
+                if self.seed_loss is None:
+                    crops = _gate_by_center_logit(crops, local_centroids_idx, h, w, window_size)
 
                 coords = coords[1:] # The first channel are just channel indices, not required here.
 
@@ -1573,6 +1855,16 @@ class InstanSeg_Torchscript(nn.Module):
             self.pixel_classifier = model.pixel_classifier
         except:
             self.pixel_classifier = model.model.pixel_classifier
+
+        # Load seed affinity net if present
+        try:
+            self.seed_affinity_net = model.seed_affinity_net
+        except AttributeError:
+            try:
+                self.seed_affinity_net = model.model.seed_affinity_net
+            except AttributeError:
+                pass
+
         self.cells_and_nuclei = cells_and_nuclei
         self.pixel_size = pixel_size
         self.dim_coords = dim_coords

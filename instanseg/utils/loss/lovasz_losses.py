@@ -94,6 +94,42 @@ def lovasz_hinge(logits, labels, per_image=True, ignore=None):
     return loss
 
 
+def lovasz_hinge_batched(logits, labels):
+    """Vectorized per-image Lovasz hinge loss over a batch.
+
+    Equivalent to lovasz_hinge(logits, labels, per_image=True) but runs all
+    images in parallel using batched sort/cumsum instead of a Python loop.
+
+    Args:
+        logits: (B, H, W) logits at each pixel
+        labels: (B, H, W) binary ground truth masks (0 or 1)
+
+    Returns:
+        Scalar mean loss over the batch.
+    """
+    B = logits.shape[0]
+    if B == 0:
+        return logits.sum() * 0.
+
+    logits_flat = logits.reshape(B, -1)   # (B, P)
+    labels_flat = labels.reshape(B, -1).float()  # (B, P)
+
+    signs = 2. * labels_flat - 1.
+    errors = 1. - logits_flat * signs             # (B, P)
+    errors_sorted, perm = torch.sort(errors, dim=1, descending=True)
+    gt_sorted = torch.gather(labels_flat, 1, perm)  # (B, P)
+
+    # Batched lovasz_grad
+    gts = gt_sorted.sum(dim=1, keepdim=True)        # (B, 1)
+    intersection = gts - gt_sorted.cumsum(dim=1)     # (B, P)
+    union = gts + (1. - gt_sorted).cumsum(dim=1)     # (B, P)
+    jaccard = 1. - intersection / union               # (B, P)
+    jaccard[:, 1:] = jaccard[:, 1:] - jaccard[:, :-1]
+
+    loss_per_image = (F.relu(errors_sorted) * jaccard).sum(dim=1)  # (B,)
+    return loss_per_image.mean()
+
+
 def lovasz_hinge_flat(logits, labels):
     """
     Binary Lovasz hinge loss

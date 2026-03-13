@@ -50,7 +50,7 @@ parser.add_argument("-dim_in", "--dim_in", type=int, default=3,help="Number of c
 parser.add_argument("-dummy", "--dummy", default=False, type=lambda x: (str(x).lower() == 'true'),help="Use the training set as a validation set, this will trigger a warning message. use only for debugging")
 parser.add_argument('-bg_weight', '--bg_weight', default=None, type= float, help = "Weight to assign to the background class in the loss function")
 parser.add_argument('-instance_loss_fn', '--instance_loss_fn', default="lovasz_hinge", type=str, help = "Loss function to use for instance segmentation: lovasz_hinge or dice_loss are supported. lovasz_hinge is a lot slower to start converging")
-parser.add_argument('-seed_loss_fn', '--seed_loss_fn', default="l1_distance", type=str, help = "Loss function to use for seed selection, only ce and l1_distance are supported. ce is much faster, but l1_distance is usually more accurate")
+parser.add_argument('-seed_loss_fn', '--seed_loss_fn', default="l1_distance", type=str, help = "Loss function to use for seed selection: ce, l1_distance, l2_distance, or l1_poisson. ce is much faster, but l1_distance is usually more accurate. l1_poisson uses Poisson field instead of EDT.")
 parser.add_argument('-mask_loss_fn', '--mask_loss_fn', default=None, type=str, help = "Loss function to use for the mask channel when dim_seeds=2: ce or dice are supported. If set, dim_seeds is forced to 2.")
 parser.add_argument('-anneal', '--cosineannealing', default=False, type=lambda x: (str(x).lower() == 'true'), help = "Whether to use cosine annealing for the learning rate")
 parser.add_argument('-o_h', '--optimize_hyperparameters', default=False, type=lambda x: (str(x).lower() == 'true'), help = "Whether to optimize hyperparameters every 10 epochs")
@@ -75,6 +75,7 @@ parser.add_argument('-sampling_mode', '--sampling_mode', default=None, type=str,
 parser.add_argument('-lora_rank', '--lora_rank', default=0, type=int, help="LoRA rank for SAM/DINO backbone. 0 = disabled, 16 is a good default.")
 parser.add_argument('-fp16', '--fp16', default=False, type=lambda x: (str(x).lower() == 'true'), help="Enable mixed precision (float16) training")
 parser.add_argument('-seed_merging', '--seed_merging', default=False, type=lambda x: (str(x).lower() == 'true'), help="Enable seed-seed attention merging")
+parser.add_argument('-uncertainty_weighting', '--uncertainty_weighting', default=False, type=lambda x: (str(x).lower() == 'true'), help="Learn task weights via uncertainty (Kendall et al. 2018)")
 parser.add_argument('-preemptable', '--preemptable', default=False, type=lambda x: (str(x).lower() == 'true'), help="Enable preemption-safe training: saves full training state and auto-resumes from checkpoint if preempted on SLURM")
 parser.add_argument('-preempt_interval', '--preempt_save_interval', default=10, type=int, help="Save preemptable checkpoint every N epochs (default=1). Higher values reduce I/O for large models at the cost of losing more progress on preemption.")
 
@@ -163,6 +164,14 @@ def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name=
 
         dict_to_print = {"train_loss": train_loss, "test_loss": test_loss, "training_time": int(train_time),
                          "testing_time": int(test_time)}
+
+        if hasattr(method, 'last_seed_loss'):
+            dict_to_print["seed_loss"] = method.last_seed_loss
+            dict_to_print["instance_loss"] = method.last_instance_loss
+        if method.uncertainty_weighting:
+            import math
+            dict_to_print["w_seed"] = math.exp(-method.log_var_seed.item())
+            dict_to_print["w_inst"] = math.exp(-method.log_var_inst.item())
 
         if args.cells_and_nuclei:
             f1_list.append(f1_score[0])
@@ -332,7 +341,8 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
                         feature_engineering_function=args.feature_engineering,
                         bg_weight = args.bg_weight,
                         mask_loss_fn = args.mask_loss_fn,
-                        seed_merging = args.seed_merging)
+                        seed_merging = args.seed_merging,
+                        uncertainty_weighting = args.uncertainty_weighting)
 
         def loss_fn(*args, **kwargs):
             return method.forward(*args, **kwargs)
@@ -603,6 +613,7 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         method.update_instance_loss(args.instance_loss_fn)
         if args.mask_loss_fn is not None:
             method.update_mask_loss(args.mask_loss_fn)
+        method.reset_uncertainty_weights()
 
     if _preemptable_resuming and _preemptable_checkpoint is not None:
         _ckpt = _preemptable_checkpoint
@@ -669,6 +680,7 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
             method.update_instance_loss(args.instance_loss_fn)
             if args.mask_loss_fn is not None:
                 method.update_mask_loss(args.mask_loss_fn)
+            method.reset_uncertainty_weights()
 
             model, train_losses, test_losses, f1_list, f1_list_cells = main(
                 model, loss_fn, train_loader, test_loader, num_epochs=num_epochs,

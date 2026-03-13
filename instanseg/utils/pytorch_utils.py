@@ -197,6 +197,7 @@ def fast_sparse_intersection_over_minimum_area(sparse_onehot: torch.Tensor) -> t
     return intersection / min_area
 
 
+
 def instance_wise_edt(x: torch.Tensor, edt_type: str = 'auto') -> torch.Tensor:
     """
     Create instance-normalized distance map from a labeled image.
@@ -235,6 +236,75 @@ def instance_wise_edt(x: torch.Tensor, edt_type: str = 'auto') -> torch.Tensor:
         x = x.type(torch.FloatTensor).to('mps')
     return x
 
+
+def instance_wise_poisson(x: torch.Tensor, n_iter: int = 30, omega: float = 1.9) -> torch.Tensor:
+    """
+    Create instance-normalized Poisson distance field from a labeled image.
+    Solves Δu = -1 with u = 0 on the boundary for each instance.
+    The result is normalized per instance to [0, 1].
+
+    Uses EDT as warm-start, then refines with Red-Black SOR via depthwise
+    conv2d on GPU. Runs in float16 for speed.
+    """
+    import edt as edt_lib
+    import torch.nn.functional as F
+
+    if x.max() == 0:
+        return torch.zeros(x.shape[-2:], device=x.device)
+
+    device = x.device
+    onehot = torch_onehot(x)  # [1, C, H, W]
+    C = onehot.shape[1]
+    if C == 0:
+        return torch.zeros(x.shape[-2:], device=x.device)
+
+    H, W = x.shape[-2:]
+    masks = onehot[0].to(device=device, dtype=torch.float16)  # [C, H, W]
+    masks_4d = masks.unsqueeze(0)  # [1, C, H, W]
+
+    # Erode masks by 1px to kill disconnected single-pixel fragments
+    eroded_4d = -F.max_pool2d(-masks_4d, kernel_size=3, stride=1, padding=1)
+
+    # Warm-start with EDT on eroded masks
+    xedt = torch.from_numpy(edt_lib.edt(x[0].cpu().numpy(), black_border=False))
+    edt_per_instance = eroded_4d.squeeze(0).float().cpu() * xedt  # [C, H, W]
+    edt_maxes = edt_per_instance.flatten(1).max(1)[0].clamp(min=1.0).view(-1, 1, 1)
+    edt_norm = edt_per_instance / edt_maxes
+    u_init = edt_norm * (2.0 - edt_norm)  # parabolic approximation
+    u_init = u_init * (edt_maxes ** 2 / 4.0)
+
+    u = u_init.unsqueeze(0).to(device=device, dtype=torch.float16)  # [1, C, H, W]
+
+    # Neighbor sum kernel for depthwise conv2d
+    neighbor_kernel = torch.tensor(
+        [[0, 1, 0], [1, 0, 1], [0, 1, 0]],
+        dtype=torch.float16, device=device,
+    ).reshape(1, 1, 3, 3).expand(C, 1, 3, 3).contiguous()
+
+    # Red-Black checkerboard masks
+    yy, xx = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+    red = ((yy + xx) % 2 == 0).unsqueeze(0).unsqueeze(0)    # [1, 1, H, W] bool
+    black = ((yy + xx) % 2 == 1).unsqueeze(0).unsqueeze(0)  # [1, 1, H, W] bool
+
+    # SOR on eroded masks
+    for _ in range(n_iter):
+        neighbor_sum = F.conv2d(u, neighbor_kernel, padding=1, groups=C)
+        u_gs = (neighbor_sum + 1.0) * 0.25
+        u = torch.where(red, u + omega * (u_gs - u), u) * eroded_4d
+
+        neighbor_sum = F.conv2d(u, neighbor_kernel, padding=1, groups=C)
+        u_gs = (neighbor_sum + 1.0) * 0.25
+        u = torch.where(black, u + omega * (u_gs - u), u) * eroded_4d
+
+    # Dilate result back into original mask (1 iteration of max_pool within mask)
+    u = F.max_pool2d(u, kernel_size=3, stride=1, padding=1) * masks_4d
+
+    # Normalize per instance to [0, 1]
+    u = u.squeeze(0)  # [C, H, W]
+    max_vals = u.flatten(1).max(1)[0].clamp(min=1e-4).view(-1, 1, 1)
+    u = u / max_vals
+
+    return u.sum(0).float()
 
 
 def fast_dual_iou(onehot1: torch.Tensor, onehot2: torch.Tensor) -> torch.Tensor:
