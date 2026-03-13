@@ -76,6 +76,7 @@ parser.add_argument('-lora_rank', '--lora_rank', default=0, type=int, help="LoRA
 parser.add_argument('-fp16', '--fp16', default=False, type=lambda x: (str(x).lower() == 'true'), help="Enable mixed precision (float16) training")
 parser.add_argument('-seed_merging', '--seed_merging', default=False, type=lambda x: (str(x).lower() == 'true'), help="Enable seed-seed attention merging")
 parser.add_argument('-uncertainty_weighting', '--uncertainty_weighting', default=False, type=lambda x: (str(x).lower() == 'true'), help="Learn task weights via uncertainty (Kendall et al. 2018)")
+parser.add_argument('-batched_instance_loss', '--batched_instance_loss', default=True, type=lambda x: (str(x).lower() == 'true'), help="Compute instance loss in one batched pass (True) or per-image (False)")
 parser.add_argument('-preemptable', '--preemptable', default=False, type=lambda x: (str(x).lower() == 'true'), help="Enable preemption-safe training: saves full training state and auto-resumes from checkpoint if preempted on SLURM")
 parser.add_argument('-preempt_interval', '--preempt_save_interval', default=10, type=int, help="Save preemptable checkpoint every N epochs (default=1). Higher values reduce I/O for large models at the cost of losing more progress on preemption.")
 
@@ -342,7 +343,8 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
                         bg_weight = args.bg_weight,
                         mask_loss_fn = args.mask_loss_fn,
                         seed_merging = args.seed_merging,
-                        uncertainty_weighting = args.uncertainty_weighting)
+                        uncertainty_weighting = args.uncertainty_weighting,
+                        batched_instance_loss = args.batched_instance_loss)
 
         def loss_fn(*args, **kwargs):
             return method.forward(*args, **kwargs)

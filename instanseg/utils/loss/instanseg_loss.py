@@ -1089,12 +1089,14 @@ class InstanSeg(nn.Module):
                  dim_seeds = 1,
                  mask_loss_fn = None,
                  seed_merging = False,
-                 uncertainty_weighting = False,):
+                 uncertainty_weighting = False,
+                 batched_instance_loss = True,):
 
         super().__init__()
         self.n_sigma = n_sigma
         self.instance_weight = instance_weight
         self.uncertainty_weighting = uncertainty_weighting
+        self.batched_instance_loss = batched_instance_loss
         if uncertainty_weighting:
             self.log_var_seed = nn.Parameter(torch.zeros(1))
             self.log_var_inst = nn.Parameter(torch.zeros(1))
@@ -1125,9 +1127,14 @@ class InstanSeg(nn.Module):
     def update_instance_loss(self, instance_loss_fn_str):
 
         if instance_loss_fn_str == "lovasz_hinge":
-            from instanseg.utils.loss.lovasz_losses import lovasz_hinge_batched
-            def instance_loss_fn(pred, gt, **kwargs):
-                return lovasz_hinge_batched(pred.squeeze(1), gt)
+            if self.batched_instance_loss:
+                from instanseg.utils.loss.lovasz_losses import lovasz_hinge_batched
+                def instance_loss_fn(pred, gt, **kwargs):
+                    return lovasz_hinge_batched(pred.squeeze(1), gt)
+            else:
+                from instanseg.utils.loss.lovasz_losses import lovasz_hinge
+                def instance_loss_fn(pred, gt, **kwargs):
+                    return lovasz_hinge(pred.squeeze(1), gt, per_image=True)
 
         elif instance_loss_fn_str == "ce":
             self.instance_loss_fn = torch.nn.BCEWithLogitsLoss()
@@ -1326,6 +1333,7 @@ class InstanSeg(nn.Module):
 
         seed_loss_sum = 0
         total_seed_loss = 0
+        instance_loss_sum = 0
         all_dists = []
         all_crops = []
 
@@ -1457,8 +1465,12 @@ class InstanSeg(nn.Module):
                         dist = _gate_by_center_logit(dist, centroids, height, width, window_size)
 
                     crop = onehot_labels.squeeze(1)[coords[0], coords[1], coords[2]].reshape(-1,window_size, window_size)
-                    all_dists.append(dist)
-                    all_crops.append(crop.float())
+                    if self.batched_instance_loss:
+                        all_dists.append(dist)
+                        all_crops.append(crop.float())
+                    else:
+                        image_dists = [dist]
+                        image_crops = [crop.float()]
 
                     # Grid-ensured maxima: fill empty grid cells with additional seeds
                     if self.seed_merging and (grid_maxima := ensure_grid_maxima(seed_map_tmp.squeeze(), centroids, grid_size=16)).shape[0] > 0:
@@ -1481,8 +1493,18 @@ class InstanSeg(nn.Module):
                         grid_target[labels_at_grid == 0] = 0  # background seeds → predict nothing
 
                         crop_grid = grid_target[coords_grid[0].long(), coords_grid[1].long(), coords_grid[2].long()].reshape(-1, window_size, window_size)
-                        all_dists.append(dist_grid)
-                        all_crops.append(crop_grid.float())
+                        if self.batched_instance_loss:
+                            all_dists.append(dist_grid)
+                            all_crops.append(crop_grid.float())
+                        else:
+                            image_dists.append(dist_grid)
+                            image_crops.append(crop_grid.float())
+
+                    # Unbatched: compute instance loss per image
+                    if not self.batched_instance_loss:
+                        img_d = torch.cat(image_dists, dim=0)
+                        img_c = torch.cat(image_crops, dim=0)
+                        instance_loss_sum += self.instance_loss_fn(img_d, img_c)
 
                 seed_loss_sum += w_seed * seed_loss
                 total_seed_loss += seed_loss
@@ -1490,13 +1512,16 @@ class InstanSeg(nn.Module):
         # Average seed loss over batch
         avg_seed_loss = seed_loss_sum / (b + 1)
 
-        # Compute instance loss in one batched pass
-        if all_dists:
-            all_dists = torch.cat(all_dists, dim=0)
-            all_crops = torch.cat(all_crops, dim=0)
-            total_instance_loss = self.instance_loss_fn(all_dists, all_crops)
+        # Compute instance loss
+        if self.batched_instance_loss:
+            if all_dists:
+                all_dists = torch.cat(all_dists, dim=0)
+                all_crops = torch.cat(all_crops, dim=0)
+                total_instance_loss = self.instance_loss_fn(all_dists, all_crops)
+            else:
+                total_instance_loss = 0
         else:
-            total_instance_loss = 0
+            total_instance_loss = instance_loss_sum / (b + 1)
 
         # Combine seed and instance losses
         if self.uncertainty_weighting:
