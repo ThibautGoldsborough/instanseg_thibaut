@@ -55,7 +55,7 @@ def _load_eupe_convnext(
         # since EUPE's built-in fbaipublicfiles URL currently 403s.
         resolved_weights = weights if weights is not None else EUPE_CONVNEXT_DEFAULT_WEIGHTS[eupe_model]
         kwargs["weights"] = resolved_weights
-    return torch.hub.load(github_repo, eupe_model, source="github", **kwargs)
+    return torch.hub.load(github_repo, eupe_model, source="github", trust_repo=True, **kwargs)
 
 
 class EUPE(nn.Module):
