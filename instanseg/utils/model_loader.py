@@ -204,6 +204,42 @@ def build_model_from_dict(build_model_dictionary, random_seed = None):
                             norm  = build_model_dictionary["norm"],
                             dropout=build_model_dictionary["dropprob"])
 
+    elif build_model_dictionary["model_str"].lower() in {"eupe_convnext_tiny", "eupe_convnext_small", "eupe_convnext_base"}:
+            from instanseg.utils.models.EUPE import EUPE
+            eupe_model = build_model_dictionary["model_str"].lower()
+            print(f"Generating EUPE[{eupe_model}]")
+            multihead = build_model_dictionary["multihead"]
+
+            if build_model_dictionary["cells_and_nuclei"]:
+                n_seeds = build_model_dictionary["dim_seeds"]
+                if not multihead:
+                    from itertools import chain
+                    out_channels = [[build_model_dictionary["dim_coords"], build_model_dictionary["n_sigma"],n_seeds] for i in range(2)]
+                    out_channels = list(chain(*out_channels))
+                else:
+                    out_channels = [[build_model_dictionary["dim_coords"], build_model_dictionary["n_sigma"],n_seeds] for i in range(2)]
+            else:
+                n_seeds = build_model_dictionary["dim_seeds"]
+                if not multihead:
+                    out_channels = [[build_model_dictionary["dim_coords"], build_model_dictionary["n_sigma"],n_seeds]]
+                else:
+                    out_channels = [[build_model_dictionary["dim_coords"]], [build_model_dictionary["n_sigma"]],[n_seeds]]
+
+            eupe_kwargs = {}
+            if "eupe_weights" in build_model_dictionary and str(build_model_dictionary["eupe_weights"]).lower() not in ("nan", "none", ""):
+                eupe_kwargs["eupe_weights"] = str(build_model_dictionary["eupe_weights"])
+            if "eupe_github_repo" in build_model_dictionary and str(build_model_dictionary["eupe_github_repo"]).lower() not in ("nan", "none", ""):
+                eupe_kwargs["eupe_github_repo"] = str(build_model_dictionary["eupe_github_repo"])
+            if "eupe_pretrained" in build_model_dictionary and str(build_model_dictionary["eupe_pretrained"]).lower() not in ("nan", ""):
+                eupe_kwargs["eupe_pretrained"] = bool(eval(str(build_model_dictionary["eupe_pretrained"]).capitalize()))
+
+            model = EUPE(in_channels=dim_in,
+                         out_channels=out_channels,
+                         eupe_model=eupe_model,
+                         norm=build_model_dictionary["norm"],
+                         dropout=build_model_dictionary["dropprob"],
+                         **eupe_kwargs)
+
     elif build_model_dictionary["model_str"].lower() == "cellposesam":
         from instanseg.utils.models.CellposeSam import CellposeSam
         print("Generating CellposeSam")
