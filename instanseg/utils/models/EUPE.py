@@ -187,6 +187,10 @@ class EUPE(nn.Module):
         neck_out = self.neck(stage_feats[-1])
         return stage_feats, neck_out
 
+    def get_embedding_tap(self) -> nn.Module:
+        """Submodule whose output is the embedding (GAP applied externally)."""
+        return self.neck
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         block1_out = self.block1(x)  # (B, 16, H, W)
         stage_feats, neck_out = self._run_backbone(block1_out)

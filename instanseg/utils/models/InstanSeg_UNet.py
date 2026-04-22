@@ -152,7 +152,11 @@ class InstanSeg_UNet(nn.Module):
             out_channels = [out_channels]
             
         self.decoders = nn.ModuleList([Decoder(layers,out_channel,norm, act, dropout = dropout) for out_channel in out_channels])
-    
+
+    def get_embedding_tap(self) -> nn.Module:
+        """Bottleneck encoder block; its output is the embedding (GAP applied externally)."""
+        return self.encoder[-1]
+
     def forward(self,x):
         skips = []
         for n,layer in enumerate(self.encoder):

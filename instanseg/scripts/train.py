@@ -71,7 +71,8 @@ parser.add_argument('-rng_seed', '--rng_seed', default=None, type=int, help = "O
 parser.add_argument('-use_deterministic', '--use_deterministic', default=False, type=lambda x: (str(x).lower() == 'true'), help = "Whether to use deterministic algorithms (default=False)")
 parser.add_argument('-tile', '--tile_size', default=256, type=int, help = "Tile sizes for the input images")
 parser.add_argument('-modality', '--modality_filter', default=None, type=str, help = "Filter datasets by image modality (e.g. 'Brightfield', 'Fluorescence'). Default None uses all modalities.")
-parser.add_argument('-sampling_mode', '--sampling_mode', default=None, type=str, help="Run embedding clustering instead of training. Options: leiden_dino, leiden_sam")
+parser.add_argument('-cluster_sample', '--cluster_sample', default=False, type=lambda x: (str(x).lower() == 'true'), help="After hotstart, cluster train images with the model's own embeddings (Leiden) and weight the sampler by cluster frequency.")
+parser.add_argument('-resample_interval', '--resample_interval', default=0, type=int, help="Refresh Leiden clusters every N main-training epochs (default 0 = off). Requires --cluster_sample.")
 parser.add_argument('-lora_rank', '--lora_rank', default=0, type=int, help="LoRA rank for SAM/DINO backbone. 0 = disabled, 16 is a good default.")
 parser.add_argument('-fp16', '--fp16', default=False, type=lambda x: (str(x).lower() == 'true'), help="Enable mixed precision (float16) training")
 parser.add_argument('-seed_merging', '--seed_merging', default=False, type=lambda x: (str(x).lower() == 'true'), help="Enable seed-seed attention merging")
@@ -122,7 +123,8 @@ def save_training_plot(train_losses, test_losses, f1_list, f1_list_cells, output
 
 def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name='output_epoch',
          prior_train_losses=None, prior_test_losses=None, prior_f1_list=None, prior_f1_list_cells=None, hotstart_epoch=None,
-         scaler=None, start_epoch=0, prior_best_f1=-1):
+         scaler=None, start_epoch=0, prior_best_f1=-1,
+         resample_fn=None, resample_interval=0):
     from instanseg.utils.AI_utils import optimize_hyperparameters, train_epoch, test_epoch
     global best_f1_score, device, method, iou_threshold, args, optimizer, scheduler
 
@@ -134,6 +136,10 @@ def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name=
     f1_list_cells = list(prior_f1_list_cells) if prior_f1_list_cells else []
 
     for epoch in range(start_epoch, num_epochs):
+
+        if resample_fn is not None and resample_interval > 0 and epoch > 0 and epoch % resample_interval == 0:
+            print(f"[resample] Refreshing Leiden clusters at epoch {epoch}")
+            train_loader = resample_fn()
 
         print("Epoch:", epoch)
 
@@ -530,13 +536,6 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
     for i in range(torch.cuda.device_count()):
         print(f"  GPU {i}: {torch.cuda.get_device_name(i)} ({torch.cuda.get_device_properties(i).total_memory / 1e9:.1f} GB)")
 
-    if args.sampling_mode is not None:
-        from instanseg.utils.sampling import run_sampling
-        run_sampling(args, train_loader, train_meta, device)
-        # Rebuild loaders with Leiden-weighted sampling and continue to training
-        args.weight = True
-        train_loader, test_loader = get_loaders(train_images, train_labels, val_images, val_labels, train_meta, val_meta, args)
-
     if args.save:
         if not os.path.exists(args.output_path):
             os.mkdir(args.output_path)
@@ -617,6 +616,32 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
             method.update_mask_loss(args.mask_loss_fn)
         method.reset_uncertainty_weights()
 
+        # Cluster train images using the hotstart-trained model, then rebuild
+        # loaders with Leiden-weighted sampling for the main training run.
+        if args.cluster_sample:
+            from instanseg.utils.sampling import run_sampling
+            run_sampling(args, train_loader, train_meta, device, model=model)
+            args.weight = True
+            train_loader, test_loader = get_loaders(
+                train_images, train_labels, val_images, val_labels,
+                train_meta, val_meta, args,
+            )
+
+    def _resample_train_loader():
+        from instanseg.utils.sampling import run_sampling
+        run_sampling(args, train_loader, train_meta, device, model=model)
+        args.weight = True
+        new_train, _ = get_loaders(
+            train_images, train_labels, val_images, val_labels,
+            train_meta, val_meta, args,
+        )
+        return new_train
+
+    _resample_kwargs = (
+        {'resample_fn': _resample_train_loader, 'resample_interval': args.resample_interval}
+        if args.cluster_sample and args.resample_interval > 0 else {}
+    )
+
     if _preemptable_resuming and _preemptable_checkpoint is not None:
         _ckpt = _preemptable_checkpoint
         _prior_train = _ckpt.get('train_losses', [])
@@ -688,7 +713,8 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
                 model, loss_fn, train_loader, test_loader, num_epochs=num_epochs,
                 prior_train_losses=train_losses, prior_test_losses=test_losses,
                 prior_f1_list=f1_list, prior_f1_list_cells=f1_list_cells,
-                hotstart_epoch=args.hotstart_training, scaler=scaler)
+                hotstart_epoch=args.hotstart_training, scaler=scaler,
+                **_resample_kwargs)
         else:
             # Resume into main training phase: recreate optimizer with correct param groups, then restore state
             if args.channel_invariant and args.freeze_main_model:
@@ -706,16 +732,19 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
                 prior_train_losses=_prior_train, prior_test_losses=_prior_test,
                 prior_f1_list=_prior_f1, prior_f1_list_cells=_prior_f1_cells,
                 hotstart_epoch=args.hotstart_training if args.hotstart_training > 0 else None,
-                scaler=scaler, start_epoch=_start, prior_best_f1=_prior_best_f1)
+                scaler=scaler, start_epoch=_start, prior_best_f1=_prior_best_f1,
+                **_resample_kwargs)
 
         del _preemptable_checkpoint
     elif args.hotstart_training > 0:
         model, train_losses, test_losses, f1_list, f1_list_cells = main(model, loss_fn, train_loader, test_loader, num_epochs=num_epochs,
             prior_train_losses=train_losses, prior_test_losses=test_losses,
             prior_f1_list=f1_list, prior_f1_list_cells=f1_list_cells,
-            hotstart_epoch=args.hotstart_training, scaler=scaler)
+            hotstart_epoch=args.hotstart_training, scaler=scaler,
+            **_resample_kwargs)
     else:
-        model, train_losses, test_losses, f1_list, f1_list_cells = main(model, loss_fn, train_loader, test_loader, num_epochs=num_epochs, scaler=scaler)
+        model, train_losses, test_losses, f1_list, f1_list_cells = main(model, loss_fn, train_loader, test_loader, num_epochs=num_epochs, scaler=scaler,
+            **_resample_kwargs)
 
     from instanseg.utils.model_loader import load_model
     model, model_dict = load_model(folder="", path=args.output_path) #Load model from checkpoint
