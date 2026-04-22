@@ -24,7 +24,7 @@ def _to_3ch(images: torch.Tensor) -> torch.Tensor:
     C = images.shape[1]
     if C == 1:
         images = images.repeat(1, 3, 1, 1)
-    elif C > 3:
+    elif C > 3 or C == 2:
         # Deterministic linear projection: assign a seeded RGB colour per channel
         gen = torch.Generator(device=images.device).manual_seed(42)
         colours = torch.rand(C, 3, device=images.device, generator=gen)  # (C, 3)
@@ -143,7 +143,7 @@ def _img_to_thumbnail(img_tensor, size=48):
     C = img.shape[0]
     if C == 1:
         img = img.repeat(3, 1, 1)
-    elif C > 3:
+    elif C > 3 or C == 2:
         # Deterministic linear projection to 3 channels
         gen = torch.Generator().manual_seed(42)
         colours = torch.rand(C, 3, generator=gen)
