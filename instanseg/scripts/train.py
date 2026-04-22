@@ -71,8 +71,7 @@ parser.add_argument('-rng_seed', '--rng_seed', default=None, type=int, help = "O
 parser.add_argument('-use_deterministic', '--use_deterministic', default=False, type=lambda x: (str(x).lower() == 'true'), help = "Whether to use deterministic algorithms (default=False)")
 parser.add_argument('-tile', '--tile_size', default=256, type=int, help = "Tile sizes for the input images")
 parser.add_argument('-modality', '--modality_filter', default=None, type=str, help = "Filter datasets by image modality (e.g. 'Brightfield', 'Fluorescence'). Default None uses all modalities.")
-parser.add_argument('-cluster_sample', '--cluster_sample', default=False, type=lambda x: (str(x).lower() == 'true'), help="After hotstart, cluster train images with the model's own embeddings (Leiden) and weight the sampler by cluster frequency.")
-parser.add_argument('-resample_interval', '--resample_interval', default=0, type=int, help="Refresh Leiden clusters every N main-training epochs (default 0 = off). Requires --cluster_sample.")
+parser.add_argument('-cluster_sample', '--cluster_sample', default=0, type=int, help="Cluster train images with the model's own embeddings after hotstart and weight the sampler by cluster frequency. 0 = off; N > 0 = refresh clusters every N main-training epochs.")
 parser.add_argument('-lora_rank', '--lora_rank', default=0, type=int, help="LoRA rank for SAM/DINO backbone. 0 = disabled, 16 is a good default.")
 parser.add_argument('-fp16', '--fp16', default=False, type=lambda x: (str(x).lower() == 'true'), help="Enable mixed precision (float16) training")
 parser.add_argument('-seed_merging', '--seed_merging', default=False, type=lambda x: (str(x).lower() == 'true'), help="Enable seed-seed attention merging")
@@ -80,6 +79,7 @@ parser.add_argument('-uncertainty_weighting', '--uncertainty_weighting', default
 parser.add_argument('-batched_instance_loss', '--batched_instance_loss', default=True, type=lambda x: (str(x).lower() == 'true'), help="Compute instance loss in one batched pass (True) or per-image (False)")
 parser.add_argument('-preemptable', '--preemptable', default=False, type=lambda x: (str(x).lower() == 'true'), help="Enable preemption-safe training: saves full training state and auto-resumes from checkpoint if preempted on SLURM")
 parser.add_argument('-preempt_interval', '--preempt_save_interval', default=10, type=int, help="Save preemptable checkpoint every N epochs (default=1). Higher values reduce I/O for large models at the cost of losing more progress on preemption.")
+parser.add_argument('-skip_bad_batches', '--skip_bad_batches', default=True, type=lambda x: (str(x).lower() == 'true'), help="Skip training batches whose loss or gradient norm is non-finite (NaN/Inf) and warn. Default=True.")
 
 
 def save_training_plot(train_losses, test_losses, f1_list, f1_list_cells, output_path, cells_and_nuclei=False, hotstart_epoch=None):
@@ -638,8 +638,8 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         return new_train
 
     _resample_kwargs = (
-        {'resample_fn': _resample_train_loader, 'resample_interval': args.resample_interval}
-        if args.cluster_sample and args.resample_interval > 0 else {}
+        {'resample_fn': _resample_train_loader, 'resample_interval': args.cluster_sample}
+        if args.cluster_sample > 0 else {}
     )
 
     if _preemptable_resuming and _preemptable_checkpoint is not None:

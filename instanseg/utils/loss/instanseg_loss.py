@@ -1153,6 +1153,28 @@ class InstanSeg(nn.Module):
                 l = instance_loss_fn_(pred[None,:,0], gt.unsqueeze(0)) * 1.5
                 return l
 
+        elif instance_loss_fn_str == "scnp_dice_loss":
+            # Spatially-Coherent Neighborhood Pooling — https://arxiv.org/pdf/2603.18671
+            # Replaces each logit with the weakest same-class logit in a 3x3
+            # window (min over FG, max over BG) before BCE+Dice.
+            from monai.losses import DiceCELoss
+            base_loss = DiceCELoss(sigmoid=True)
+            kernel_size = 3
+            padding = kernel_size // 2
+            LARGE = 1.0e4
+            def instance_loss_fn(pred, gt, **kwargs):
+                logits = pred.squeeze(1)                       # (K, H, W)
+                Y = (gt > 0.5).float()                         # (K, H, W)
+                logits_4d = logits.unsqueeze(1)                # (K, 1, H, W)
+                Y4 = Y.unsqueeze(1)
+                t1 = -F.max_pool2d(-(logits_4d * Y4 + LARGE * (1 - Y4)),
+                                   kernel_size=kernel_size, stride=1, padding=padding)
+                t2 = F.max_pool2d(logits_4d * (1 - Y4) - LARGE * Y4,
+                                  kernel_size=kernel_size, stride=1, padding=padding)
+                scnp_logits = (t1 * Y4 + t2 * (1 - Y4)).squeeze(1)  # (K, H, W)
+                l = base_loss(scnp_logits.unsqueeze(0), Y.unsqueeze(0)) * 1.5
+                return l
+
         elif instance_loss_fn_str == "general_dice_loss":
             from monai.losses import GeneralizedDiceLoss
             def instance_loss_fn(pred, gt):

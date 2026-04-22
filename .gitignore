@@ -38,3 +38,4 @@ instanseg/bio_2_delete/
 dist/
 env
 analyze_mask_areas.py
+/.claude

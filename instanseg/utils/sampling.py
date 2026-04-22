@@ -3,7 +3,9 @@ Self-embedding extraction + Leiden clustering + UMAP visualization.
 
 Called from train.py after hotstart when -cluster_sample is set. Hooks a named
 tap module on the training model, runs eval-augmented train images through the
-real forward pass, and clusters the resulting embeddings.
+real forward pass N times (each pass gets a fresh random crop + flip from the
+eval aug pipeline, averaged per image), and clusters the resulting embeddings
+with Leiden.
 """
 
 import pickle
@@ -48,12 +50,12 @@ def _plot_umap_thumbnails(adata, dataset, output_path, n_per_cluster=3):
     from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 
     umap_coords = adata.obsm["X_umap"]
-    leiden_labels = adata.obs["leiden"].values
+    cluster_labels = adata.obs["leiden"].values
 
     rng = np.random.default_rng(42)
     sampled_indices = []
-    for cluster in np.unique(leiden_labels):
-        idxs = np.where(leiden_labels == cluster)[0]
+    for cluster in np.unique(cluster_labels):
+        idxs = np.where(cluster_labels == cluster)[0]
         chosen = rng.choice(idxs, size=min(n_per_cluster, len(idxs)), replace=False)
         sampled_indices.extend(chosen)
 
@@ -78,11 +80,12 @@ def _plot_umap_thumbnails(adata, dataset, output_path, n_per_cluster=3):
 
 
 def _plot_cluster_grid(adata, dataset, output_path, n_cols=10, thumb_size=64):
-    """Save an image grid: rows = Leiden clusters, columns = sample images from each cluster."""
+    """Save an image grid: rows = Leiden clusters, columns = sample images per cluster."""
     import matplotlib.pyplot as plt
 
-    leiden_labels = adata.obs["leiden"].values
-    clusters = sorted(np.unique(leiden_labels), key=lambda x: int(x))
+    cluster_labels = adata.obs["leiden"].values
+    # Sort numerically; -1 (noise) comes first so it's visually distinct at the top.
+    clusters = sorted(np.unique(cluster_labels), key=lambda x: int(x))
 
     n_rows = len(clusters)
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 1.2, n_rows * 1.2))
@@ -93,7 +96,7 @@ def _plot_cluster_grid(adata, dataset, output_path, n_cols=10, thumb_size=64):
 
     rng = np.random.default_rng(42)
     for row, cluster in enumerate(clusters):
-        idxs = np.where(leiden_labels == cluster)[0]
+        idxs = np.where(cluster_labels == cluster)[0]
         chosen = rng.choice(idxs, size=min(n_cols, len(idxs)), replace=False)
         for col in range(n_cols):
             ax = axes[row, col]
@@ -166,7 +169,7 @@ def _build_eval_dataset(train_dataset, args):
     )
 
 
-def run_sampling(args, train_loader, train_meta, device, model):
+def run_sampling(args, train_loader, train_meta, device, model, n_tta_passes: int = 10):
     """Cluster train images using the training model itself, save to embeddings.pkl.
 
     Hooks the model's ``get_embedding_tap()`` submodule and runs the real
@@ -183,15 +186,18 @@ def run_sampling(args, train_loader, train_meta, device, model):
           f"tap={type(tap).__name__}")
 
     # Eval-augmented sequential loader so embedding i ↔ dataset image i.
+    # Workers parallelize the CPU-bound augs (percentile-normalize, rescale,
+    # random crop); persistent_workers avoids worker respawn between TTA passes.
     from torch.utils.data import DataLoader
     eval_dataset = _build_eval_dataset(train_loader.dataset, args)
+    num_workers = max(1, args.num_workers)
     seq_loader = DataLoader(
         eval_dataset, batch_size=train_loader.batch_size, shuffle=False,
-        collate_fn=train_loader.collate_fn, num_workers=0,
+        collate_fn=train_loader.collate_fn, num_workers=num_workers,
+        persistent_workers=True,
     )
 
-    print("Extracting embeddings ...")
-    all_embeddings = []
+    print(f"Extracting embeddings ({n_tta_passes} TTA passes via eval aug pipeline) ...")
     was_training = full_model.training
     full_model.eval()
 
@@ -199,21 +205,29 @@ def run_sampling(args, train_loader, train_meta, device, model):
     def _hook(_mod, _inp, out):
         captured["out"] = out
     handle = tap.register_forward_hook(_hook)
+
+    # Each pass through the loader re-samples random crop + flips + pixel-size
+    # jitter from the eval aug pipeline, so averaging over passes gives
+    # crop/flip-invariant embeddings aligned with the training distribution.
+    pass_arrays = []
     try:
         with torch.no_grad():
-            for batch in tqdm(seq_loader):
-                images_batch = batch[0].to(device)
-                _ = full_model(images_batch)
-                feat = captured["out"]
-                while feat.ndim > 2:
-                    feat = feat.mean(dim=-1)
-                all_embeddings.append(feat.cpu().numpy())
+            for pass_idx in range(n_tta_passes):
+                pass_feats = []
+                for batch in tqdm(seq_loader, desc=f"pass {pass_idx + 1}/{n_tta_passes}"):
+                    images_batch = batch[0].to(device)
+                    _ = full_model(images_batch)
+                    feat = captured["out"]
+                    while feat.ndim > 2:
+                        feat = feat.mean(dim=-1)
+                    pass_feats.append(feat.cpu().numpy())
+                pass_arrays.append(np.concatenate(pass_feats, axis=0))
     finally:
         handle.remove()
         if was_training:
             full_model.train()
 
-    embeddings = np.concatenate(all_embeddings, axis=0)
+    embeddings = np.mean(np.stack(pass_arrays, axis=0), axis=0)
     print(f"Embeddings shape: {embeddings.shape}")
 
     parent_datasets = [
@@ -221,7 +235,9 @@ def run_sampling(args, train_loader, train_meta, device, model):
         for meta in train_meta
     ]
 
-    # L2-normalize for cosine kNN graph
+    embeddings = (embeddings - embeddings.mean(axis=0, keepdims=True)) / np.clip(
+        embeddings.std(axis=0, keepdims=True), 1e-8, None
+    )
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
     norms = np.clip(norms, 1e-8, None)
     embeddings = embeddings / norms
@@ -231,13 +247,14 @@ def run_sampling(args, train_loader, train_meta, device, model):
     adata.obs["parent_dataset"] = parent_datasets[:len(embeddings)]
     sc.pp.neighbors(adata, n_neighbors=15, use_rep="X", random_state=42)
     sc.tl.leiden(adata, resolution=2.5, random_state=42)
+    cluster_labels = np.array(adata.obs["leiden"])
     print(f"Found {adata.obs['leiden'].nunique()} clusters.")
 
     print("Computing UMAP ...")
     sc.tl.umap(adata, random_state=42)
 
     sc.settings.figdir = str(output_path)
-    sc.pl.umap(adata, color="leiden", save="_leiden.png", show=False)
+    sc.pl.umap(adata, color="leiden", save="_cluster.png", show=False)
     sc.pl.umap(adata, color="parent_dataset", save="_dataset.png", show=False)
 
     _plot_umap_thumbnails(adata, train_loader.dataset, output_path, n_per_cluster=10)
@@ -248,7 +265,7 @@ def run_sampling(args, train_loader, train_meta, device, model):
     with open(save_path, "wb") as f:
         pickle.dump({
             "embeddings": embeddings,
-            "leiden_labels": np.array(adata.obs["leiden"]),
+            "cluster_labels": cluster_labels,
             "parent_datasets": parent_datasets[:len(embeddings)],
             "metadata": train_meta,
         }, f)

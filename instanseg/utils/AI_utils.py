@@ -27,6 +27,9 @@ def train_epoch(train_model,
     train_model.train()
     train_loss = []
     use_amp = scaler is not None
+    skip_bad_batches = getattr(args, 'skip_bad_batches', True)
+    skipped_loss = 0
+    skipped_grad = 0
 
     for image_batch, labels_batch, _ in tqdm(train_dataloader, disable=args.on_cluster):
 
@@ -37,23 +40,51 @@ def train_epoch(train_model,
             output = train_model(image_batch)
             loss = train_loss_fn(output, labels.clone()).mean()
 
+        if skip_bad_batches and not torch.isfinite(loss):
+            warnings.warn(f"Skipping batch: non-finite loss ({loss.item()})")
+            train_optimizer.zero_grad(set_to_none=True)
+            if use_amp:
+                # Keep scaler state consistent so the next iteration works
+                scaler.update()
+            skipped_loss += 1
+            continue
+
         train_optimizer.zero_grad()
         if use_amp:
             scaler.scale(loss).backward()
             scaler.unscale_(train_optimizer)
-            torch.nn.utils.clip_grad_norm_(train_model.parameters(), args.clip)
+            total_norm = torch.nn.utils.clip_grad_norm_(train_model.parameters(), args.clip)
+            if skip_bad_batches and not torch.isfinite(total_norm):
+                warnings.warn(f"Skipping batch: non-finite gradient norm ({total_norm.item()})")
+                # scaler.step is internally a no-op when infs are present;
+                # scaler.update will then reduce the loss scale for next iter.
+                scaler.step(train_optimizer)
+                scaler.update()
+                train_optimizer.zero_grad(set_to_none=True)
+                skipped_grad += 1
+                continue
             scaler.step(train_optimizer)
             scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(train_model.parameters(), args.clip)
+            total_norm = torch.nn.utils.clip_grad_norm_(train_model.parameters(), args.clip)
+            if skip_bad_batches and not torch.isfinite(total_norm):
+                warnings.warn(f"Skipping batch: non-finite gradient norm ({total_norm.item()})")
+                train_optimizer.zero_grad(set_to_none=True)
+                skipped_grad += 1
+                continue
             train_optimizer.step()
 
         train_loss.append(loss.detach().cpu().numpy())
 
     end = time.time()
 
-    return np.mean(train_loss), end - start
+    if skipped_loss or skipped_grad:
+        print(f"[skip_bad_batches] skipped {skipped_loss} batch(es) for non-finite loss, "
+              f"{skipped_grad} for non-finite gradient norm")
+
+    mean_loss = float(np.mean(train_loss)) if train_loss else float('nan')
+    return mean_loss, end - start
     
 
 global_step_test = 0

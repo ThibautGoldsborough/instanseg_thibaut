@@ -315,17 +315,17 @@ def get_loaders(train_images_local, train_labels_local, val_images_local, val_la
 
     else:
 
-        leiden_path = Path(args.output_path) / "embeddings.pkl"
-        if leiden_path.exists():
+        embeddings_path = Path(args.output_path) / "embeddings.pkl"
+        if embeddings_path.exists():
             import pickle
-            with open(leiden_path, "rb") as f:
-                leiden_data = pickle.load(f)
-            leiden_labels = leiden_data["leiden_labels"]
-            labels, counts = np.unique(leiden_labels, return_counts=True)
-            dict_labels = dict(zip(labels, counts / sum(counts)))
-            freq = [1 / dict_labels[l] for l in leiden_labels]
+            with open(embeddings_path, "rb") as f:
+                cluster_data = pickle.load(f)
+            cluster_labels = cluster_data["cluster_labels"]
+            labels, counts = np.unique(cluster_labels, return_counts=True)
+            cluster_prob = dict(zip(labels, counts / sum(counts)))
+            freq = [1.0 / cluster_prob[l] for l in cluster_labels]
             rel_freq = np.array(freq) / sum(freq)
-            print("Leiden cluster distribution:", dict_labels)
+            print("Leiden cluster distribution:", cluster_prob)
         else:
             datasets_train = [meta["parent_dataset"] for meta in train_meta]
             datasets,counts = np.unique(datasets_train,return_counts=True)
