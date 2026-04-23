@@ -178,11 +178,8 @@ def build_model_from_dict(build_model_dictionary, random_seed = None):
                 dropout=build_model_dictionary["dropprob"],
                 attn_dropout=build_model_dictionary["dropprob"],
             )
-            if maxvit_name == "maxvit":
-                # Back-compat path: honor user-supplied `layers` from config.
-                model = MaxViT(layers=np.array(build_model_dictionary["layers"])[::-1],
-                               **common_kwargs)
-            elif maxvit_name == "maxvit_tiny":
+            # "maxvit" alone is treated as the tiny preset for back-compat.
+            if maxvit_name in ("maxvit", "maxvit_tiny"):
                 model = maxvit_tiny(**common_kwargs)
             elif maxvit_name == "maxvit_base":
                 model = maxvit_base(**common_kwargs)

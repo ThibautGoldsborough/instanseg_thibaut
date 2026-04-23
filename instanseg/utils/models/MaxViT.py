@@ -1,259 +1,77 @@
 from __future__ import annotations
 
-from tkinter import FALSE
-from typing import Sequence
+import dataclasses
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
 
 from instanseg.utils.models.InstanSeg_UNet import conv_norm_act
 
 
-def _num_heads(dim: int, head_dim: int = 32) -> int:
-    return max(1, dim // head_dim)
+# Preset -> (timm arch name, default training resolution used to fetch pretrained).
+# We pick the `*_rmlp_*_rw_*` variants where possible: relative MLP position bias
+# is resolution-agnostic, so the pretrained weights transfer cleanly to 256x256
+# inputs. `large` falls back to a `_tf_*` variant (no rmlp equivalent exists) —
+# its window-based rel_pos_bias tables are interpolated by timm at load time.
+_PRESETS: dict[str, dict] = {
+    "tiny":  dict(timm_name="maxvit_rmlp_pico_rw_256"),
+    "base":  dict(timm_name="maxvit_rmlp_tiny_rw_256"),
+    "large": dict(timm_name="maxvit_large_tf_512"),
+}
 
 
-class SqueezeExcite(nn.Module):
-    def __init__(self, dim: int, rd_ratio: float = 0.25):
-        super().__init__()
-        hidden = max(1, int(dim * rd_ratio))
-        self.fc1 = nn.Conv2d(dim, hidden, 1)
-        self.fc2 = nn.Conv2d(hidden, dim, 1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        s = x.mean(dim=(2, 3), keepdim=True)
-        s = F.silu(self.fc1(s), inplace=True)
-        s = torch.sigmoid(self.fc2(s))
-        return x * s
+def _cfg_base_name(timm_name: str) -> str:
+    """Strip the resolution suffix (_256, _384, _512, _224) used in create_model
+    to get the config key under timm.models.maxxvit.model_cfgs."""
+    for suffix in ("_256", "_384", "_512", "_224"):
+        if timm_name.endswith(suffix):
+            return timm_name[: -len(suffix)]
+    return timm_name
 
 
-class MBConv(nn.Module):
-    """Inverted-residual MBConv with SE; optional stride-2 downsample."""
+def _build_timm_maxvit(timm_name: str, in_channels: int, img_size: int,
+                       pretrained: bool) -> nn.Module:
+    """Create a timm MaxxVit and rebuild it at our img_size.
 
-    def __init__(
-        self,
-        in_dim: int,
-        out_dim: int,
-        stride: int = 1,
-        expansion: float = 4.0,
-        se_ratio: float = 0.25,
-    ):
-        super().__init__()
-        hidden = int(in_dim * expansion)
-        self.use_residual = (stride == 1 and in_dim == out_dim)
-
-        self.pre_norm = nn.BatchNorm2d(in_dim)
-        self.expand = nn.Conv2d(in_dim, hidden, 1, bias=False)
-        self.bn1 = nn.BatchNorm2d(hidden)
-        self.dwconv = nn.Conv2d(
-            hidden, hidden, 3, stride=stride, padding=1, groups=hidden, bias=False
-        )
-        self.bn2 = nn.BatchNorm2d(hidden)
-        self.se = SqueezeExcite(hidden, se_ratio)
-        self.project = nn.Conv2d(hidden, out_dim, 1, bias=False)
-        self.bn3 = nn.BatchNorm2d(out_dim)
-
-        if self.use_residual:
-            self.shortcut: nn.Module = nn.Identity()
-        else:
-            layers: list[nn.Module] = []
-            if stride > 1:
-                layers.append(nn.AvgPool2d(stride, stride))
-            layers += [
-                nn.Conv2d(in_dim, out_dim, 1, bias=False),
-                nn.BatchNorm2d(out_dim),
-            ]
-            self.shortcut = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        sc = self.shortcut(x)
-        x = self.pre_norm(x)
-        x = F.silu(self.bn1(self.expand(x)), inplace=True)
-        x = F.silu(self.bn2(self.dwconv(x)), inplace=True)
-        x = self.se(x)
-        x = self.bn3(self.project(x))
-        return x + sc
-
-
-class PartitionAttention(nn.Module):
-    """Pre-norm multi-head self-attention + MLP over a block or grid partition.
-
-    Block partition: P x P local windows (local attention).
-    Grid partition:  P x P dilated groups (global attention at stride H/P).
+    We stay in `features_only=False` mode so `.stem` / `.stages` are reachable
+    for weight copying; we'll extract multi-scale features by running them
+    manually in `MaxViT._run`.
     """
-
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        window_size: int,
-        partition: str,
-        mlp_ratio: float = 4.0,
-        drop: float = 0.0,
-    ):
-        super().__init__()
-        assert partition in ("block", "grid")
-        assert dim % num_heads == 0
-        self.partition = partition
-        self.window_size = window_size
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-
-        self.norm1 = nn.LayerNorm(dim)
-        self.qkv = nn.Linear(dim, dim * 3, bias=True)
-        self.proj = nn.Linear(dim, dim)
-        self.attn_drop_p = drop
-        self.proj_drop = nn.Dropout(drop)
-
-        self.norm2 = nn.LayerNorm(dim)
-        hidden = int(dim * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, hidden),
-            nn.GELU(),
-            nn.Dropout(drop),
-            nn.Linear(hidden, dim),
-            nn.Dropout(drop),
-        )
-
-    def _attn(self, tokens: torch.Tensor) -> torch.Tensor:
-        B, N, C = tokens.shape
-        qkv = self.qkv(tokens).reshape(B, N, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
-        out = F.scaled_dot_product_attention(
-            q, k, v, dropout_p=self.attn_drop_p if self.training else 0.0,
-        )
-        out = out.transpose(1, 2).reshape(B, N, C)
-        return self.proj_drop(self.proj(out))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
-        P = self.window_size
-        # Unconditional pad (zero pad is a no-op for 0,0) to stay compile-friendly:
-        # a data-dependent `if pad_h or pad_w` breaks torch.compile graph tracing.
-        pad_h = (P - H % P) % P
-        pad_w = (P - W % P) % P
-        x = F.pad(x, (0, pad_w, 0, pad_h))
-        Hp, Wp = H + pad_h, W + pad_w
-
-        if self.partition == "block":
-            tok = rearrange(x, "b c (h1 p1) (w1 p2) -> (b h1 w1) (p1 p2) c", p1=P, p2=P)
-        else:
-            tok = rearrange(x, "b c (h1 p1) (w1 p2) -> (b p1 p2) (h1 w1) c", p1=P, p2=P)
-
-        tok = tok + self._attn(self.norm1(tok))
-        tok = tok + self.mlp(self.norm2(tok))
-
-        if self.partition == "block":
-            y = rearrange(
-                tok, "(b h1 w1) (p1 p2) c -> b c (h1 p1) (w1 p2)",
-                b=B, h1=Hp // P, w1=Wp // P, p1=P, p2=P,
-            )
-        else:
-            y = rearrange(
-                tok, "(b p1 p2) (h1 w1) c -> b c (h1 p1) (w1 p2)",
-                b=B, h1=Hp // P, w1=Wp // P, p1=P, p2=P,
-            )
-        return y[..., :H, :W]
-
-
-class MaxViTBlock(nn.Module):
-    """MBConv -> block-attention -> grid-attention."""
-
-    def __init__(
-        self,
-        in_dim: int,
-        out_dim: int,
-        window_size: int,
-        stride: int = 1,
-        head_dim: int = 32,
-        mbconv_expansion: float = 4.0,
-        mlp_ratio: float = 4.0,
-        drop: float = 0.0,
-    ):
-        super().__init__()
-        self.mbconv = MBConv(in_dim, out_dim, stride=stride, expansion=mbconv_expansion)
-        nh = _num_heads(out_dim, head_dim)
-        self.block_attn = PartitionAttention(out_dim, nh, window_size, "block", mlp_ratio, drop)
-        self.grid_attn = PartitionAttention(out_dim, nh, window_size, "grid", mlp_ratio, drop)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.mbconv(x)
-        x = self.block_attn(x)
-        x = self.grid_attn(x)
-        return x
-
-
-class MaxViTStage(nn.Module):
-    def __init__(
-        self,
-        in_dim: int,
-        out_dim: int,
-        depth: int,
-        window_size: int,
-        downsample: bool = True,
-        head_dim: int = 32,
-        mbconv_expansion: float = 4.0,
-        mlp_ratio: float = 4.0,
-        drop: float = 0.0,
-        gradient_checkpointing: bool = False,
-    ):
-        super().__init__()
-        self.gradient_checkpointing = gradient_checkpointing
-        blocks: list[nn.Module] = []
-        for i in range(depth):
-            stride = 2 if (i == 0 and downsample) else 1
-            d_in = in_dim if i == 0 else out_dim
-            blocks.append(
-                MaxViTBlock(
-                    d_in, out_dim, window_size, stride=stride,
-                    head_dim=head_dim, mbconv_expansion=mbconv_expansion,
-                    mlp_ratio=mlp_ratio, drop=drop,
-                )
-            )
-        self.blocks = nn.ModuleList(blocks)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for blk in self.blocks:
-            if self.gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
-            else:
-                x = blk(x)
-        return x
+    import timm
+    kwargs = dict(
+        pretrained=pretrained,
+        in_chans=in_channels,
+        num_classes=0,
+        global_pool="",
+        drop_path_rate=0.0,
+    )
+    # tf_* variants hard-code window_size at training res; pass img_size to rebuild.
+    if "_tf_" in timm_name:
+        kwargs["img_size"] = (img_size, img_size)
+    return timm.create_model(timm_name, **kwargs)
 
 
 class ConvBlock(nn.Module):
-    """Residual conv block used at full resolution where attention is wasteful."""
+    """Small residual conv block used at full- and half-res (no attention)."""
 
-    def __init__(
-        self,
-        in_dim: int,
-        out_dim: int,
-        norm: str = "BATCH",
-        act: str = "ReLU",
-        dropout: float = 0.0,
-    ):
+    def __init__(self, in_dim: int, out_dim: int,
+                 norm: str = "BATCH", act: str = "ReLU", dropout: float = 0.0):
         super().__init__()
         self.shortcut = conv_norm_act(in_dim, out_dim, 1, norm, act)
         self.conv1 = conv_norm_act(in_dim, out_dim, 3, norm, act)
         self.conv2 = conv_norm_act(out_dim, out_dim, 3, norm, act)
-        self.conv3 = conv_norm_act(out_dim, out_dim, 3, norm, act)
-        self.conv4 = conv_norm_act(out_dim, out_dim, 3, norm, act)
         self.dropout = nn.Dropout2d(p=dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         sc = self.shortcut(x)
         x = self.conv1(x)
-        x = sc + self.dropout(self.conv2(x))
-        x = x + self.dropout(self.conv4(self.conv3(x)))
-        return x
+        return sc + self.dropout(self.conv2(x))
 
 
-class MaxViTDecoderStage(nn.Module):
-    """Upsample (to skip size) -> concat skip -> 1x1 fuse -> MaxViT blocks."""
+class _TimmDecoderStage(nn.Module):
+    """Upsample -> concat skip -> 1x1 fuse -> timm MaxxVitBlocks (stride=1)."""
 
     def __init__(
         self,
@@ -261,44 +79,45 @@ class MaxViTDecoderStage(nn.Module):
         skip_dim: int,
         out_dim: int,
         depth: int,
-        window_size: int,
-        head_dim: int = 32,
-        mbconv_expansion: float = 4.0,
-        mlp_ratio: float = 4.0,
-        drop: float = 0.0,
+        transformer_cfg,
+        conv_cfg,
+        feat_size: tuple[int, int],
         gradient_checkpointing: bool = False,
     ):
         super().__init__()
+        from timm.models.maxxvit import MaxxVitStage
+
+        self.gradient_checkpointing = gradient_checkpointing
         self.fuse = nn.Sequential(
             nn.Conv2d(in_dim + skip_dim, out_dim, 1, bias=False),
             nn.BatchNorm2d(out_dim),
         )
-        self.stage = MaxViTStage(
-            out_dim, out_dim, depth=max(1, depth), window_size=window_size,
-            downsample=False, head_dim=head_dim,
-            mbconv_expansion=mbconv_expansion, mlp_ratio=mlp_ratio, drop=drop,
-            gradient_checkpointing=gradient_checkpointing,
+        # A stride=1 MaxxVitStage with in==out channels is structurally identical
+        # to the refinement portion of an encoder stage — this is what makes the
+        # warm-start via state_dict copy work.
+        self.stage = MaxxVitStage(
+            in_chs=out_dim, out_chs=out_dim, stride=1, depth=depth,
+            feat_size=feat_size, block_types=("M",),
+            transformer_cfg=transformer_cfg, conv_cfg=conv_cfg,
+            drop_path=[0.0] * depth,
         )
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         x = F.interpolate(x, size=skip.shape[-2:], mode="nearest")
         x = torch.cat([x, skip], dim=1)
         x = self.fuse(x)
+        if self.gradient_checkpointing and self.training:
+            for blk in self.stage.blocks:
+                x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
+            return x
         return self.stage(x)
 
 
-class ConvDecoderStage(nn.Module):
-    """Full-resolution counterpart to MaxViTDecoderStage; no attention."""
+class _ConvDecoderStage(nn.Module):
+    """Upsample + fuse + conv block; used at 1/2 resolution where attention is wasteful."""
 
-    def __init__(
-        self,
-        in_dim: int,
-        skip_dim: int,
-        out_dim: int,
-        norm: str = "BATCH",
-        act: str = "ReLU",
-        dropout: float = 0.0,
-    ):
+    def __init__(self, in_dim: int, skip_dim: int, out_dim: int,
+                 norm: str, act: str, dropout: float):
         super().__init__()
         self.fuse = nn.Sequential(
             nn.Conv2d(in_dim + skip_dim, out_dim, 1, bias=False),
@@ -313,130 +132,143 @@ class ConvDecoderStage(nn.Module):
         return self.block(x)
 
 
-class MaxViTDecoder(nn.Module):
-    """Mirror of the encoder: 2 MaxViT upsample stages + 1 conv upsample stage."""
+class _MaxViTDecoder(nn.Module):
+    """Full decoder: 3 MaxxVit stages (1/16, 1/8, 1/4) + 1 conv stage (1/2)
+    + final 1x1 heads after a 2x upsample back to 1/1."""
 
     def __init__(
         self,
-        layers: Sequence[int],
+        dims: Sequence[int],          # [d0, d1, d2, d3]
+        stem_dim: int,
+        dec_depths: Sequence[int],    # 3 entries for the 3 MaxxVit decoder stages
         out_channels: list[int],
-        depths: Sequence[int],
-        window_size: int,
-        head_dim: int,
-        mbconv_expansion: float,
-        mlp_ratio: float,
-        attn_drop: float,
+        transformer_cfg,
+        conv_cfg,
+        img_size: int,
         norm: str,
         act: str,
         dropout: float,
-        gradient_checkpointing: bool = False,
+        gradient_checkpointing: bool,
     ):
         super().__init__()
-        d0, d1, d2, d3 = layers
+        d0, d1, d2, d3 = dims
 
-        self.up2 = MaxViTDecoderStage(
-            d3, d2, d2, depths[2], window_size,
-            head_dim, mbconv_expansion, mlp_ratio, attn_drop,
+        self.up3 = _TimmDecoderStage(
+            in_dim=d3, skip_dim=d2, out_dim=d2, depth=dec_depths[2],
+            transformer_cfg=transformer_cfg, conv_cfg=conv_cfg,
+            feat_size=(img_size // 16, img_size // 16),
             gradient_checkpointing=gradient_checkpointing,
         )
-        self.up1 = MaxViTDecoderStage(
-            d2, d1, d1, depths[1], window_size,
-            head_dim, mbconv_expansion, mlp_ratio, attn_drop,
+        self.up2 = _TimmDecoderStage(
+            in_dim=d2, skip_dim=d1, out_dim=d1, depth=dec_depths[1],
+            transformer_cfg=transformer_cfg, conv_cfg=conv_cfg,
+            feat_size=(img_size // 8, img_size // 8),
             gradient_checkpointing=gradient_checkpointing,
         )
-        self.up0 = ConvDecoderStage(d1, d0, d0, norm=norm, act=act, dropout=dropout)
+        self.up1 = _TimmDecoderStage(
+            in_dim=d1, skip_dim=d0, out_dim=d0, depth=dec_depths[0],
+            transformer_cfg=transformer_cfg, conv_cfg=conv_cfg,
+            feat_size=(img_size // 4, img_size // 4),
+            gradient_checkpointing=gradient_checkpointing,
+        )
+        self.up0 = _ConvDecoderStage(d0, stem_dim, stem_dim, norm, act, dropout)
+        self.final_conv = ConvBlock(stem_dim, stem_dim, norm=norm, act=act, dropout=dropout)
 
         final_norm = norm if (norm is not None and norm.lower() != "instance") else None
-        self.final_blocks = nn.ModuleList(
-            [conv_norm_act(d0, oc, 1, norm=final_norm, act=None) for oc in out_channels]
+        self.heads = nn.ModuleList(
+            [conv_norm_act(stem_dim, oc, 1, norm=final_norm, act=None) for oc in out_channels]
         )
 
-    def forward(self, x: torch.Tensor, skips: list[torch.Tensor]) -> torch.Tensor:
-        # skips ordered shallow -> deep: [s0 @ 1/1, s1 @ 1/2, s2 @ 1/4]
-        x = self.up2(x, skips[2])
-        x = self.up1(x, skips[1])
-        x = self.up0(x, skips[0])
-        return torch.cat([b(x) for b in self.final_blocks], dim=1)
+    def forward(self, bottleneck: torch.Tensor, skips: list[torch.Tensor], input_size) -> torch.Tensor:
+        # skips = [stem @ 1/2, s0 @ 1/4, s1 @ 1/8, s2 @ 1/16]
+        x = self.up3(bottleneck, skips[3])   # -> 1/16, d2
+        x = self.up2(x,          skips[2])   # -> 1/8,  d1
+        x = self.up1(x,          skips[1])   # -> 1/4,  d0
+        x = self.up0(x,          skips[0])   # -> 1/2,  stem_dim
+        x = F.interpolate(x, size=input_size, mode="nearest")
+        x = self.final_conv(x)
+        return torch.cat([h(x) for h in self.heads], dim=1)
 
 
 class MaxViT(nn.Module):
-    """Symmetric UNet-style encoder-decoder with MaxViT blocks.
+    """Pretrained timm MaxViT encoder + symmetric UNet-style decoder.
 
-    Encoder (4 levels, 3 downsamples):
-        stage0  conv          in  -> d0 @ 1/1   (skip)
-        stage1  MaxViT/s=2    d0  -> d1 @ 1/2   (skip)
-        stage2  MaxViT/s=2    d1  -> d2 @ 1/4   (skip)
-        stage3  MaxViT/s=2    d2  -> d3 @ 1/8   (bottleneck)
+    Encoder: timm's `MaxxVit`. We extract 5 feature levels (stem @ 1/2 and the
+    four stage outputs at 1/4, 1/8, 1/16, 1/32).
 
-    Decoder mirrors that:
-        up2  MaxViT  d3 -> d2 @ 1/4 (+skip d2)
-        up1  MaxViT  d2 -> d1 @ 1/2 (+skip d1)
-        up0  conv    d1 -> d0 @ 1/1 (+skip d0)
+    Decoder: 3 timm `MaxxVitStage`s (stride=1) mirroring encoder stages 0..2
+    at 1/4, 1/8, 1/16, plus a conv stage at 1/2 and a final 2x upsample to 1/1.
+    With `init_decoder_from_encoder=True` (default when `pretrained=True`),
+    each decoder stage's MaxxVit blocks are warm-started from the encoder
+    stage's refinement blocks (blocks[1:]), which have matching shapes. Fuse
+    convs and the final conv block stay randomly initialized.
 
-    `layers` is ordered shallow-to-deep (matches InstanSeg_UNet after its
-    internal reversal). `out_channels` follows the same int / list /
-    list-of-lists convention as InstanSeg_UNet.
+    Decoder depths default to `max(1, encoder_depth - 1)` so every decoder
+    block has a matching-shape encoder refinement block to copy from.
     """
 
     def __init__(
         self,
         in_channels: int,
         out_channels,
-        layers: Sequence[int] = (32, 64, 128, 256),
-        depths: Sequence[int] = (1, 2, 2, 2),
-        window_size: int = 8,
-        head_dim: int = 32,
-        mbconv_expansion: float = 4.0,
-        mlp_ratio: float = 4.0,
+        timm_name: str = "maxvit_rmlp_tiny_rw_256",
+        pretrained: bool = True,
+        img_size: int = 256,
+        dec_depths: Optional[Sequence[int]] = None,
+        dropout: float = 0.0,
+        attn_dropout: Optional[float] = None,
         norm: str = "BATCH",
         act: str = "ReLU",
-        dropout: float = 0.0,
-        attn_dropout: float | None = None,
         amp: bool = True,
         channels_last: bool = True,
         compile: bool = False,
         compile_mode: str = "default",
         amp_dtype: torch.dtype = torch.bfloat16,
         gradient_checkpointing: bool = False,
+        init_decoder_from_encoder: Optional[bool] = None,
     ):
         super().__init__()
-        # Coerce to plain Python ints: callers may pass numpy arrays (see
-        # model_loader), and np.int64 in nn.LayerNorm's normalized_shape
-        # confuses torch.compile into treating it as a symbolic int.
-        layers = [int(v) for v in layers]
-        depths = [int(v) for v in depths]
-        if len(layers) != 4:
-            raise ValueError(f"MaxViT expects 4 feature levels, got {len(layers)}")
-        if len(depths) != 4:
-            raise ValueError(f"depths must have 4 entries, got {len(depths)}")
-        d0, d1, d2, d3 = layers
-        self.layers = layers
-        self.window_size = int(window_size)
-        # Default attn_dropout to the same value as dropout so a single
-        # `dropout=` kwarg (or train.py's dropprob) applies uniformly.
+
         if attn_dropout is None:
             attn_dropout = dropout
+        if init_decoder_from_encoder is None:
+            init_decoder_from_encoder = pretrained
 
-        self.stage0 = ConvBlock(in_channels, d0, norm=norm, act=act, dropout=dropout)
-        self.stage1 = MaxViTStage(
-            d0, d1, depths[1], window_size, downsample=True,
-            head_dim=head_dim, mbconv_expansion=mbconv_expansion,
-            mlp_ratio=mlp_ratio, drop=attn_dropout,
-            gradient_checkpointing=gradient_checkpointing,
-        )
-        self.stage2 = MaxViTStage(
-            d1, d2, depths[2], window_size, downsample=True,
-            head_dim=head_dim, mbconv_expansion=mbconv_expansion,
-            mlp_ratio=mlp_ratio, drop=attn_dropout,
-            gradient_checkpointing=gradient_checkpointing,
-        )
-        self.stage3 = MaxViTStage(
-            d2, d3, depths[3], window_size, downsample=True,
-            head_dim=head_dim, mbconv_expansion=mbconv_expansion,
-            mlp_ratio=mlp_ratio, drop=attn_dropout,
-            gradient_checkpointing=gradient_checkpointing,
+        from timm.models.maxxvit import model_cfgs
+
+        self.timm_name = timm_name
+        self.img_size = int(img_size)
+
+        # --- Encoder ---------------------------------------------------------
+        self.encoder = _build_timm_maxvit(
+            timm_name, in_channels=in_channels, img_size=self.img_size,
+            pretrained=pretrained,
         )
 
+        # Grab the config so we can replicate it exactly in the decoder stages.
+        cfg = model_cfgs[_cfg_base_name(timm_name)]
+        dims = list(cfg.embed_dim)                # [d0, d1, d2, d3]
+        enc_depths = list(cfg.depths)             # e.g. (2, 2, 5, 2)
+        # stem_width may be int or (conv1_out, conv2_out); the stem output is the last value.
+        stem_dim = cfg.stem_width[-1] if isinstance(cfg.stem_width, (tuple, list)) else cfg.stem_width
+        stem_dim = int(stem_dim)
+        # Propagate window/grid size from img_size through the cfg, mirroring
+        # what timm's MaxxVit.__init__ does for the encoder. If the encoder is
+        # built at a different img_size, its own stages will have been rebuilt
+        # by timm with these same values.
+        ws = self.img_size // cfg.transformer_cfg.partition_ratio
+        transformer_cfg = dataclasses.replace(
+            cfg.transformer_cfg, window_size=(ws, ws), grid_size=(ws, ws)
+        )
+        conv_cfg = cfg.conv_cfg
+
+        if dec_depths is None:
+            # One shorter than encoder so every decoder block maps to an encoder
+            # refinement block, giving a clean warm-start.
+            dec_depths = [max(1, d - 1) for d in enc_depths[:3]]
+        dec_depths = [int(x) for x in dec_depths]
+
+        # --- Decoder heads ---------------------------------------------------
         if isinstance(out_channels, int):
             out_channels = [[out_channels]]
         if isinstance(out_channels[0], int):
@@ -444,34 +276,70 @@ class MaxViT(nn.Module):
 
         self.decoders = nn.ModuleList(
             [
-                MaxViTDecoder(
-                    layers, oc, depths, window_size, head_dim,
-                    mbconv_expansion, mlp_ratio, attn_dropout, norm, act, dropout,
+                _MaxViTDecoder(
+                    dims=dims, stem_dim=stem_dim,
+                    dec_depths=dec_depths, out_channels=oc,
+                    transformer_cfg=transformer_cfg, conv_cfg=conv_cfg,
+                    img_size=self.img_size,
+                    norm=norm, act=act, dropout=dropout,
                     gradient_checkpointing=gradient_checkpointing,
                 )
                 for oc in out_channels
             ]
         )
 
+        self._enc_depths = enc_depths
+        self._dec_depths = dec_depths
+
+        if init_decoder_from_encoder:
+            self._warm_start_decoder_from_encoder()
+
+        # --- Runtime flags (amp / channels_last / compile) -------------------
         self._amp = amp
         self._amp_dtype = amp_dtype
         self._channels_last = channels_last
         if channels_last:
             self.to(memory_format=torch.channels_last)
-        # Compile the core forward, not the wrapper — autocast context must stay
-        # outside the compiled region so dtype promotion happens per-call.
         self._core = torch.compile(self._run, mode=compile_mode) if compile else self._run
 
-    def get_embedding_tap(self) -> nn.Module:
-        return self.stage3
+    # ------------------------------------------------------------------ warm-start
+    def _warm_start_decoder_from_encoder(self) -> None:
+        """Copy encoder refinement-block weights into decoder blocks.
 
+        Encoder stage i has `enc_depths[i]` blocks: block 0 is the downsample
+        block (different in_chs), blocks 1..N-1 are refinement blocks
+        (in_chs == out_chs == dims[i], stride=1). Decoder stages are built with
+        stride=1 and in==out channels, so their blocks match those refinement
+        blocks key-for-key. We copy as many as we have slots for.
+        """
+        report = {}
+        for dec in self.decoders:
+            for stage_idx, dec_stage in zip((0, 1, 2), (dec.up1, dec.up2, dec.up3)):
+                enc_stage = self.encoder.stages[stage_idx]
+                refinement = enc_stage.blocks[1:]  # skip the downsample block
+                dst_blocks = dec_stage.stage.blocks
+                n = min(len(dst_blocks), len(refinement))
+                for j in range(n):
+                    dst_blocks[j].load_state_dict(refinement[j].state_dict(), strict=True)
+                report[f"enc_stage[{stage_idx}]->dec_up{stage_idx+1}"] = f"{n}/{len(dst_blocks)} blocks"
+        self._warm_start_report = report
+
+    # ------------------------------------------------------------------ introspection
+    def get_embedding_tap(self) -> nn.Module:
+        return self.encoder.stages[-1]
+
+    # ------------------------------------------------------------------ forward
     def _run(self, x: torch.Tensor) -> torch.Tensor:
-        s0 = self.stage0(x)
-        s1 = self.stage1(s0)
-        s2 = self.stage2(s1)
-        s3 = self.stage3(s2)
-        skips = [s0, s1, s2]
-        return torch.cat([dec(s3, skips) for dec in self.decoders], dim=1)
+        input_size = x.shape[-2:]
+        # Extract the 5-level feature pyramid manually so we can use `.stages`
+        # directly (needed so warm-start / gc-through-encoder behave predictably).
+        stem = self.encoder.stem(x)                    # 1/2,  stem_dim
+        s0 = self.encoder.stages[0](stem)              # 1/4,  d0
+        s1 = self.encoder.stages[1](s0)                # 1/8,  d1
+        s2 = self.encoder.stages[2](s1)                # 1/16, d2
+        s3 = self.encoder.stages[3](s2)                # 1/32, d3 (bottleneck)
+        skips = [stem, s0, s1, s2]
+        return torch.cat([dec(s3, skips, input_size) for dec in self.decoders], dim=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._channels_last:
@@ -480,28 +348,13 @@ class MaxViT(nn.Module):
             in_dtype = x.dtype
             with torch.autocast("cuda", dtype=self._amp_dtype):
                 y = self._core(x)
-            # Cast back so downstream code (viz, .numpy(), fp32 losses) sees
-            # the input dtype; compute stays in low precision inside autocast.
             return y.to(in_dtype)
         return self._core(x)
 
 
-# Preset sizes. Targets (with the default symmetric UNet decoder):
-#   tiny   ~8M    — layers (32,64,128,256),    depths (1,2,2,2)
-#   base   ~47M   — layers (64,128,256,512),   depths (2,2,5,2)
-#   large  ~309M  — layers (128,256,512,1024), depths (2,5,10,2)
-# Large enables gradient_checkpointing by default — a 1024-wide bottleneck
-# with mbconv_expansion=4 explodes activation memory on 256x256 inputs
-# otherwise. Override by passing gradient_checkpointing=False.
-_MAXVIT_PRESETS: dict[str, dict] = {
-    "tiny":  dict(layers=(32,  64,  128,  256),  depths=(1, 2,  2, 2), gradient_checkpointing=False),
-    "base":  dict(layers=(64,  128, 256,  512),  depths=(2, 2,  5, 2), gradient_checkpointing=False),
-    "large": dict(layers=(128, 256, 512, 1024),  depths=(2, 5, 10, 2), gradient_checkpointing=True),
-}
-
-
+# ---------------------------------------------------------------------------- presets
 def _make_preset(name: str, in_channels: int, out_channels, **overrides) -> MaxViT:
-    cfg = dict(_MAXVIT_PRESETS[name])
+    cfg = dict(_PRESETS[name])
     cfg.update(overrides)
     return MaxViT(in_channels=in_channels, out_channels=out_channels, **cfg)
 
@@ -515,36 +368,25 @@ def maxvit_base(in_channels: int, out_channels, **kwargs) -> MaxViT:
 
 
 def maxvit_large(in_channels: int, out_channels, **kwargs) -> MaxViT:
+    # Large needs gradient checkpointing — without it, activations at 1024 ch
+    # with MBConv x4 expansion blow past typical GPU memory.
+    kwargs.setdefault("gradient_checkpointing", True)
     return _make_preset("large", in_channels, out_channels, **kwargs)
 
 
 if __name__ == "__main__":
-    model = MaxViT(
-        in_channels=3,
-        out_channels=[[2, 2, 1]],
-        layers=(32, 64, 128, 256),
-        depths=(1, 2, 2, 2),
-        window_size=8,
-    )
-    model.eval()
-    n_params = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"MaxViT parameters: {n_params:.2f}M")
-    with torch.no_grad():
-        for H, W in [(256, 256), (128, 128), (192, 160)]:
-            y = model(torch.randn(1, 3, H, W))
-            assert y.shape[-2:] == (H, W), f"Bad output shape: {y.shape} for input ({H},{W})"
-            print(f"Input (1,3,{H},{W}) -> Output {tuple(y.shape)}")
-
-    if torch.cuda.is_available():
-        fast = MaxViT(
-            in_channels=3,
-            out_channels=[[2, 2, 1]],
-            layers=(32, 64, 128, 256),
-            depths=(1, 2, 2, 2),
-            amp=True,
-            channels_last=True,
-            compile=True,
-        ).cuda().eval()
+    # No network: exercise architecture with pretrained=False so the test runs
+    # offline. Warm-start is skipped automatically in this mode.
+    for name, builder in [("tiny", maxvit_tiny), ("base", maxvit_base), ("large", maxvit_large)]:
+        print(f"--- maxvit_{name} ---")
+        m = builder(in_channels=3, out_channels=[[2, 2, 1]], pretrained=False)
+        p = sum(x.numel() for x in m.parameters()) / 1e6
+        print(f"  params: {p:.2f}M  (timm={_PRESETS[name]['timm_name']})")
+        m.eval()
+        # Encoder window/grid sizes are fixed at build time from img_size, so
+        # inputs must be multiples of 32*window = 256 for the bottleneck feature
+        # to be partitionable. train.py already operates on 256x256 crops.
         with torch.no_grad():
-            y = fast(torch.randn(1, 3, 256, 256, device="cuda"))
-        print(f"Fast-path (amp+channels_last+compile) -> {tuple(y.shape)}")
+            y = m(torch.randn(1, 3, 256, 256))
+        assert y.shape[-2:] == (256, 256), f"Bad output shape: {y.shape}"
+        print(f"  input (256,256) -> {tuple(y.shape)}")
