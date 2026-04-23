@@ -246,7 +246,7 @@ def run_sampling(args, train_loader, train_meta, device, model, n_tta_passes: in
     adata = sc.AnnData(embeddings)
     adata.obs["parent_dataset"] = parent_datasets[:len(embeddings)]
     sc.pp.neighbors(adata, n_neighbors=15, use_rep="X", random_state=42)
-    sc.tl.leiden(adata, resolution=2.5, random_state=42)
+    sc.tl.leiden(adata, resolution=0.5, random_state=42)
     cluster_labels = np.array(adata.obs["leiden"])
     print(f"Found {adata.obs['leiden'].nunique()} clusters.")
 

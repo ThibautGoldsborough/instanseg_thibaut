@@ -148,7 +148,47 @@ def build_model_from_dict(build_model_dictionary, random_seed = None):
                             out_channels=out_channels,
                             norm  = build_model_dictionary["norm"], 
                             dropout=build_model_dictionary["dropprob"])
-            
+
+
+    elif build_model_dictionary["model_str"].lower() in {"maxvit", "maxvit_tiny", "maxvit_base", "maxvit_large"}:
+            from instanseg.utils.models.MaxViT import MaxViT, maxvit_tiny, maxvit_base, maxvit_large
+            maxvit_name = build_model_dictionary["model_str"].lower()
+            print(f"Generating {maxvit_name}")
+            multihead = build_model_dictionary["multihead"]
+
+            if build_model_dictionary["cells_and_nuclei"]:
+                n_seeds = build_model_dictionary["dim_seeds"]
+                if not multihead:
+                    from itertools import chain
+                    out_channels = [[build_model_dictionary["dim_coords"], build_model_dictionary["n_sigma"], n_seeds] for i in range(2)]
+                    out_channels = list(chain(*out_channels))
+                else:
+                    out_channels = [[build_model_dictionary["dim_coords"], build_model_dictionary["n_sigma"], n_seeds] for i in range(2)]
+            else:
+                n_seeds = build_model_dictionary["dim_seeds"]
+                if not multihead:
+                    out_channels = [[build_model_dictionary["dim_coords"], build_model_dictionary["n_sigma"], n_seeds]]
+                else:
+                    out_channels = [[build_model_dictionary["dim_coords"]], [build_model_dictionary["n_sigma"]], [n_seeds]]
+
+            common_kwargs = dict(
+                in_channels=dim_in,
+                out_channels=out_channels,
+                norm=build_model_dictionary["norm"],
+                dropout=build_model_dictionary["dropprob"],
+                attn_dropout=build_model_dictionary["dropprob"],
+            )
+            if maxvit_name == "maxvit":
+                # Back-compat path: honor user-supplied `layers` from config.
+                model = MaxViT(layers=np.array(build_model_dictionary["layers"])[::-1],
+                               **common_kwargs)
+            elif maxvit_name == "maxvit_tiny":
+                model = maxvit_tiny(**common_kwargs)
+            elif maxvit_name == "maxvit_base":
+                model = maxvit_base(**common_kwargs)
+            else:
+                model = maxvit_large(**common_kwargs)
+
 
     elif build_model_dictionary["model_str"].lower() == "instanseg_sam":
             from instanseg.utils.models.InstanSeg_SAM import InstanSeg_SAM
