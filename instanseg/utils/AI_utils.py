@@ -43,9 +43,8 @@ def train_epoch(train_model,
         if skip_bad_batches and not torch.isfinite(loss):
             warnings.warn(f"Skipping batch: non-finite loss ({loss.item()})")
             train_optimizer.zero_grad(set_to_none=True)
-            if use_amp:
-                # Keep scaler state consistent so the next iteration works
-                scaler.update()
+            # No scaler.update() here: we never called scale()/backward()/step(),
+            # so no inf check was recorded. Calling update() would assert.
             skipped_loss += 1
             continue
 
