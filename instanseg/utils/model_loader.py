@@ -171,12 +171,21 @@ def build_model_from_dict(build_model_dictionary, random_seed = None):
                 else:
                     out_channels = [[build_model_dictionary["dim_coords"]], [build_model_dictionary["n_sigma"]], [n_seeds]]
 
+            import torch as _torch  # local alias to avoid leaking into module scope
+            _use_fp16 = bool(build_model_dictionary.get("fp16", False))
             common_kwargs = dict(
                 in_channels=dim_in,
                 out_channels=out_channels,
                 norm=build_model_dictionary["norm"],
                 dropout=build_model_dictionary["dropprob"],
                 attn_dropout=build_model_dictionary["dropprob"],
+                drop_path_rate=float(build_model_dictionary.get("drop_path_rate", 0.0)),
+                # When the outer training loop uses fp16 autocast (AI_utils
+                # wraps forward in `torch.amp.autocast(..., dtype=float16)`
+                # when `--fp16` is set), make sure MaxViT's internal amp_dtype
+                # matches, so any nested autocast is a no-op instead of a
+                # dtype-switching mid-forward mismatch.
+                amp_dtype=_torch.float16 if _use_fp16 else _torch.bfloat16,
             )
             # "maxvit" alone is treated as the tiny preset for back-compat.
             if maxvit_name in ("maxvit", "maxvit_tiny"):

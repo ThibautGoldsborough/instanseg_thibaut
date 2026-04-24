@@ -45,6 +45,7 @@ parser.add_argument("-slice", "--data_slice", type=int, default=None, help = "Sl
 parser.add_argument("-clip", "--clip", type=float, default=20, help ="Gradient clipping value")
 parser.add_argument("-decay", "--weight_decay", type=float, default=0.000, help = "Weight decay")
 parser.add_argument("-drop", "--dropprob", type=float, default=0., help = "Dropout probability applied to encoder/decoder blocks (Dropout2d)")
+parser.add_argument("-drop_path", "--drop_path_rate", type=float, default=0., help = "Stochastic depth rate. Applied uniformly to every MaxViT block (paper-style fixed rate).")
 parser.add_argument("-tf", "--transform_intensity", type=float, default=0.5, help = "Intensity transformation factor")
 parser.add_argument("-dim_in", "--dim_in", type=int, default=3,help="Number of channels that the (backbone) model expects. This is also the number of channels a channel invariant model would output.")
 parser.add_argument("-dummy", "--dummy", default=False, type=lambda x: (str(x).lower() == 'true'),help="Use the training set as a validation set, this will trigger a warning message. use only for debugging")
@@ -368,6 +369,7 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
     else:
         args_dict["dim_in"] = int(dim_in)
     args_dict["dropprob"] = float(args.dropprob)
+    args_dict["drop_path_rate"] = float(args.drop_path_rate)
 
     model = build_model_from_dict(args_dict, random_seed=args.rng_seed)
 

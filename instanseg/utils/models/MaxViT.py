@@ -32,12 +32,13 @@ def _cfg_base_name(timm_name: str) -> str:
 
 
 def _build_timm_maxvit(timm_name: str, in_channels: int, img_size: int,
-                       pretrained: bool) -> nn.Module:
+                       pretrained: bool, drop_path_rate: float) -> nn.Module:
     """Create a timm MaxxVit and rebuild it at our img_size.
 
     We stay in `features_only=False` mode so `.stem` / `.stages` are reachable
     for weight copying; we'll extract multi-scale features by running them
-    manually in `MaxViT._run`.
+    manually in `MaxViT._run`. timm applies a linear stochastic-depth schedule
+    (0 at the first encoder block, ``drop_path_rate`` at the last) internally.
     """
     import timm
     kwargs = dict(
@@ -45,7 +46,7 @@ def _build_timm_maxvit(timm_name: str, in_channels: int, img_size: int,
         in_chans=in_channels,
         num_classes=0,
         global_pool="",
-        drop_path_rate=0.0,
+        drop_path_rate=drop_path_rate,
     )
     # tf_* variants hard-code window_size at training res; pass img_size to rebuild.
     if "_tf_" in timm_name:
@@ -82,6 +83,7 @@ class _TimmDecoderStage(nn.Module):
         transformer_cfg,
         conv_cfg,
         feat_size: tuple[int, int],
+        drop_path: float = 0.0,
         gradient_checkpointing: bool = False,
     ):
         super().__init__()
@@ -99,7 +101,7 @@ class _TimmDecoderStage(nn.Module):
             in_chs=out_dim, out_chs=out_dim, stride=1, depth=depth,
             feat_size=feat_size, block_types=("M",),
             transformer_cfg=transformer_cfg, conv_cfg=conv_cfg,
-            drop_path=[0.0] * depth,
+            drop_path=[drop_path] * depth,
         )
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
@@ -149,6 +151,7 @@ class _MaxViTDecoder(nn.Module):
         act: str,
         dropout: float,
         gradient_checkpointing: bool,
+        drop_path: float = 0.0,
     ):
         super().__init__()
         d0, d1, d2, d3 = dims
@@ -157,18 +160,21 @@ class _MaxViTDecoder(nn.Module):
             in_dim=d3, skip_dim=d2, out_dim=d2, depth=dec_depths[2],
             transformer_cfg=transformer_cfg, conv_cfg=conv_cfg,
             feat_size=(img_size // 16, img_size // 16),
+            drop_path=drop_path,
             gradient_checkpointing=gradient_checkpointing,
         )
         self.up2 = _TimmDecoderStage(
             in_dim=d2, skip_dim=d1, out_dim=d1, depth=dec_depths[1],
             transformer_cfg=transformer_cfg, conv_cfg=conv_cfg,
             feat_size=(img_size // 8, img_size // 8),
+            drop_path=drop_path,
             gradient_checkpointing=gradient_checkpointing,
         )
         self.up1 = _TimmDecoderStage(
             in_dim=d1, skip_dim=d0, out_dim=d0, depth=dec_depths[0],
             transformer_cfg=transformer_cfg, conv_cfg=conv_cfg,
             feat_size=(img_size // 4, img_size // 4),
+            drop_path=drop_path,
             gradient_checkpointing=gradient_checkpointing,
         )
         self.up0 = _ConvDecoderStage(d0, stem_dim, stem_dim, norm, act, dropout)
@@ -219,13 +225,14 @@ class MaxViT(nn.Module):
         attn_dropout: Optional[float] = None,
         norm: str = "BATCH",
         act: str = "ReLU",
-        amp: bool = True,
+        amp: bool = False,
         channels_last: bool = True,
         compile: bool = False,
         compile_mode: str = "default",
         amp_dtype: torch.dtype = torch.bfloat16,
         gradient_checkpointing: bool = False,
         init_decoder_from_encoder: Optional[bool] = None,
+        drop_path_rate: float = 0.0,
     ):
         super().__init__()
 
@@ -238,11 +245,12 @@ class MaxViT(nn.Module):
 
         self.timm_name = timm_name
         self.img_size = int(img_size)
+        self.drop_path_rate = float(drop_path_rate)
 
         # --- Encoder ---------------------------------------------------------
         self.encoder = _build_timm_maxvit(
             timm_name, in_channels=in_channels, img_size=self.img_size,
-            pretrained=pretrained,
+            pretrained=pretrained, drop_path_rate=self.drop_path_rate,
         )
 
         # Grab the config so we can replicate it exactly in the decoder stages.
@@ -283,10 +291,19 @@ class MaxViT(nn.Module):
                     img_size=self.img_size,
                     norm=norm, act=act, dropout=dropout,
                     gradient_checkpointing=gradient_checkpointing,
+                    drop_path=self.drop_path_rate,
                 )
                 for oc in out_channels
             ]
         )
+
+        # Override timm's default linear schedule on the encoder so every block
+        # uses the same fixed rate, as in the MaxViT paper's description.
+        if self.drop_path_rate > 0:
+            from timm.layers import DropPath
+            for m in self.encoder.modules():
+                if isinstance(m, DropPath):
+                    m.drop_prob = float(self.drop_path_rate)
 
         self._enc_depths = enc_depths
         self._dec_depths = dec_depths
