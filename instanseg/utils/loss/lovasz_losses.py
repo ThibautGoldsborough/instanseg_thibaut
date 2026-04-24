@@ -111,7 +111,9 @@ def lovasz_hinge_batched(logits, labels):
     if B == 0:
         return logits.sum() * 0.
 
-    logits_flat = logits.reshape(B, -1)   # (B, P)
+    # Clamp to keep errors in fp16-safe range. sigmoid(±30) is already ~{0,1},
+    # so this is lossless in practice but prevents Inf*0 = NaN under AMP.
+    logits_flat = logits.reshape(B, -1).clamp(-30.0, 30.0)   # (B, P)
     labels_flat = labels.reshape(B, -1).float()  # (B, P)
 
     signs = 2. * labels_flat - 1.
@@ -140,6 +142,8 @@ def lovasz_hinge_flat(logits, labels):
     if len(labels) == 0:
         # only void pixels, the gradients should be 0
         return logits.sum() * 0.
+    # See lovasz_hinge_batched: clamp keeps errors in fp16-safe range.
+    logits = logits.clamp(-30.0, 30.0)
     signs = 2. * labels.float() - 1.
     errors = (1. - logits * Variable(signs))
     errors_sorted, perm = torch.sort(errors, dim=0, descending=True)
