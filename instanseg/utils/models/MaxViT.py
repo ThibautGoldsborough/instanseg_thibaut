@@ -268,6 +268,12 @@ class MaxViT(nn.Module):
         transformer_cfg = dataclasses.replace(
             cfg.transformer_cfg, window_size=(ws, ws), grid_size=(ws, ws)
         )
+        # Inputs to forward() must be divisible by (partition_ratio * window_size)
+        # in both H and W, since the deepest stage runs at 1/partition_ratio
+        # resolution and partitions into ws-sized windows. We pad to this
+        # multiple in forward() and crop the output back, so non-multiple and
+        # non-square inputs both work.
+        self._pad_multiple = int(cfg.transformer_cfg.partition_ratio * ws)
         conv_cfg = cfg.conv_cfg
 
         if dec_depths is None:
@@ -359,14 +365,32 @@ class MaxViT(nn.Module):
         return torch.cat([dec(s3, skips, input_size) for dec in self.decoders], dim=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Accept arbitrary (H, W), square or not, by replicate-padding up to
+        # the next multiple of self._pad_multiple in each dim (Swin/SwinIR
+        # "pad-and-crop" recipe, e.g. https://arxiv.org/abs/2108.10257). For
+        # the _rmlp_ presets this is bit-exact for inputs already on the grid
+        # because position bias is an MLP over relative coords (log-CPB,
+        # https://arxiv.org/abs/2111.09883) and so is resolution-agnostic.
+        H, W = x.shape[-2:]
+        m = self._pad_multiple
+        pad_h = (-H) % m
+        pad_w = (-W) % m
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
+
         if self._channels_last:
             x = x.contiguous(memory_format=torch.channels_last)
         if self._amp and x.is_cuda:
             in_dtype = x.dtype
             with torch.autocast("cuda", dtype=self._amp_dtype):
                 y = self._core(x)
-            return y.to(in_dtype)
-        return self._core(x)
+            y = y.to(in_dtype)
+        else:
+            y = self._core(x)
+
+        if pad_h or pad_w:
+            y = y[..., :H, :W]
+        return y
 
 
 # ---------------------------------------------------------------------------- presets

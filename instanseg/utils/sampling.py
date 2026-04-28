@@ -169,7 +169,7 @@ def _build_eval_dataset(train_dataset, args):
     )
 
 
-def run_sampling(args, train_loader, train_meta, device, model, n_tta_passes: int = 10):
+def run_sampling(args, train_loader, train_meta, device, model, n_tta_passes: int = 3):
     """Cluster train images using the training model itself, save to embeddings.pkl.
 
     Hooks the model's ``get_embedding_tap()`` submodule and runs the real
