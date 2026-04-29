@@ -26,6 +26,7 @@ parser.add_argument('-num_workers', '--num_workers', default=3, type=int, help =
 parser.add_argument('-ci', '--channel_invariant', default=False, type=lambda x: (str(x).lower() == 'true'), help = "Whether to add a channel invariant model to the pipeline")
 parser.add_argument('-target', '--target_segmentation', default="N",type=str, help = " Cells or nuclei or both? Accepts: C,N, NC")  
 parser.add_argument('-pixel_size', '--requested_pixel_size', default=None, type=float, help = "Requested pixel size to rescale the input images")
+parser.add_argument('--force_pseudo_pixel_size', default=False, type=lambda x: (str(x).lower() == 'true'), help = "If True, ignore pixel_size from image metadata and always estimate it from average instance area.")
 
 #advanced usage
 parser.add_argument("-bs", "--batch_size", type=int, default=3)
@@ -503,8 +504,13 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
                                                                                                        data_slice = args.data_slice, 
                                                                                                        dummy = args.dummy, 
                                                                                                        args = args, 
-                                                                                                       sets= ["Train","Validation"], 
+                                                                                                       sets= ["Train","Validation"],
                                                                                                        complete_dataset=segmentation_dataset)
+
+    if args.force_pseudo_pixel_size:
+        for m in list(train_meta or []) + list(val_meta or []):
+            if isinstance(m, dict):
+                m.pop("pixel_size", None)
 
     n_gpus = torch.cuda.device_count()
     if n_gpus > 1:

@@ -122,6 +122,241 @@ def load_Cellpose(Segmentation_Dataset: dict, verbose: bool = True) -> dict:
 
     return Segmentation_Dataset
 
+def _osf_download_folder(folder_id: str, dest_dir: Path, project_id: str = "xmury",
+                         verbose: bool = True, skip=None) -> None:
+    api_root = "https://api.osf.io/v2"
+    stack = [("", folder_id)]
+    while stack:
+        rel_prefix, fid = stack.pop()
+        page_url = f"{api_root}/nodes/{project_id}/files/osfstorage/{fid}/?page%5Bsize%5D=100"
+        while page_url:
+            resp = requests.get(page_url)
+            resp.raise_for_status()
+            payload = resp.json()
+            for entry in payload["data"]:
+                attrs = entry["attributes"]
+                name = attrs["name"]
+                if name in (".DS_Store", "__MACOSX"):
+                    continue
+                if attrs["kind"] == "folder":
+                    stack.append((rel_prefix + name + "/", entry["id"]))
+                    continue
+                rel_path = rel_prefix + name
+                if skip is not None and skip(rel_path):
+                    continue
+                out_path = dest_dir / rel_path
+                if out_path.exists() and out_path.stat().st_size > 0:
+                    continue
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                if verbose:
+                    print(f"  downloading {rel_path}")
+                file_resp = requests.get(entry["links"]["download"], stream=True)
+                file_resp.raise_for_status()
+                with open(out_path, "wb") as f:
+                    for chunk in file_resp.iter_content(chunk_size=8192):
+                        f.write(chunk)
+            page_url = payload["links"].get("next")
+
+
+def load_OmniPose(Segmentation_Dataset: dict, verbose: bool = True, subsets=None) -> dict:
+    omnipose_subsets = {
+        "bact_phase":    ("62f5813e0beb5f0558b0ba6c", "phase-contrast"),
+        "bact_fluor":    ("62f581630beb5f0558b0baa2", "Fluorescence"),
+        "worm":          ("62f581dd5775130708f251d6", "Fluorescence"),
+        "worm_high_res": ("62f5c47a0beb5f0573b0b78b", "Brightfield"),
+    }
+    if subsets is None:
+        subsets = list(omnipose_subsets)
+
+    omnipose_dir = create_raw_datasets_dir("Cell_Segmentation", "OmniPose")
+
+    for subset in subsets:
+        if subset not in omnipose_subsets:
+            raise ValueError(f"Unknown OmniPose subset '{subset}'. Choose from {list(omnipose_subsets)}.")
+        folder_id, modality = omnipose_subsets[subset]
+        subset_dir = omnipose_dir / subset
+
+        already_downloaded = subset_dir.exists() and (
+            any(subset_dir.rglob("*.tif")) or any(subset_dir.rglob("*.png"))
+        )
+        if not already_downloaded:
+            if verbose:
+                print(f"Downloading OmniPose subset '{subset}' from OSF (https://osf.io/xmury/) to {subset_dir}...")
+            subset_dir.mkdir(parents=True, exist_ok=True)
+            _osf_download_folder(folder_id, subset_dir, project_id="xmury", verbose=verbose,
+                                 skip=lambda rel: rel.endswith("_flows.tif"))
+            if verbose:
+                print(f"Download of '{subset}' completed.")
+
+        for split_name, dest in [("train_sorted", "Train"), ("train", "Train"),
+                                 ("test_sorted", "Test"),  ("test", "Test")]:
+            split_path = subset_dir / split_name
+            if not split_path.exists():
+                continue
+
+            candidates = sorted(p for ext in ("*.tif", "*.png") for p in split_path.rglob(ext))
+
+            items = []
+            for img_path in tqdm(candidates, desc=f"OmniPose/{subset}/{split_name}", disable=not verbose):
+                fname = img_path.name
+                stem = img_path.stem
+                ext = img_path.suffix
+                if stem.endswith("_masks") or stem.endswith("_flows"):
+                    continue
+                mask_path = img_path.with_name(stem + "_masks" + ext)
+                if not mask_path.exists():
+                    continue
+
+                image = io.imread(str(img_path))
+                masks = io.imread(str(mask_path))
+                if masks.ndim == 3:
+                    masks = masks[..., 0]
+                masks, _ = fastremap.renumber(masks.astype(np.int32), in_place=True)
+
+                item = {
+                    "image": image,
+                    "cell_masks": fastremap.refit(masks),
+                    "parent_dataset": "OmniPose",
+                    "subset": subset,
+                    "licence": "CC BY-NC 3.0",
+                    "image_modality": modality,
+                    "file_name": fname,
+                    "original_size": image.shape,
+                }
+                items.append(item)
+
+            if not items:
+                continue
+
+            if dest == "Train":
+                np.random.seed(42)
+                np.random.shuffle(items)
+                cut = int(len(items) * 0.9)
+                Segmentation_Dataset['Train'] += items[:cut]
+                Segmentation_Dataset['Validation'] += items[cut:]
+            else:
+                Segmentation_Dataset['Test'] += items
+
+    return Segmentation_Dataset
+
+
+def load_DeepBacs(Segmentation_Dataset: dict, verbose: bool = True, datasets=None) -> dict:
+    deepbacs_records = {
+        "S_aureus_brightfield": (
+            "5550933", "DeepBacs_Data_Segmentation_Staph_Aureus_dataset.zip",
+            "brightfield_dataset/train/full_images/brightfield", "brightfield_dataset/train/full_images/masks",
+            "brightfield_dataset/test/brightfield",                "brightfield_dataset/test/masks",
+            "Brightfield",
+        ),
+        "E_coli_brightfield": (
+            "5550935", "DeepBacs_Data_Segmentation_E.coli_Brightfield_dataset.zip",
+            "train/brightfield", "train/masks_RoiMap",
+            "test/brightfield",  "test/masks_RoiMap",
+            "Brightfield",
+        ),
+        "B_subtilis_fluorescence": (
+            "5550968", "DeepBacs_Data_Segmentation_B.subtilis_FtsZ_dataset.zip",
+            "CARE_U-Net_dataset/train/fluorescence", "CARE_U-Net_dataset/train/masks",
+            "CARE_U-Net_dataset/test/fluorescence",  "CARE_U-Net_dataset/test/masks",
+            "Fluorescence",
+        ),
+        "Mixed": (
+            "5551009", "DeepBacs_Data_Segmentation_StarDist_MIXED_dataset.zip",
+            "training/source", "training/target",
+            "test/source",     "test/target",
+            "Brightfield",
+        ),
+        "E_coli_stationary_phase": (
+            "6400327", "DeepBacs_Data_Segmentation_Ecoli_stationary_phase.zip",
+            "train/brightfield", "train/masks",
+            "test/brightfield",  "test/masks",
+            "Brightfield",
+        ),
+    }
+
+    if datasets is None:
+        datasets = list(deepbacs_records)
+
+    deepbacs_dir = create_raw_datasets_dir("Cell_Segmentation", "DeepBacs")
+
+    for ds_key in datasets:
+        if ds_key not in deepbacs_records:
+            raise ValueError(f"Unknown DeepBacs dataset '{ds_key}'. Choose from {list(deepbacs_records)}.")
+        rec_id, zip_name, tr_img, tr_mask, te_img, te_mask, modality = deepbacs_records[ds_key]
+        ds_dir = deepbacs_dir / ds_key
+        zip_path = ds_dir / zip_name
+
+        train_img_dir = ds_dir / tr_img
+        if not train_img_dir.exists() or not any(train_img_dir.glob("*.tif")):
+            ds_dir.mkdir(parents=True, exist_ok=True)
+            url = f"https://zenodo.org/records/{rec_id}/files/{zip_name}"
+            if verbose:
+                print(f"Fetching DeepBacs '{ds_key}' from {url}")
+            download_and_extract(url, zip_path, ds_dir, verbose=verbose)
+
+        for img_rel, mask_rel, dest in [(tr_img, tr_mask, "Train"), (te_img, te_mask, "Test")]:
+            img_dir = ds_dir / img_rel
+            mask_dir = ds_dir / mask_rel
+            if not img_dir.exists() or not mask_dir.exists():
+                if verbose:
+                    print(f"  WARNING: {ds_key}/{dest}: missing {img_dir.name} or {mask_dir.name}, skipping")
+                continue
+
+            img_files = sorted(img_dir.glob("*.tif"))
+            mask_files = sorted(mask_dir.glob("*.tif"))
+            name_matches = sum(1 for ip in img_files if (mask_dir / ip.name).exists())
+            if img_files and name_matches == len(img_files):
+                pairs = [(ip, mask_dir / ip.name) for ip in img_files]
+            elif img_files and len(img_files) == len(mask_files):
+                if verbose:
+                    print(f"  {ds_key}/{dest}: filenames don't match between images and masks; "
+                          f"pairing {len(img_files)} files by sorted index.")
+                pairs = list(zip(img_files, mask_files))
+            else:
+                if verbose:
+                    print(f"  WARNING: {ds_key}/{dest}: cannot pair images and masks "
+                          f"({len(img_files)} images vs {len(mask_files)} masks); skipping.")
+                continue
+
+            items = []
+            for img_path, mask_path in tqdm(pairs, desc=f"DeepBacs/{ds_key}/{dest}", disable=not verbose):
+                image = io.imread(str(img_path))
+                masks = io.imread(str(mask_path))
+
+                if masks.ndim == 3:
+                    masks = masks[..., 0]
+
+                if len(np.unique(masks)) <= 2:
+                    masks, _ = ndimage.label(masks > 0)
+                masks, _ = fastremap.renumber(masks.astype(np.int32), in_place=True)
+
+                item = {
+                    "image": image,
+                    "cell_masks": fastremap.refit(masks),
+                    "parent_dataset": "DeepBacs",
+                    "subset": ds_key,
+                    "licence": "CC BY 4.0",
+                    "image_modality": modality,
+                    "file_name": img_path.name,
+                    "original_size": image.shape,
+                }
+                items.append(item)
+
+            if not items:
+                continue
+
+            if dest == "Train":
+                np.random.seed(42)
+                np.random.shuffle(items)
+                cut = int(len(items) * 0.9)
+                Segmentation_Dataset['Train'] += items[:cut]
+                Segmentation_Dataset['Validation'] += items[cut:]
+            else:
+                Segmentation_Dataset['Test'] += items
+
+    return Segmentation_Dataset
+
+
 def load_TNBC_2018(Segmentation_Dataset: dict, verbose: bool = True) -> dict:
 
     tnbc_dir = create_raw_datasets_dir("Nucleus_Segmentation", "TNBC_NucleiSegmentation")
@@ -1836,4 +2071,223 @@ def load_LIVECELL(Segmentation_Dataset: dict, verbose: bool = True) -> dict:
  
     Segmentation_Dataset['Test'] += get_data("test")
     return Segmentation_Dataset
- 
+
+
+def load_Usiigaci(Segmentation_Dataset: dict, verbose: bool = True) -> dict:
+
+    usiigaci_dir = create_raw_datasets_dir("Cell_Segmentation", "Usiigaci")
+    zip_path = usiigaci_dir / "Usiigaci-master.zip"
+    extracted_root = usiigaci_dir / "Usiigaci-master"
+    train_root = extracted_root / "Mask R-CNN" / "train"
+    val_root = extracted_root / "Mask R-CNN" / "val"
+
+    if not (train_root.exists() and val_root.exists()):
+        download_url = "https://codeload.github.com/oist/Usiigaci/zip/refs/heads/master"
+        if not zip_path.exists():
+            if verbose:
+                print(f"Downloading Usiigaci repo zip from {download_url} to {zip_path}...")
+            response = requests.get(download_url, stream=True)
+            response.raise_for_status()
+            with open(zip_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            if verbose:
+                print("Download completed.")
+
+        if verbose:
+            print(f"Extracting Usiigaci train/val data to {usiigaci_dir}...")
+        wanted_prefixes = ("Usiigaci-master/Mask R-CNN/train/", "Usiigaci-master/Mask R-CNN/val/")
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            members = [n for n in zip_ref.namelist() if n.startswith(wanted_prefixes)]
+            zip_ref.extractall(usiigaci_dir, members=members)
+        if verbose:
+            print("Extraction completed.")
+
+    def _load_set_dir(set_dir: Path):
+        img_path = set_dir / "raw.tif"
+        mask_path = set_dir / "instances_ids.png"
+        if not img_path.exists() or not mask_path.exists():
+            return None
+        image = io.imread(str(img_path))
+        masks = io.imread(str(mask_path))
+        if masks.ndim == 3:
+            masks = masks[..., 0]
+        masks, _ = fastremap.renumber(masks.astype(np.int32), in_place=True)
+        return {
+            "image": image,
+            "cell_masks": fastremap.refit(masks),
+            "parent_dataset": "Usiigaci",
+            "licence": "MIT",
+            "image_modality": "phase-contrast",
+            "file_name": f"{set_dir.name}/raw.tif",
+            "original_size": image.shape,
+        }
+
+    train_sets = sorted([d for d in train_root.iterdir() if d.is_dir()])
+    val_sets = sorted([d for d in val_root.iterdir() if d.is_dir()])
+
+    train_items = []
+    for set_dir in tqdm(train_sets, desc="Usiigaci/train", disable=not verbose):
+        item = _load_set_dir(set_dir)
+        if item is not None:
+            train_items.append(item)
+
+    val_items = []
+    for set_dir in tqdm(val_sets, desc="Usiigaci/val", disable=not verbose):
+        item = _load_set_dir(set_dir)
+        if item is not None:
+            val_items.append(item)
+
+    np.random.seed(42)
+    np.random.shuffle(train_items)
+    cut = int(len(train_items) * 0.9)
+    Segmentation_Dataset['Train'] += train_items[:cut]
+    Segmentation_Dataset['Test'] += train_items[cut:]
+    Segmentation_Dataset['Validation'] += val_items
+
+    return Segmentation_Dataset
+
+
+def load_Vicar(Segmentation_Dataset: dict, verbose: bool = True) -> dict:
+
+    vicar_dir = create_raw_datasets_dir("Cell_Segmentation", "Vicar")
+    zip_path = vicar_dir / "labelled.zip"
+    extracted_root = vicar_dir / "labelled"
+
+    if not extracted_root.exists() or not any(extracted_root.rglob("*_img.tif")):
+        download_url = "https://zenodo.org/records/5153251/files/labelled.zip?download=1"
+        if not zip_path.exists():
+            if verbose:
+                print(f"Downloading Vicar QPI dataset from {download_url} to {zip_path}...")
+            response = requests.get(download_url, stream=True)
+            response.raise_for_status()
+            with open(zip_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            if verbose:
+                print("Download completed.")
+
+        if verbose:
+            print(f"Extracting Vicar dataset to {vicar_dir}...")
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            zip_ref.extractall(vicar_dir)
+        if verbose:
+            print("Extraction completed.")
+
+    img_paths = sorted(extracted_root.rglob("*_img.tif"))
+    if len(img_paths) == 0:
+        # Some Zenodo zips extract directly into vicar_dir
+        img_paths = sorted(vicar_dir.rglob("*_img.tif"))
+
+    items = []
+    for img_path in tqdm(img_paths, desc="Vicar", disable=not verbose):
+        mask_path = img_path.with_name(img_path.name.replace("_img.tif", "_mask.png"))
+        if not mask_path.exists():
+            continue
+        image = io.imread(str(img_path))
+        masks = io.imread(str(mask_path))
+        if masks.ndim == 3:
+            masks = masks[..., 0]
+        if len(np.unique(masks)) <= 2:
+            masks, _ = ndimage.label(masks > 0)
+        masks, _ = fastremap.renumber(masks.astype(np.int32), in_place=True)
+        # Cell line is the middle token, e.g. 00235_PC3_img.tif -> PC3
+        stem_parts = img_path.stem.split("_")
+        cell_line = stem_parts[1] if len(stem_parts) >= 3 else "unknown"
+        items.append({
+            "image": image,
+            "cell_masks": fastremap.refit(masks),
+            "parent_dataset": "Vicar",
+            "subset": cell_line,
+            "licence": "CC BY 4.0",
+            "image_modality": "phase-contrast",
+            "file_name": img_path.name,
+            "original_size": image.shape,
+        })
+
+    np.random.seed(42)
+    np.random.shuffle(items)
+    n = len(items)
+    n_train = int(n * 0.8)
+    n_val = int(n * 0.9)
+    Segmentation_Dataset['Train'] += items[:n_train]
+    Segmentation_Dataset['Validation'] += items[n_train:n_val]
+    Segmentation_Dataset['Test'] += items[n_val:]
+
+    return Segmentation_Dataset
+
+
+def load_TOIAM(Segmentation_Dataset: dict, verbose: bool = True, frame_stride: int = 5) -> dict:
+
+    toiam_dir = create_raw_datasets_dir("Cell_Segmentation", "TOIAM")
+    zip_path = toiam_dir / "ctc_format.zip"
+    download_url = "https://zenodo.org/api/records/7260137/files/ctc_format.zip/content"
+
+    extracted_marker = toiam_dir / "00_GT" / "SEG" / "man_seg0000.tif"
+    if not extracted_marker.exists():
+        if not zip_path.exists() or zip_path.stat().st_size < 2_200_000_000:
+            if verbose:
+                print(f"Downloading TOIAM (~2.2 GB) from {download_url} to {zip_path}...")
+            response = requests.get(download_url, stream=True)
+            response.raise_for_status()
+            with open(zip_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            if verbose:
+                print("Download completed.")
+
+        if verbose:
+            print(f"Extracting TOIAM dataset to {toiam_dir}...")
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            zip_ref.extractall(toiam_dir)
+        if verbose:
+            print("Extraction completed.")
+
+    split_by_seq = {
+        "00": "Train", "01": "Train", "02": "Train",
+        "03": "Validation",
+        "04": "Test",
+    }
+
+    items_by_split = {"Train": [], "Validation": [], "Test": []}
+    sequences = sorted(d for d in toiam_dir.iterdir()
+                       if d.is_dir() and d.name in split_by_seq)
+
+    for seq_dir in sequences:
+        seq_id = seq_dir.name
+        gt_seg_dir = toiam_dir / f"{seq_id}_GT" / "SEG"
+        if not gt_seg_dir.exists():
+            continue
+
+        mask_paths = sorted(gt_seg_dir.glob("man_seg*.tif"))
+        for idx, mask_path in enumerate(tqdm(mask_paths, desc=f"TOIAM/{seq_id}", disable=not verbose)):
+            if idx % frame_stride != 0:
+                continue
+            frame_num = mask_path.stem.replace("man_seg", "")
+            img_path = seq_dir / f"t{frame_num}.tif"
+            if not img_path.exists():
+                continue
+            image = io.imread(str(img_path))
+            masks = io.imread(str(mask_path))
+            if masks.ndim == 3:
+                masks = masks[..., 0]
+            masks, _ = fastremap.renumber(masks.astype(np.int32), in_place=True)
+            items_by_split[split_by_seq[seq_id]].append({
+                "image": image,
+                "cell_masks": fastremap.refit(masks),
+                "parent_dataset": "TOIAM",
+                "subset": seq_id,
+                "licence": "CC BY 4.0",
+                "image_modality": "phase-contrast",
+                "file_name": f"{seq_id}/t{frame_num}.tif",
+                "original_size": image.shape,
+            })
+
+    np.random.seed(42)
+    np.random.shuffle(items_by_split["Train"])
+    cut = int(len(items_by_split["Train"]) * 0.9)
+    Segmentation_Dataset['Train'] += items_by_split["Train"][:cut]
+    Segmentation_Dataset['Validation'] += items_by_split["Train"][cut:] + items_by_split["Validation"]
+    Segmentation_Dataset['Test'] += items_by_split["Test"]
+
+    return Segmentation_Dataset

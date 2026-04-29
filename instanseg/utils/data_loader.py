@@ -224,10 +224,28 @@ def _read_images_from_pth(data_path= "../datasets", dataset = "segmentation", da
 
         print("Loading dataset from ", os.path.abspath(path_of_pth))
 
-        try:
-            complete_dataset = torch.load(path_of_pth,weights_only = False)
-        except:
-            complete_dataset = torch.load(path_of_pth)
+        if os.path.exists(path_of_pth):
+            try:
+                complete_dataset = torch.load(path_of_pth,weights_only = False)
+            except:
+                complete_dataset = torch.load(path_of_pth)
+        else:
+            complete_dataset = {}
+
+        # Merge any per-dataset pth files dropped into <data_path>/parts/.
+        # Each part is itself a {Train, Validation, Test} dict; their item lists
+        # are concatenated onto the main dataset. This lets new datasets be added
+        # without rebuilding the monolithic pth.
+        parts_dir = Path(data_path) / "parts"
+        if parts_dir.is_dir():
+            for part_path in sorted(parts_dir.glob("*.pth")):
+                print(f"Merging dataset part from {part_path}")
+                try:
+                    part = torch.load(str(part_path), weights_only=False)
+                except:
+                    part = torch.load(str(part_path))
+                for _set, items in part.items():
+                    complete_dataset.setdefault(_set, []).extend(items)
     
 
     data_dicts = {}
