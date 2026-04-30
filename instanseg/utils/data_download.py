@@ -246,7 +246,7 @@ def load_DeepBacs(Segmentation_Dataset: dict, verbose: bool = True, datasets=Non
             "5550933", "DeepBacs_Data_Segmentation_Staph_Aureus_dataset.zip",
             "brightfield_dataset/train/full_images/brightfield", "brightfield_dataset/train/full_images/masks",
             "brightfield_dataset/test/brightfield",                "brightfield_dataset/test/masks",
-            "Brightfield",
+            "Fluorescence",
         ),
         "E_coli_brightfield": (
             "5550935", "DeepBacs_Data_Segmentation_E.coli_Brightfield_dataset.zip",
@@ -264,7 +264,7 @@ def load_DeepBacs(Segmentation_Dataset: dict, verbose: bool = True, datasets=Non
             "5551009", "DeepBacs_Data_Segmentation_StarDist_MIXED_dataset.zip",
             "training/source", "training/target",
             "test/source",     "test/target",
-            "Brightfield",
+            "Fluorescence",
         ),
         "E_coli_stationary_phase": (
             "6400327", "DeepBacs_Data_Segmentation_Ecoli_stationary_phase.zip",
@@ -308,10 +308,19 @@ def load_DeepBacs(Segmentation_Dataset: dict, verbose: bool = True, datasets=Non
             if img_files and name_matches == len(img_files):
                 pairs = [(ip, mask_dir / ip.name) for ip in img_files]
             elif img_files and len(img_files) == len(mask_files):
+                # Filenames don't match — pair by sorted index. Use a natural
+                # (numeric-aware) sort key on both sides so e.g. "train_2.tif"
+                # comes before "train_10.tif" rather than after it.
+                import re
+                def _natkey(p):
+                    return [int(t) if t.isdigit() else t.lower()
+                            for t in re.split(r"(\d+)", p.name)]
+                img_files_sorted = sorted(img_files, key=_natkey)
+                mask_files_sorted = sorted(mask_files, key=_natkey)
                 if verbose:
                     print(f"  {ds_key}/{dest}: filenames don't match between images and masks; "
-                          f"pairing {len(img_files)} files by sorted index.")
-                pairs = list(zip(img_files, mask_files))
+                          f"pairing {len(img_files)} files by natural-sorted index.")
+                pairs = list(zip(img_files_sorted, mask_files_sorted))
             else:
                 if verbose:
                     print(f"  WARNING: {ds_key}/{dest}: cannot pair images and masks "

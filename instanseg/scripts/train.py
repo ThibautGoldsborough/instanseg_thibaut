@@ -450,7 +450,7 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         optimizer = get_optimizer(params, args)
 
     if args.cosineannealing:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100, eta_min=0.00001)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=args.lr * 1e-2)
     
     elif args.model_str.lower() in ("cellposesam", "instanseg_sam", "instanseg_dino"):
         from torch.optim.lr_scheduler import LambdaLR
@@ -614,7 +614,7 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
 
             scheduler = LambdaLR(optimizer, lr_lambda=lambda epoch: lr_schedule(epoch))
         elif args.cosineannealing:
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100, eta_min=0.00001)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=args.lr * 1e-2)
 
         mask_str = f", mask_loss={args.mask_loss_fn}" if args.mask_loss_fn is not None else ""
         print(f"Starting main training with seed_loss={args.seed_loss_fn}, instance_loss={args.instance_loss_fn}{mask_str}, lr={args.lr}")
@@ -709,7 +709,7 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
                         return 0.01
                 scheduler = LambdaLR(optimizer, lr_lambda=lambda epoch: lr_schedule(epoch))
             elif args.cosineannealing:
-                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100, eta_min=0.00001)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=args.lr * 1e-2)
 
             method.update_seed_loss(args.seed_loss_fn)
             method.update_instance_loss(args.instance_loss_fn)
