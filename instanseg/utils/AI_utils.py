@@ -26,59 +26,48 @@ def train_epoch(train_model,
     start = time.time()
     train_model.train()
     train_loss = []
-    use_amp = scaler is not None
     skip_bad_batches = getattr(args, 'skip_bad_batches', True)
     skipped_loss = 0
     skipped_grad = 0
 
-    for image_batch, labels_batch, _ in tqdm(train_dataloader, disable=args.on_cluster):
+    accelerator = getattr(args, "accelerator", None)
+    is_main = accelerator.is_main_process if accelerator is not None else True
+    device = accelerator.device if accelerator is not None else train_device
 
-        image_batch = image_batch.to(train_device)
-        labels = labels_batch.to(train_device)
+    for image_batch, labels_batch, _ in tqdm(train_dataloader, disable=args.on_cluster or not is_main):
 
-        with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
-            output = train_model(image_batch)
-            loss = train_loss_fn(output, labels.clone()).mean()
+        image_batch = image_batch.to(device, non_blocking=True)
+        labels = labels_batch.to(device, non_blocking=True)
+
+        output = train_model(image_batch)
+        loss = train_loss_fn(output, labels.clone()).mean()
 
         if skip_bad_batches and not torch.isfinite(loss):
             warnings.warn(f"Skipping batch: non-finite loss ({loss.item()})")
             train_optimizer.zero_grad(set_to_none=True)
-            # No scaler.update() here: we never called scale()/backward()/step(),
-            # so no inf check was recorded. Calling update() would assert.
             skipped_loss += 1
             continue
 
         train_optimizer.zero_grad()
-        if use_amp:
-            scaler.scale(loss).backward()
-            scaler.unscale_(train_optimizer)
-            total_norm = torch.nn.utils.clip_grad_norm_(train_model.parameters(), args.clip)
-            if skip_bad_batches and not torch.isfinite(total_norm):
-                warnings.warn(f"Skipping batch: non-finite gradient norm ({total_norm.item()})")
-                # scaler.step is internally a no-op when infs are present;
-                # scaler.update will then reduce the loss scale for next iter.
-                scaler.step(train_optimizer)
-                scaler.update()
-                train_optimizer.zero_grad(set_to_none=True)
-                skipped_grad += 1
-                continue
-            scaler.step(train_optimizer)
-            scaler.update()
+        if accelerator is not None:
+            accelerator.backward(loss)
+            total_norm = accelerator.clip_grad_norm_(train_model.parameters(), args.clip)
         else:
             loss.backward()
             total_norm = torch.nn.utils.clip_grad_norm_(train_model.parameters(), args.clip)
-            if skip_bad_batches and not torch.isfinite(total_norm):
-                warnings.warn(f"Skipping batch: non-finite gradient norm ({total_norm.item()})")
-                train_optimizer.zero_grad(set_to_none=True)
-                skipped_grad += 1
-                continue
-            train_optimizer.step()
+
+        if skip_bad_batches and not torch.isfinite(total_norm):
+            warnings.warn(f"Skipping batch: non-finite gradient norm ({total_norm.item()})")
+            train_optimizer.zero_grad(set_to_none=True)
+            skipped_grad += 1
+            continue
+        train_optimizer.step()
 
         train_loss.append(loss.detach().cpu().numpy())
 
     end = time.time()
 
-    if skipped_loss or skipped_grad:
+    if (skipped_loss or skipped_grad) and is_main:
         print(f"[skip_bad_batches] skipped {skipped_loss} batch(es) for non-finite loss, "
               f"{skipped_grad} for non-finite gradient norm")
 
@@ -103,17 +92,20 @@ def test_epoch(test_model,
     global global_step_test
     start = time.time()
 
+    accelerator = getattr(args, 'accelerator', None)
+    is_main = accelerator.is_main_process if accelerator is not None else True
+    device = accelerator.device if accelerator is not None else test_device
+
     test_model.eval()
     test_loss = []
 
     current_f1_list = []
     with torch.no_grad():
-        for image_batch, labels_batch, _ in tqdm(test_dataloader, disable=args.on_cluster):
-            image_batch = image_batch.to(test_device)
-            labels = labels_batch.to(test_device)
-            with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
-                output = test_model(image_batch)
-                loss = test_loss_fn(output, labels.clone()).mean()
+        for image_batch, labels_batch, _ in tqdm(test_dataloader, disable=args.on_cluster or not is_main):
+            image_batch = image_batch.to(device, non_blocking=True)
+            labels = labels_batch.to(device, non_blocking=True)
+            output = test_model(image_batch)
+            loss = test_loss_fn(output, labels.clone()).mean()
             test_loss.append(loss.detach().cpu().numpy())
 
             if type(output) == list:
@@ -131,6 +123,13 @@ def test_epoch(test_model,
 
             global_step_test += 1
 
+    # Gather per-batch F1 values across ranks so mean_f1 reflects the whole val set.
+    if accelerator is not None and accelerator.num_processes > 1 and len(current_f1_list) > 0:
+        f1_local = np.stack([np.atleast_1d(x) for x in current_f1_list]).astype(np.float32)
+        f1_t = torch.tensor(f1_local, device=accelerator.device)
+        f1_t = accelerator.gather_for_metrics(f1_t).detach().cpu().numpy()
+        current_f1_list = list(f1_t)
+
     f1_array = np.array(current_f1_list)  # either N,2 or N,
 
     if f1_array.ndim == 1:
@@ -139,9 +138,8 @@ def test_epoch(test_model,
     mean1_f1 = np.nanmean(f1_array, axis=0)
 
     mean_f1 = _robust_f1_mean_calculator(mean1_f1)
-    #  mean_f1 = current_f1_list
 
-    if mean_f1 > best_f1 or save_bool:
+    if (mean_f1 > best_f1 or save_bool) and is_main:
         if len(image_batch[0]) == 3:
             input1 = image_batch[0]
         else:

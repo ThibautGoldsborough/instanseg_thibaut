@@ -1,4 +1,7 @@
 import os
+# BEFORE any matplotlib import — silences Tk teardown errors under DDP.
+import matplotlib
+matplotlib.use("Agg")
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
@@ -83,6 +86,11 @@ parser.add_argument('-preemptable', '--preemptable', default=False, type=lambda 
 parser.add_argument('-preempt_interval', '--preempt_save_interval', default=10, type=int, help="Save preemptable checkpoint every N epochs (default=1). Higher values reduce I/O for large models at the cost of losing more progress on preemption.")
 parser.add_argument('-skip_bad_batches', '--skip_bad_batches', default=True, type=lambda x: (str(x).lower() == 'true'), help="Skip training batches whose loss or gradient norm is non-finite (NaN/Inf) and warn. Default=True.")
 
+_bool = lambda x: (str(x).lower() == 'true')
+parser.add_argument('-compile', '--compile', default=False, type=_bool, help="Whether to torch.compile the model")
+parser.add_argument('-compile_mode', '--compile_mode', default="default", type=str, help="torch.compile mode: default, reduce-overhead, max-autotune")
+parser.add_argument('-shard_dataset_per_rank', '--shard_dataset_per_rank', default=True, type=_bool, help="Per-rank dataset sharding under multi-GPU DDP. Each rank sees 1/N of the data; total samples per epoch is preserved by scaling length_of_epoch.")
+
 
 def save_training_plot(train_losses, test_losses, f1_list, f1_list_cells, output_path, cells_and_nuclei=False, hotstart_epoch=None):
     import matplotlib
@@ -130,6 +138,9 @@ def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name=
     from instanseg.utils.AI_utils import optimize_hyperparameters, train_epoch, test_epoch
     global best_f1_score, device, method, iou_threshold, args, optimizer, scheduler
 
+    accelerator = getattr(args, 'accelerator', None)
+    is_main = accelerator.is_main_process if accelerator is not None else True
+
     train_losses = list(prior_train_losses) if prior_train_losses else []
     test_losses = list(prior_test_losses) if prior_test_losses else []
 
@@ -140,10 +151,12 @@ def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name=
     for epoch in range(start_epoch, num_epochs):
 
         if resample_fn is not None and resample_interval > 0 and epoch > 0 and epoch % resample_interval == 0:
-            print(f"[resample] Refreshing Leiden clusters at epoch {epoch}")
+            if is_main:
+                print(f"[resample] Refreshing Leiden clusters at epoch {epoch}")
             train_loader = resample_fn()
 
-        print("Epoch:", epoch)
+        if is_main:
+            print("Epoch:", epoch)
 
         train_loss, train_time = train_epoch(model, device, train_loader, loss_fn, optimizer, args=args, scaler=scaler)
 
@@ -203,12 +216,14 @@ def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name=
         _is_new_best = f1_score > best_f1_score
         if _is_new_best or save_epoch_outputs:
             best_f1_score = np.maximum(f1_score, best_f1_score)
-            print("Saving model, best f1_score:", best_f1_score)
+            if is_main:
+                print("Saving model, best f1_score:", best_f1_score)
 
         _should_save_best = _is_new_best or save_epoch_outputs
         _should_save_preempt = args.preemptable and (epoch % args.preempt_save_interval == 0 or epoch == num_epochs - 1)
-        if _should_save_best or _should_save_preempt:
-            _model_state = model.state_dict()
+        if (_should_save_best or _should_save_preempt) and is_main:
+            _model_state = (accelerator.unwrap_model(model).state_dict()
+                            if accelerator is not None else model.state_dict())
             _optim_state = optimizer.state_dict()
             _sched_state = scheduler.state_dict() if scheduler is not None else None
 
@@ -244,11 +259,10 @@ def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name=
                 _tmp_path.rename(args.output_path / "preemptable_state.pth")
 
 
-        # this is where the loss gets printed
-        print(", ".join(f"{k}: {v:.5g}" for k, v in dict_to_print.items()))
-
-        save_training_plot(train_losses, test_losses, f1_list, f1_list_cells,
-                           args.output_path, args.cells_and_nuclei, hotstart_epoch=hotstart_epoch)
+        if is_main:
+            print(", ".join(f"{k}: {v:.5g}" for k, v in dict_to_print.items()))
+            save_training_plot(train_losses, test_losses, f1_list, f1_list_cells,
+                               args.output_path, args.cells_and_nuclei, hotstart_epoch=hotstart_epoch)
 
     return model, train_losses, test_losses, f1_list, f1_list_cells
 
@@ -264,20 +278,39 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         else:
             raise ValueError(f"Argument {key} not recognized")
 
-       
+
     from instanseg.utils.utils import plot_average, _choose_device
     from instanseg.utils.model_loader import build_model_from_dict, load_model_weights
     from instanseg.utils.data_loader import _read_images_from_pth, get_loaders
 
+    # Accelerator setup (replaces nn.DataParallel). Initialize first so is_main_process
+    # is available for guarding mkdir / prints / saves throughout.
+    from accelerate import Accelerator
+    from accelerate.utils import DistributedDataParallelKwargs
+
+    ddp_kwargs = DistributedDataParallelKwargs(
+        static_graph=True,           # graph traced once → handles unused + reused params
+        gradient_as_bucket_view=True,
+    )
+    accelerator = Accelerator(
+        mixed_precision="bf16" if args.fp16 else "no",
+        kwargs_handlers=[ddp_kwargs],
+    )
+    is_main = accelerator.is_main_process
+    args.accelerator = accelerator   # consumed by train_epoch / test_epoch
+
     args.data_path = Path(args.data_path)
 
-    if not os.path.exists(args.output_path):
+    if is_main and not os.path.exists(args.output_path):
         os.mkdir(args.output_path)
+    accelerator.wait_for_everyone()
 
     args.output_path = Path(args.output_path) / args.experiment_str
-    print("Saving results to {}".format(os.path.abspath(args.output_path)))
-    if not os.path.exists(args.output_path):
-        os.mkdir(args.output_path)
+    if is_main:
+        print("Saving results to {}".format(os.path.abspath(args.output_path)))
+        if not os.path.exists(args.output_path):
+            os.mkdir(args.output_path)
+    accelerator.wait_for_everyone()
 
     # Preemptable: detect existing checkpoint for auto-resume
     _preemptable_resuming = False
@@ -285,10 +318,11 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
     if args.preemptable and not args.model_folder:
         _ckpt_path = args.output_path / "preemptable_state.pth"
         if _ckpt_path.exists():
-            print(f"[preemptable] Found existing checkpoint at {_ckpt_path}, will auto-resume")
+            if is_main:
+                print(f"[preemptable] Found existing checkpoint at {_ckpt_path}, will auto-resume")
             _preemptable_resuming = True
-            _preemptable_checkpoint = torch.load(_ckpt_path, weights_only=False, map_location=args.device)
-        else:
+            _preemptable_checkpoint = torch.load(_ckpt_path, weights_only=False, map_location=accelerator.device)
+        elif is_main:
             print("[preemptable] No existing checkpoint found, starting fresh")
 
     os.environ["INSTANSEG_DATASET_PATH"] = os.environ.get("INSTANSEG_DATASET_PATH", str(args.data_path))
@@ -296,16 +330,18 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
 
     # Seed as many rngs as we can
     if args.rng_seed:
-        print(f'Setting RNG seed to {args.rng_seed}')
+        if is_main:
+            print(f'Setting RNG seed to {args.rng_seed}')
         torch.manual_seed(args.rng_seed)
         np.random.seed(args.rng_seed)
         import random
         random.seed(args.rng_seed)
-    else:
+    elif is_main:
         print('RNG seed not set')
 
     if args.use_deterministic:
-        print('Setting use_deterministic_algorithms=True')
+        if is_main:
+            print('Setting use_deterministic_algorithms=True')
         torch.use_deterministic_algorithms(True,warn_only = True)
         os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 
@@ -324,7 +360,8 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
     else:
         args.cells_and_nuclei = False
         
-    device = _choose_device(args.device)
+    device = accelerator.device
+    args.device = device
 
     if args.loss_function == "instanseg_loss":
         from instanseg.utils.loss.instanseg_loss import InstanSeg
@@ -378,7 +415,8 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
     try:
         from fvcore.nn import FlopCountAnalysis
         flops = FlopCountAnalysis(model, torch.randn(1,3,256,256))
-        print("Number of flops:",flops.total()/1e9)
+        if is_main:
+            print("Number of flops:",flops.total()/1e9)
         #from fvcore.nn import flop_count_str
        # print(flop_count_str(flops))
     except:
@@ -420,12 +458,14 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
             if args.lora_rank > 0 and hasattr(model, 'enable_lora'):
                 optimizer = get_optimizer(filter(lambda p: p.requires_grad, model.parameters()), args)
                 # Skip loading optimizer state dict — LoRA changes parameter groups
-                print("LoRA enabled: skipping optimizer state dict (parameter groups changed)")
+                if is_main:
+                    print("LoRA enabled: skipping optimizer state dict (parameter groups changed)")
             else:
                 optimizer = get_optimizer(model.parameters(),args)
                 optimizer.load_state_dict(model_dict['optimizer_state_dict'])
 
-        print("Resuming training from epoch", model_dict['epoch'])
+        if is_main:
+            print("Resuming training from epoch", model_dict['epoch'])
 
     else:
         # Enable LoRA before creating optimizer (when no hotstart to handle it)
@@ -489,12 +529,14 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         from instanseg.utils.model_loader import remove_module_prefix_from_dict
         _state = remove_module_prefix_from_dict(_preemptable_checkpoint['model_state_dict'])
         model.load_state_dict(_state, strict=True)
-        print(f"[preemptable] Restored model weights, will resume from epoch {_resume_epoch}")
+        if is_main:
+            print(f"[preemptable] Restored model weights, will resume from epoch {_resume_epoch}")
 
     if "[" in args.source_dataset:
- 
+
         args.source_dataset = [i.lower() for i in args.source_dataset.replace("[","").replace("]","").replace("'","").split(",")]
-        print(type(args.source_dataset), args.source_dataset)
+        if is_main:
+            print(type(args.source_dataset), args.source_dataset)
     else:
         args.source_dataset = args.source_dataset.lower()
 
@@ -512,14 +554,27 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
             if isinstance(m, dict):
                 m.pop("pixel_size", None)
 
-    n_gpus = torch.cuda.device_count()
-    if n_gpus > 1:
-        args.batch_size = args.batch_size * n_gpus
-        print(f"Scaling batch size to {args.batch_size} ({args.batch_size // n_gpus} per GPU x {n_gpus} GPUs)")
+    # Per-rank dataset shard (DDP). Scale len_epoch / len_eval down so total
+    # samples per epoch is preserved across ranks.
+    args._dataloader_was_sharded = False
+    _do_shard = args.shard_dataset_per_rank and accelerator.num_processes > 1
+    if _do_shard:
+        rank = accelerator.process_index
+        n = accelerator.num_processes
+        train_images = train_images[rank::n]
+        train_labels = train_labels[rank::n]
+        train_meta   = train_meta[rank::n]
+        val_images   = val_images[rank::n]
+        val_labels   = val_labels[rank::n]
+        val_meta     = val_meta[rank::n]
+        args._dataloader_was_sharded = True
+        args.length_of_epoch = max(1, args.length_of_epoch // n)
+        if getattr(args, 'length_of_eval', None) is not None:
+            args.length_of_eval = max(1, args.length_of_eval // n)
 
     train_loader, test_loader = get_loaders(train_images, train_labels, val_images, val_labels, train_meta, val_meta, args)
 
-    if args.show_augmentations:
+    if args.show_augmentations and is_main:
         from instanseg.utils.visualization import show_images
         aug_dir = args.output_path / "augmentation_examples"
         os.makedirs(aug_dir, exist_ok=True)
@@ -534,17 +589,28 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
                         save_str=str(aug_dir / f"sample_{i:02d}"))
         print(f"Saved {min(10, len(train_dataset))} augmentation examples to {aug_dir}")
 
-    if torch.cuda.device_count() > 1:
-        print("Using", torch.cuda.device_count(), "GPUs!")
-        model = nn.DataParallel(model)
-
     model.to(device)
 
-    print(f"CUDA devices visible: {torch.cuda.device_count()}")
-    for i in range(torch.cuda.device_count()):
-        print(f"  GPU {i}: {torch.cuda.get_device_name(i)} ({torch.cuda.get_device_properties(i).total_memory / 1e9:.1f} GB)")
+    # Re-point method device after Accelerator init (was constructed with cuda:0 default).
+    method.device = device
+    if hasattr(method, 'pixel_classifier') and method.pixel_classifier is not None:
+        method.pixel_classifier.to(device)
+    if hasattr(method, 'teacher_model') and method.teacher_model is not None:
+        method.teacher_model.to(device)
+    if hasattr(method, 'loss_temporal') and method.loss_temporal is not None:
+        method.loss_temporal.device = device
 
-    if args.save:
+    model, optimizer = accelerator.prepare(model, optimizer)
+    if not args._dataloader_was_sharded:
+        train_loader, test_loader = accelerator.prepare(train_loader, test_loader)
+
+    if accelerator.is_main_process:
+        print(f"CUDA devices visible: {torch.cuda.device_count()}")
+        for i in range(torch.cuda.device_count()):
+            print(f"  GPU {i}: {torch.cuda.get_device_name(i)} ({torch.cuda.get_device_properties(i).total_memory / 1e9:.1f} GB)")
+        print(f"Accelerator: num_processes={accelerator.num_processes}, mixed_precision={accelerator.mixed_precision}")
+
+    if args.save and is_main:
         if not os.path.exists(args.output_path):
             os.mkdir(args.output_path)
         if not os.path.exists(args.output_path / "epoch_outputs"):
@@ -553,22 +619,27 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
             import glob
             for f in glob.glob(str(args.output_path / "epoch_outputs" / "*.png")):
                 os.remove(f)
+    accelerator.wait_for_everyone()
 
 
-    pd.DataFrame.from_dict(args_dict, orient='index').to_csv(args.output_path / "experiment_log.csv",
-                                                            header=False)
+    if is_main:
+        pd.DataFrame.from_dict(args_dict, orient='index').to_csv(args.output_path / "experiment_log.csv",
+                                                                header=False)
 
     iou_threshold = np.linspace(0.5, 1.0, 10)
 
-    scaler = torch.amp.GradScaler() if args.fp16 else None
-    if args.fp16:
-        print("Mixed precision (fp16) training enabled")
+    # Mixed precision is now driven by Accelerator (mixed_precision="bf16" if fp16),
+    # so the manual GradScaler is no longer used — kept None to preserve API.
+    scaler = None
+    if args.fp16 and is_main:
+        print("Mixed precision (bf16) training enabled via Accelerator")
 
     if args.hotstart_training > 0 and not _preemptable_resuming:
         hot_epochs = args.hotstart_training
         hotstart_lr = 1e-3
         mask_str = f", mask_loss=ce" if args.mask_loss_fn is not None else ""
-        print(f"Hotstart for {hot_epochs} epochs with seed_loss=l1_distance, instance_loss=dice_loss{mask_str}, lr={hotstart_lr}")
+        if is_main:
+            print(f"Hotstart for {hot_epochs} epochs with seed_loss=l1_distance, instance_loss=dice_loss{mask_str}, lr={hotstart_lr}")
 
         method.update_seed_loss("l1_distance")
         method.update_instance_loss("dice_loss")
@@ -578,7 +649,8 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         # Freeze pretrained backbone weights during hotstart
         _backbone_frozen = hasattr(model, 'freeze_backbone')
         if _backbone_frozen:
-            print("Freezing backbone weights for hotstart")
+            if is_main:
+                print("Freezing backbone weights for hotstart")
             model.freeze_backbone()
             optimizer = get_optimizer(filter(lambda p: p.requires_grad, model.parameters()), args, lr=hotstart_lr)
         else:
@@ -589,11 +661,13 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         # Unfreeze backbone weights after hotstart
         if _backbone_frozen:
             if args.lora_rank > 0 and hasattr(model, 'enable_lora'):
-                print(f"Enabling LoRA (rank={args.lora_rank}) for main training")
+                if is_main:
+                    print(f"Enabling LoRA (rank={args.lora_rank}) for main training")
                 model.enable_lora(rank=args.lora_rank)
                 model.unfreeze_backbone()
             else:
-                print("Unfreezing backbone weights for main training")
+                if is_main:
+                    print("Unfreezing backbone weights for main training")
                 model.unfreeze_backbone()
 
         optimizer = get_optimizer(filter(lambda p: p.requires_grad, model.parameters()), args)
@@ -617,7 +691,8 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=args.lr * 1e-2)
 
         mask_str = f", mask_loss={args.mask_loss_fn}" if args.mask_loss_fn is not None else ""
-        print(f"Starting main training with seed_loss={args.seed_loss_fn}, instance_loss={args.instance_loss_fn}{mask_str}, lr={args.lr}")
+        if is_main:
+            print(f"Starting main training with seed_loss={args.seed_loss_fn}, instance_loss={args.instance_loss_fn}{mask_str}, lr={args.lr}")
         method.update_seed_loss(args.seed_loss_fn)
         method.update_instance_loss(args.instance_loss_fn)
         if args.mask_loss_fn is not None:
@@ -663,7 +738,8 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         # Determine if we were in hotstart or main training phase using the saved epoch_name
         if args.hotstart_training > 0 and _was_in_hotstart:
             # Resume into hotstart phase: replicate hotstart setup
-            print(f"[preemptable] Resuming hotstart phase from epoch {_start}")
+            if is_main:
+                print(f"[preemptable] Resuming hotstart phase from epoch {_start}")
             method.update_seed_loss("l1_distance")
             method.update_instance_loss("dice_loss")
             if args.mask_loss_fn is not None:
@@ -726,7 +802,7 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         else:
             # Resume into main training phase: recreate optimizer with correct param groups, then restore state
             if args.channel_invariant and args.freeze_main_model:
-                _inner = model.module if isinstance(model, nn.DataParallel) else model
+                _inner = accelerator.unwrap_model(model)
                 optimizer = get_optimizer(_inner.model.AdaptorNet.parameters(), args)
             else:
                 optimizer = get_optimizer(filter(lambda p: p.requires_grad, model.parameters()), args)
@@ -753,6 +829,10 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
     else:
         model, train_losses, test_losses, f1_list, f1_list_cells = main(model, loss_fn, train_loader, test_loader, num_epochs=num_epochs, scaler=scaler,
             **_resample_kwargs)
+
+    accelerator.wait_for_everyone()
+    if not is_main:
+        return
 
     from instanseg.utils.model_loader import load_model
     model, model_dict = load_model(folder="", path=args.output_path) #Load model from checkpoint

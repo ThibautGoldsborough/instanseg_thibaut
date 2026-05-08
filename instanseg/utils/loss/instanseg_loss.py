@@ -1580,9 +1580,20 @@ class InstanSeg(nn.Module):
         if window_size is None:
             window_size = self.window_size
         if device is None:
-            device = self.device
+            if isinstance(prediction, torch.Tensor):
+                device = prediction.device     # rank's actual GPU
+            else:
+                device = self.device           # numpy fallback only
         if classifier is None:
             classifier = self.pixel_classifier
+
+        # Move the attached pixel_classifier to the prediction's device if needed.
+        if classifier is not None and isinstance(prediction, torch.Tensor):
+            try:
+                if next(classifier.parameters()).device != prediction.device:
+                    classifier.to(prediction.device)
+            except StopIteration:
+                pass
 
         if self.parameters_have_been_updated:
             for key in self.params:
