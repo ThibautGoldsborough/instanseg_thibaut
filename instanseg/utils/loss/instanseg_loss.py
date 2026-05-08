@@ -907,9 +907,9 @@ def feature_engineering_2(x: torch.Tensor, xxyy: torch.Tensor, c: torch.Tensor, 
 
     return x
 
-def feature_engineering_3(x: torch.Tensor, xxyy: torch.Tensor, c: torch.Tensor, sigma: torch.Tensor, window_size: int,
+def feature_engineering_3(x: torch.Tensor, c: torch.Tensor, sigma: torch.Tensor, window_size: int,
                         mesh_grid_flat: torch.Tensor):
-    
+
     # NO SIGMA
     E = x.shape[0]
     h, w = x.shape[-2:]

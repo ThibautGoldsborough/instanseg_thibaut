@@ -82,6 +82,8 @@ parser.add_argument('-batched_instance_loss', '--batched_instance_loss', default
 parser.add_argument('-preemptable', '--preemptable', default=False, type=lambda x: (str(x).lower() == 'true'), help="Enable preemption-safe training: saves full training state and auto-resumes from checkpoint if preempted on SLURM")
 parser.add_argument('-preempt_interval', '--preempt_save_interval', default=10, type=int, help="Save preemptable checkpoint every N epochs (default=1). Higher values reduce I/O for large models at the cost of losing more progress on preemption.")
 parser.add_argument('-skip_bad_batches', '--skip_bad_batches', default=True, type=lambda x: (str(x).lower() == 'true'), help="Skip training batches whose loss or gradient norm is non-finite (NaN/Inf) and warn. Default=True.")
+parser.add_argument('-pct_unsup', '--percent_unsupervised', default=0.0, type=float, help="Percent (0..100) of training images whose labels are wiped; an equivariance consistency loss is applied to those images instead. 0 disables the feature.")
+parser.add_argument('-cons_w', '--consistency_weight', default=1.0, type=float, help="Weight applied to the consistency loss when --percent_unsupervised > 0.")
 
 
 def save_training_plot(train_losses, test_losses, f1_list, f1_list_cells, output_path, cells_and_nuclei=False, hotstart_epoch=None):
@@ -145,7 +147,7 @@ def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name=
 
         print("Epoch:", epoch)
 
-        train_loss, train_time = train_epoch(model, device, train_loader, loss_fn, optimizer, args=args, scaler=scaler)
+        train_loss, train_time, train_extra = train_epoch(model, device, train_loader, loss_fn, optimizer, args=args, scaler=scaler)
 
         if epoch <= 5 and not args.model_folder and start_epoch == 0:  # Training is just starting AND we are not resuming
             save_epoch_outputs = True
@@ -177,6 +179,11 @@ def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name=
         if hasattr(method, 'last_seed_loss'):
             dict_to_print["seed_loss"] = method.last_seed_loss
             dict_to_print["instance_loss"] = method.last_instance_loss
+        if args.percent_unsupervised > 0:
+            dict_to_print["sup_loss"] = train_extra['mean_sup_loss']
+            dict_to_print["cons_loss"] = train_extra['mean_cons_loss']
+            dict_to_print["n_sup_b"] = train_extra['n_sup_batches']
+            dict_to_print["n_cons_b"] = train_extra['n_cons_batches']
         if method.uncertainty_weighting:
             import math
             dict_to_print["w_seed"] = math.exp(-method.log_var_seed.item())
@@ -511,6 +518,33 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         for m in list(train_meta or []) + list(val_meta or []):
             if isinstance(m, dict):
                 m.pop("pixel_size", None)
+
+    if args.percent_unsupervised > 0:
+        if args.dim_coords != 2:
+            raise ValueError("--percent_unsupervised requires dim_coords=2 (consistency loss assumes 2-channel y,x offsets)")
+        if args.cells_and_nuclei:
+            raise ValueError("--percent_unsupervised does not yet support cells_and_nuclei (target_segmentation=NC)")
+        if not (0.0 <= args.percent_unsupervised <= 100.0):
+            raise ValueError(f"--percent_unsupervised must be in [0, 100]; got {args.percent_unsupervised}")
+
+        rng_unsup = np.random.default_rng(args.rng_seed)
+        n_train = len(train_labels)
+        n_unsup = int(round(args.percent_unsupervised / 100.0 * n_train))
+        if n_unsup > 0:
+            # Sentinel = -1 so that the augmenter's "skip renumbering when label
+            # contains -1" convention preserves it (see augmentations.py:169).
+            # Cast to int32 first because TIFF masks load as uint8/uint16 where
+            # np.full_like(..., -1) silently wraps to 255/65535.
+            for j in range(n_train):
+                lbl = np.asarray(train_labels[j])
+                if lbl.dtype != np.int32:
+                    train_labels[j] = lbl.astype(np.int32)
+
+            unsup_idx = rng_unsup.choice(n_train, size=n_unsup, replace=False)
+            for i in unsup_idx:
+                lbl = train_labels[i]
+                train_labels[i] = np.full(lbl.shape, -1, dtype=np.int32)
+            print(f"[unsupervised] Wiped labels for {n_unsup}/{n_train} ({args.percent_unsupervised:.1f}%) train images; consistency loss will be applied to them (weight={args.consistency_weight})")
 
     n_gpus = torch.cuda.device_count()
     if n_gpus > 1:

@@ -26,10 +26,37 @@ def train_epoch(train_model,
     start = time.time()
     train_model.train()
     train_loss = []
+    sup_loss_hist = []
+    cons_loss_hist = []
     use_amp = scaler is not None
     skip_bad_batches = getattr(args, 'skip_bad_batches', True)
     skipped_loss = 0
     skipped_grad = 0
+
+    pct_unsup = float(getattr(args, 'percent_unsupervised', 0.0) or 0.0)
+    use_unsup = pct_unsup > 0
+    if use_unsup:
+        from instanseg.utils.loss.consistency_loss import consistency_loss
+        dim_coords = int(getattr(args, 'dim_coords', 2))
+        cons_weight = float(getattr(args, 'consistency_weight', 1.0))
+        cons_nan_dumped = False  # one-shot diagnostic dump
+        sup_nan_dumped = False
+
+        def _offset_only(x: torch.Tensor) -> torch.Tensor:
+            # Match InstanSeg's displacement formula (instanseg_loss.py:1354):
+            # spatial_emb = (sigmoid(raw) - 0.5) * 8 + xxyy. The consistency loss
+            # operates on the displacement (offset from xxyy), in coord units.
+            #
+            # Channel-order swap: InstanSeg's xxyy = cat((xx, yy)) has channel 0=x
+            # and channel 1=y, but consistency_loss treats channel 0=y, channel 1=x
+            # (its homography solver is _compute_homography_yx). Flip channels so
+            # the displacement vector enters consistency_loss in (y, x) order.
+            out = train_model(x)
+            if isinstance(out, list):
+                out = out[0]
+            raw = out[:, :dim_coords]
+            disp_xy = (torch.sigmoid(raw) - 0.5) * 8.0
+            return disp_xy[:, [1, 0]]
 
     for image_batch, labels_batch, _ in tqdm(train_dataloader, disable=args.on_cluster):
 
@@ -37,8 +64,98 @@ def train_epoch(train_model,
         labels = labels_batch.to(train_device)
 
         with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
-            output = train_model(image_batch)
-            loss = train_loss_fn(output, labels.clone()).mean()
+            if use_unsup:
+                # Wiped samples are stamped with sentinel value -1 (chosen to match
+                # the augmenter's "skip renumbering" convention). Augmentation may pad
+                # borders with 0, so detect via .any() rather than .all().
+                unsup_mask = (labels == -1).reshape(labels.shape[0], -1).any(dim=1)
+                sup_mask = ~unsup_mask
+
+                loss_terms = []
+                if sup_mask.any():
+                    sup_imgs = image_batch[sup_mask]
+                    sup_labels = labels[sup_mask]
+                    sup_output = train_model(sup_imgs)
+                    sup_loss = train_loss_fn(sup_output, sup_labels.clone()).mean()
+                    if torch.isfinite(sup_loss):
+                        loss_terms.append(sup_loss)
+                        sup_loss_hist.append(sup_loss.detach().cpu().item())
+                    else:
+                        if not sup_nan_dumped:
+                            sup_nan_dumped = True
+                            stats = (
+                                f"sup_imgs: shape={tuple(sup_imgs.shape)} "
+                                f"min={sup_imgs.min().item():.4g} max={sup_imgs.max().item():.4g} "
+                                f"finite={torch.isfinite(sup_imgs).all().item()}; "
+                                f"sup_labels: shape={tuple(sup_labels.shape)} "
+                                f"unique~={sup_labels.unique()[:8].tolist()} "
+                                f"finite={torch.isfinite(sup_labels.float()).all().item()}; "
+                                f"sup_output: min={sup_output.min().item():.4g} max={sup_output.max().item():.4g} "
+                                f"finite={torch.isfinite(sup_output).all().item()}; "
+                                f"sup_loss={sup_loss.item()}"
+                            )
+                            try:
+                                import os
+                                dump_dir = getattr(args, 'output_path', None)
+                                if dump_dir is not None:
+                                    dump_path = os.fspath(dump_dir) + "/supervised_nan_dump.pt"
+                                    torch.save({
+                                        'sup_imgs': sup_imgs.detach().cpu(),
+                                        'sup_labels': sup_labels.detach().cpu(),
+                                        'sup_output': sup_output.detach().cpu(),
+                                        'sup_loss': sup_loss.detach().cpu(),
+                                    }, dump_path)
+                                    stats += f"  saved to {dump_path}"
+                            except Exception as _e:
+                                stats += f"  (dump failed: {_e})"
+                            warnings.warn(f"sup_loss is non-finite; dropping. {stats}")
+                        else:
+                            warnings.warn(f"sup_loss non-finite ({sup_loss.item()}); dropping (suppressed further detail)")
+                if unsup_mask.any() and cons_weight != 0:
+                    unsup_imgs = image_batch[unsup_mask]
+                    cons_loss = consistency_loss(_offset_only, unsup_imgs)
+                    if torch.isfinite(cons_loss):
+                        loss_terms.append(cons_weight * cons_loss)
+                        cons_loss_hist.append(cons_loss.detach().cpu().item())
+                    else:
+                        # One-shot dump: capture the offending inputs + model output stats
+                        # so the NaN source can be inspected offline.
+                        if not cons_nan_dumped:
+                            cons_nan_dumped = True
+                            with torch.no_grad():
+                                raw_out = _offset_only(unsup_imgs)
+                            stats = (
+                                f"images: shape={tuple(unsup_imgs.shape)} "
+                                f"min={unsup_imgs.min().item():.4g} max={unsup_imgs.max().item():.4g} "
+                                f"finite={torch.isfinite(unsup_imgs).all().item()}; "
+                                f"offsets: min={raw_out.min().item():.4g} max={raw_out.max().item():.4g} "
+                                f"abs.mean={raw_out.abs().mean().item():.4g} "
+                                f"finite={torch.isfinite(raw_out).all().item()}; "
+                                f"cons_loss={cons_loss.item()}"
+                            )
+                            try:
+                                import os
+                                dump_dir = getattr(args, 'output_path', None)
+                                if dump_dir is not None:
+                                    dump_path = os.fspath(dump_dir) + "/consistency_nan_dump.pt"
+                                    torch.save({
+                                        'images': unsup_imgs.detach().cpu(),
+                                        'offsets': raw_out.detach().cpu(),
+                                        'cons_loss': cons_loss.detach().cpu(),
+                                    }, dump_path)
+                                    stats += f"  saved to {dump_path}"
+                            except Exception as _e:
+                                stats += f"  (dump failed: {_e})"
+                            warnings.warn(f"consistency_loss is non-finite; dropping this batch's consistency term. {stats}")
+                        else:
+                            warnings.warn(f"consistency_loss non-finite ({cons_loss.item()}); dropping (suppressed further detail)")
+
+                if not loss_terms:
+                    continue
+                loss = sum(loss_terms)
+            else:
+                output = train_model(image_batch)
+                loss = train_loss_fn(output, labels.clone()).mean()
 
         if skip_bad_batches and not torch.isfinite(loss):
             warnings.warn(f"Skipping batch: non-finite loss ({loss.item()})")
@@ -83,7 +200,13 @@ def train_epoch(train_model,
               f"{skipped_grad} for non-finite gradient norm")
 
     mean_loss = float(np.mean(train_loss)) if train_loss else float('nan')
-    return mean_loss, end - start
+    extra = {
+        'mean_sup_loss': float(np.mean(sup_loss_hist)) if sup_loss_hist else float('nan'),
+        'mean_cons_loss': float(np.mean(cons_loss_hist)) if cons_loss_hist else float('nan'),
+        'n_sup_batches': len(sup_loss_hist),
+        'n_cons_batches': len(cons_loss_hist),
+    }
+    return mean_loss, end - start, extra
     
 
 global_step_test = 0
