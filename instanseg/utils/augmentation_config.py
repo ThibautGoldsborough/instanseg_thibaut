@@ -179,6 +179,7 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                     ("HistogramNormalize", [0.1, amount]),
                     ("add_noisy_channels", [0.3 if channel_invariance else 0, 5]),#Probability/ max total channels
                     ("channel_suppress", [1 if channel_invariance else 0, 0.3]),  #proba, supression_factor
+                    ("channel_shuffle", [0.5, amount]),  #Probability/Amount (unused), randomly permutes channels
                 ])
             },
             "test": {

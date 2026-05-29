@@ -3,7 +3,7 @@ import numpy as np
 import pdb
 
 from einops import rearrange
-from typing import Tuple, List, Union
+from typing import Tuple, List, Union, Optional
 from instanseg.utils.pytorch_utils import torch_fastremap, torch_onehot,fast_sparse_intersection_over_minimum_area, remap_values, fast_iou, fast_sparse_iou, connected_components, flood_fill,fill_holes, expand_labels_map
 from instanseg.utils.tiling import _instanseg_padding, _recover_padding
 
@@ -594,9 +594,8 @@ class ProbabilityNet(nn.Module):
         self.fc2 = nn.Linear(width, width)
         self.fc3 = nn.Linear(width, 1)
 
-    def forward(self, x, **kwargs):
+    def forward(self, x, seed_emb: Optional[torch.Tensor] = None, window_size: Optional[int] = None):
         # x is C*H*W,E+S+1 (H,W is the window of the crop used here, e.g 100x100, not the image)
-      #  with torch.cuda.amp.autocast():
         x = self._relu_non_empty(self.fc1(x))
         x = self._relu_non_empty(self.fc2(x))
         x = self.fc3(x)
@@ -712,7 +711,7 @@ class ConvProbabilityNet(nn.Module):
 
     
 
-    def forward(self, x, **kwargs):
+    def forward(self, x, seed_emb: Optional[torch.Tensor] = None, window_size: Optional[int] = None):
         # x is C*H*W,E+S+1 (H,W is the window of the crop used here, e.g 100x100, not the image)
 
         positional_embedding = guide_function(self.positional_embedding_params, width = 100)
@@ -1863,7 +1862,10 @@ class IdentityTransform:
 
         
 from instanseg.utils.biological_utils import resolve_cell_and_nucleus_boundaries
+from instanseg.utils.models.MaxViT import MaxViTRunWrapper, MaxViTPadCropWrapper
 from typing import Dict, Optional
+
+
 class InstanSeg_Torchscript(nn.Module):
     def __init__(self, model, 
                  cells_and_nuclei: bool = False,
@@ -1882,7 +1884,16 @@ class InstanSeg_Torchscript(nn.Module):
 
         with torch.amp.autocast("cuda", enabled=use_mixed_precision):
             with torch.no_grad():
-                self.fcn = torch.jit.trace(model, torch.rand(1, backbone_dim_in, 256, 256))
+                example = torch.rand(1, backbone_dim_in, 256, 256)
+                if hasattr(model, '_pad_multiple') and hasattr(model, '_run'):
+                    # MaxViT: trace the size-adaptive `_run` (timm internals), then
+                    # wrap with a scripted pad-and-crop so the model accepts arbitrary
+                    # input sizes. Direct trace bakes the pad conditional out as a constant.
+                    pad_multiple = int(model._pad_multiple)
+                    core_traced = torch.jit.trace(MaxViTRunWrapper(model), example)
+                    self.fcn = MaxViTPadCropWrapper(core_traced, pad_multiple)
+                else:
+                    self.fcn = torch.jit.trace(model, example)
 
         #from instanseg.utils.models.CellposeSam import SAM_UNet_inference
         #self.fcn = SAM_UNet_inference(self.fcn)
@@ -1918,7 +1929,7 @@ class InstanSeg_Torchscript(nn.Module):
         self.default_overlap_threshold = self.params.get('overlap_threshold', 0.3)
         self.default_mean_threshold = self.params.get('mean_threshold', 0.0)
         self.default_fg_threshold = self.params.get('fg_threshold', 0.5)
-        self.default_window_size = self.params.get('window_size',32) #32
+        self.default_window_size = self.params.get('window_size',64) #32
         self.default_cleanup_fragments = self.params.get('cleanup_fragments', True)
         self.default_resolve_cell_and_nucleus = self.params.get('resolve_cell_and_nucleus', True)
 
@@ -2076,7 +2087,10 @@ class InstanSeg_Torchscript(nn.Module):
                     coords = mesh_grid_flat.reshape(2, C, slice_size, slice_size)
 
                     if min_size > 0:
-                        valid_objects = (x >= mask_threshold).sum((2,3)).squeeze() > min_size
+                        # reshape(-1) -> (C,) regardless of C. A bare .squeeze() (or chained
+                        # .squeeze(-1).squeeze(-1)) collapses to a 0-d scalar when C == 1 and
+                        # triggers a CUDA boolean-indexing assert (OffsetCalculator.cuh:115).
+                        valid_objects = (x >= mask_threshold).sum((2,3)).reshape(-1) > min_size
                         x = x[valid_objects]
                         coords = coords[:,valid_objects]
                         mesh_grid_flat = coords.flatten(1)

@@ -42,8 +42,20 @@ def train_epoch(train_model,
         output = train_model(image_batch)
         loss = train_loss_fn(output, labels.clone()).mean()
 
-        if skip_bad_batches and not torch.isfinite(loss):
-            warnings.warn(f"Skipping batch: non-finite loss ({loss.item()})")
+        # DDP: sync the skip decision across ranks. If any rank has a non-finite
+        # loss, *all* ranks must skip — otherwise the surviving ranks call
+        # accelerator.backward(...) and hang in NCCL waiting for the rank that
+        # bailed out via `continue`. Note: `not torch.isfinite(loss)` is a
+        # Python bool (0-d tensor → __bool__), so use `~` to keep it as a tensor.
+        local_bad_loss = (~torch.isfinite(loss)).to(torch.float32).detach()
+        if accelerator is not None and accelerator.num_processes > 1:
+            any_bad_loss = accelerator.reduce(local_bad_loss, reduction="sum").item() > 0
+        else:
+            any_bad_loss = local_bad_loss.item() > 0
+
+        if skip_bad_batches and any_bad_loss:
+            if local_bad_loss.item() > 0:
+                warnings.warn(f"Skipping batch: non-finite loss ({loss.item()})")
             train_optimizer.zero_grad(set_to_none=True)
             skipped_loss += 1
             continue
@@ -56,6 +68,9 @@ def train_epoch(train_model,
             loss.backward()
             total_norm = torch.nn.utils.clip_grad_norm_(train_model.parameters(), args.clip)
 
+        # accelerator.clip_grad_norm_ returns the synced (global) norm, so the
+        # skip decision below is already identical on every rank — no extra
+        # all-reduce needed here.
         if skip_bad_batches and not torch.isfinite(total_norm):
             warnings.warn(f"Skipping batch: non-finite gradient norm ({total_norm.item()})")
             train_optimizer.zero_grad(set_to_none=True)

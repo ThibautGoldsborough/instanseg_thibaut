@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import dataclasses
 from typing import Optional, Sequence
 
@@ -413,6 +411,43 @@ def maxvit_large(in_channels: int, out_channels, **kwargs) -> MaxViT:
     # with MBConv x4 expansion blow past typical GPU memory.
     kwargs.setdefault("gradient_checkpointing", True)
     return _make_preset("large", in_channels, out_channels, **kwargs)
+
+
+# ---------------------------------------------------------------------------- torchscript wrappers
+class MaxViTRunWrapper(nn.Module):
+    """Exposes MaxViT._run as forward so tracing skips the pad-and-crop
+    conditional in MaxViT.forward (which gets baked as a constant by trace)."""
+    def __init__(self, inner: nn.Module):
+        super().__init__()
+        self._inner = inner
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self._inner._run(x)
+
+
+class MaxViTPadCropWrapper(nn.Module):
+    """Scripted pad-and-crop wrapper around a traced MaxViT core. Pads H/W up
+    to the next multiple of ``pad_multiple`` (replicate), calls the core, then
+    crops back. Lets the traced core run on arbitrary input sizes."""
+    pad_multiple: int
+
+    def __init__(self, core: nn.Module, pad_multiple: int):
+        super().__init__()
+        self.core = core
+        self.pad_multiple = pad_multiple
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        H = x.shape[-2]
+        W = x.shape[-1]
+        m = self.pad_multiple
+        pad_h = (-H) % m
+        pad_w = (-W) % m
+        if pad_h > 0 or pad_w > 0:
+            x = F.pad(x, [0, pad_w, 0, pad_h], mode='replicate')
+        y = self.core(x)
+        if pad_h > 0 or pad_w > 0:
+            y = y[..., :H, :W]
+        return y
 
 
 if __name__ == "__main__":

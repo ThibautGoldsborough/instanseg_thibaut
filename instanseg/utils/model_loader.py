@@ -343,6 +343,63 @@ def has_pixel_classifier_model(model):
     return False
 
 
+def duplicate_decoder_heads(model, state_dict):
+    """Warm-start the cell branch of an NC model from a single-task (N or C) checkpoint.
+
+    A ``cells_and_nuclei`` (NC) MaxViT has twice as many decoder heads as a
+    single-task model: ``heads.0..K-1`` for one task and ``heads.K..2K-1`` for
+    the other (see ``model_loader.build_model_from_dict`` / ``_MaxViTDecoder``).
+    A checkpoint trained with ``-target N`` only contains ``heads.0..K-1``, so a
+    strict load fails with missing keys for the cell heads. This copies each
+    existing head ``i`` into the matching missing head ``i + K`` so both task
+    branches start from the trained single-task weights.
+
+    Mutates and returns ``state_dict``. Only acts when a decoder's model head
+    count is exactly twice the checkpoint's; any other mismatch is left for the
+    subsequent strict load to report.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        The freshly built (NC) model whose ``state_dict`` defines the target keys.
+    state_dict : dict[str, torch.Tensor]
+        The checkpoint state dict to augment in place.
+
+    Returns
+    -------
+    tuple[dict[str, torch.Tensor], bool]
+        The (possibly augmented) state dict and whether any head was duplicated.
+    """
+    import re
+    head_re = re.compile(r"^(decoders\.\d+\.heads\.)(\d+)(\..*)$")
+
+    def _heads_by_prefix(keys: "list[str]") -> "dict[str, set[int]]":
+        out: dict[str, set[int]] = {}
+        for k in keys:
+            m = head_re.match(k)
+            if m:
+                out.setdefault(m.group(1), set()).add(int(m.group(2)))
+        return out
+
+    model_keys = set(model.state_dict().keys())
+    model_heads = _heads_by_prefix(list(model_keys))
+    ckpt_heads = _heads_by_prefix(list(state_dict.keys()))
+
+    duplicated = False
+    for prefix, m_idx in model_heads.items():
+        c_idx = ckpt_heads.get(prefix, set())
+        n_model, n_ckpt = len(m_idx), len(c_idx)
+        if n_ckpt == 0 or n_model != 2 * n_ckpt:
+            continue  # not the single->double head case; leave it to strict load
+        for k in [key for key in state_dict if key.startswith(prefix)]:
+            m = head_re.match(k)
+            dst_key = f"{prefix}{int(m.group(2)) + n_ckpt}{m.group(3)}"
+            if dst_key in model_keys and dst_key not in state_dict:
+                state_dict[dst_key] = state_dict[k].clone()
+                duplicated = True
+    return state_dict, duplicated
+
+
 def load_model_weights(model, device, folder, path=r"../models/", dict = None):
     import torch
     from pathlib import Path
@@ -376,6 +433,12 @@ def load_model_weights(model, device, folder, path=r"../models/", dict = None):
     #from instanseg.utils.AI_utils import set_running_stats
     #set_running_stats(model,device = "cuda")
 
+    model_dict['model_state_dict'], _duplicated_heads = duplicate_decoder_heads(
+        model, model_dict['model_state_dict'])
+    model_dict['duplicated_decoder_heads'] = _duplicated_heads
+    if _duplicated_heads:
+        print("Warm-starting cell decoder heads by duplicating the single-task "
+              "(nuclei) heads from the checkpoint into the NC model.")
 
     model.load_state_dict(model_dict['model_state_dict'], strict=True)
     model.to(device)

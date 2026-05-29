@@ -460,6 +460,14 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
                 # Skip loading optimizer state dict — LoRA changes parameter groups
                 if is_main:
                     print("LoRA enabled: skipping optimizer state dict (parameter groups changed)")
+            elif model_dict.get('duplicated_decoder_heads', False):
+                optimizer = get_optimizer(model.parameters(), args)
+                # Skip loading optimizer state dict — warm-starting an NC model
+                # from a single-task checkpoint adds decoder heads, so the
+                # parameter groups no longer match.
+                if is_main:
+                    print("Warm-started NC heads: skipping optimizer state dict "
+                          "(parameter groups changed)")
             else:
                 optimizer = get_optimizer(model.parameters(),args)
                 optimizer.load_state_dict(model_dict['optimizer_state_dict'])

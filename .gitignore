@@ -39,3 +39,5 @@ dist/
 env
 analyze_mask_areas.py
 /.claude
+CLAUDE.md
+/instanseg/.claude

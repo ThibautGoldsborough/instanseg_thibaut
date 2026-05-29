@@ -222,30 +222,52 @@ def _read_images_from_pth(data_path= "../datasets", dataset = "segmentation", da
         else:
             path_of_pth = os.path.join(data_path,str(dataset + "_dataset.pth"))
 
-        print("Loading dataset from ", os.path.abspath(path_of_pth))
+        # Resolve which sources the user asked for so we can skip loading parts
+        # (and the monolithic pth) we don't actually need.
+        def _norm(s: str) -> str:
+            return str(s).lower().replace("-", "_")
 
-        if os.path.exists(path_of_pth):
-            try:
-                complete_dataset = torch.load(path_of_pth,weights_only = False)
-            except:
-                complete_dataset = torch.load(path_of_pth)
+        src = getattr(args, "source_dataset", "all") if args is not None else "all"
+        if src == "all" or src == ["all"]:
+            requested = None
+        elif isinstance(src, str):
+            requested = {_norm(src)}
         else:
-            complete_dataset = {}
+            requested = {_norm(s) for s in src}
 
-        # Merge any per-dataset pth files dropped into <data_path>/parts/.
-        # Each part is itself a {Train, Validation, Test} dict; their item lists
-        # are concatenated onto the main dataset. This lets new datasets be added
-        # without rebuilding the monolithic pth.
         parts_dir = Path(data_path) / "parts"
+        parts_by_stem = {}
         if parts_dir.is_dir():
-            for part_path in sorted(parts_dir.glob("*.pth")):
-                print(f"Merging dataset part from {part_path}")
+            for p in sorted(parts_dir.glob("*.pth")):
+                parts_by_stem[_norm(p.stem)] = p
+
+        if requested is None:
+            parts_to_load = list(parts_by_stem.values())
+            load_monolith = True
+        else:
+            parts_to_load = [parts_by_stem[s] for s in requested if s in parts_by_stem]
+            # Only fall back to the monolith if some requested source isn't covered by a part.
+            load_monolith = not all(s in parts_by_stem for s in requested)
+
+        complete_dataset = {}
+        if load_monolith:
+            print("Loading dataset from ", os.path.abspath(path_of_pth))
+            if os.path.exists(path_of_pth):
                 try:
-                    part = torch.load(str(part_path), weights_only=False)
+                    complete_dataset = torch.load(path_of_pth, weights_only=False)
                 except:
-                    part = torch.load(str(part_path))
-                for _set, items in part.items():
-                    complete_dataset.setdefault(_set, []).extend(items)
+                    complete_dataset = torch.load(path_of_pth)
+        else:
+            print(f"Skipping monolithic dataset (requested sources covered by parts: {sorted(requested)})")
+
+        for part_path in parts_to_load:
+            print(f"Merging dataset part from {part_path}")
+            try:
+                part = torch.load(str(part_path), weights_only=False)
+            except:
+                part = torch.load(str(part_path))
+            for _set, items in part.items():
+                complete_dataset.setdefault(_set, []).extend(items)
     
 
     data_dicts = {}
@@ -370,8 +392,8 @@ def get_loaders(train_images_local, train_labels_local, val_images_local, val_la
 
 
     train_loader = DataLoader(train_data, collate_fn=collate_fn, batch_size=args.batch_size, num_workers=args.num_workers,
-                              sampler=train_sampler, persistent_workers=True)
+                              sampler=train_sampler, persistent_workers=True, drop_last=True)
     test_loader = DataLoader(test_data, collate_fn=collate_fn, batch_size=args.batch_size, num_workers=args.num_workers,
-                             sampler=test_sampler, persistent_workers=True)
+                             sampler=test_sampler, persistent_workers=True, drop_last=True)
 
     return train_loader, test_loader

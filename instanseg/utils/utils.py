@@ -462,13 +462,21 @@ def download_model(model_str: str, version: Optional[str] = None, verbose: bool 
             if verbose:
                 print(f"Assuming model is stored under {bioimageio_path}/{model_str}/{version}...")
             model_path = model_str + os.path.sep + version
-        path_to_torchscript_model = os.path.join(bioimageio_path, model_path, "instanseg.pt")
 
-        if os.path.exists(path_to_torchscript_model):
-            return torch.jit.load(path_to_torchscript_model)
-        else:
-            raise Exception(
-                f"Model {path_to_torchscript_model} version {version} not found in the release data or locally. Please check the model name and try again.")
+        candidate_paths = [
+            os.path.join(bioimageio_path, model_path, "instanseg.pt"),
+            os.path.join(bioimageio_path, "local", model_path, "instanseg.pt"),
+        ]
+
+        for path_to_torchscript_model in candidate_paths:
+            if os.path.exists(path_to_torchscript_model):
+                if verbose:
+                    print(f"Loading local model from {path_to_torchscript_model}")
+                return torch.jit.load(path_to_torchscript_model)
+
+        raise Exception(
+            f"Model {model_str} version {version} not found in the release data or locally "
+            f"(searched: {', '.join(candidate_paths)}). Please check the model name and try again.")
 
 
 def _filter_kwargs(func, kwargs):
