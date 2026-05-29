@@ -532,7 +532,10 @@ class Augmentations(object):
         my_stains = [torch.clone(stains['hematoxylin'])]
         channels = [im_nuclei]
 
-        if np.random.random() > 0.1:
+        if np.random.random() > 0.1 and len(image) > 1:
+            # Add a second (DAB) stain from a non-nuclei channel. Only possible
+            # when there is more than one channel; a single-channel image yields
+            # a hematoxylin-only rendering.
             my_stains.append(torch.clone(stains['dab']))
 
             all_channels = np.arange(len(image))
