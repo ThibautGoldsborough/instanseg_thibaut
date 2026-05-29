@@ -110,6 +110,16 @@ exclude = ["scratch_notebooks/**","notebooks/**", "instanseg/examples/*", "asset
 Homepage = "https://github.com/instanseg/instanseg"
 Issues = "https://github.com/instanseg/instanseg/issues"
 
+[tool.uv]
+# Guardrail: ome-zarr -> fsspec[s3] -> s3fs pulls in boto3/botocore transitively.
+# The 2018 s3fs 0.2.0 sdist declares no requires-python, so a fresh resolution
+# (e.g. `uv run --with ...` which bypasses the lock) can select it on Python
+# 3.11, dragging in botocore 1.10.84 whose vendored urllib3 does
+# `from collections import Mapping` (removed in 3.10) and crashes at import.
+# Floor-pin so that ancient stack can never be chosen, regardless of how the
+# environment is resolved.
+constraint-dependencies = ["s3fs>=2023.1.0", "botocore>=1.34"]
+
 [tool.tox]
 env_list = ["py3"]
 
