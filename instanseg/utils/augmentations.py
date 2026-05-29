@@ -512,7 +512,10 @@ class Augmentations(object):
 
         if metadata is not None and metadata["image_modality"] != "Fluorescence":
             return image, labels
-        
+
+        if c_nuclei is None:
+            c_nuclei = 0  # No nuclei channel specified; assume channel 0 (mirrors colourize)
+
         image , _ , c_nuclei= self.extract_nucleus_and_cytoplasm_channels(image, labels, c_nuclei, metadata)
 
         image = percentile_normalize(image, 0.01, subsampling_factor=5)

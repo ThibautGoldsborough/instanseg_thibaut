@@ -26,6 +26,12 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
     # Channel subsample probability: always run if dim_in==1 (to reduce multi-channel to 1), else skip
     channel_subsample_prob = 1 if dim_in == 1 else 0
 
+    # colourize outputs exactly 3 channels, so for a fixed 3-channel (RGB) model
+    # it doubles as the channel reducer: it must always run on multi-channel
+    # fluorescence to coerce to 3 channels (it early-returns on already-3ch /
+    # brightfield). For channel-invariant models it is only an optional aug.
+    colourize_reduce = dim_in == 3
+
     if augmentation_type == "minimal":
 
         augmentation_dict = {
@@ -163,11 +169,11 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                     ("normalize", [1]), #Probability
                     ("torch_rescale", [1,pixel_size, pixel_size_range_heavy]),#in microns per pixel
                     ("channel_subsample", [channel_subsample_prob, (dim_in, dim_in)]),  #proba,(min,max)
-                    ("pseudo_brightfield", [0, nuclei_channel]),
+                    ("pseudo_brightfield", [0.2, nuclei_channel]),
                     ("randomJPEGcompression", [0.2, amount]),
                     ("extract_nucleus_and_cytoplasm_channels", [0.05 if channel_invariance else 0, amount]),
                     ("pseudo_imc", [0, amount]),
-                    ("colourize", [0.1 if channel_invariance else 0, nuclei_channel]),
+                    ("colourize", [0.1 if channel_invariance else (1 if colourize_reduce else 0), nuclei_channel]),
                    # ("draw_shapes", [0.05, amount]),
                     ("flips", [1]),
                     ("rotate", [1]),
@@ -202,7 +208,7 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                     ("channel_subsample", [channel_subsample_prob, (dim_in, dim_in)]),  #proba,(min,max)
                     ("pseudo_brightfield", [0 if not channel_invariance else 0, nuclei_channel]),
                     ("extract_nucleus_and_cytoplasm_channels", [0, amount]),
-                    ("colourize", [0 if not channel_invariance else 0, nuclei_channel]),
+                    ("colourize", [1 if colourize_reduce else 0, nuclei_channel]),
                     ("flips", [1])
 
                 ])
