@@ -391,9 +391,13 @@ def get_loaders(train_images_local, train_labels_local, val_images_local, val_la
             test_sampler = WeightedRandomSampler(rel_freq, len(freq))
 
 
+    # persistent_workers=False: workers are torn down and re-forked each epoch.
+    # With the dataset held as in-memory arrays, persistent workers slowly
+    # privatize those arrays via copy-on-write refcount writes, growing RSS every
+    # epoch until OOM (~epoch 17 on 6-rank DDP). Re-forking resets that each epoch.
     train_loader = DataLoader(train_data, collate_fn=collate_fn, batch_size=args.batch_size, num_workers=args.num_workers,
-                              sampler=train_sampler, persistent_workers=True, drop_last=True)
+                              sampler=train_sampler, persistent_workers=False, drop_last=True)
     test_loader = DataLoader(test_data, collate_fn=collate_fn, batch_size=args.batch_size, num_workers=args.num_workers,
-                             sampler=test_sampler, persistent_workers=True, drop_last=True)
+                             sampler=test_sampler, persistent_workers=False, drop_last=True)
 
     return train_loader, test_loader
