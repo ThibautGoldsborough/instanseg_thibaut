@@ -241,16 +241,34 @@ def instance_wise_edt(x: torch.Tensor, edt_type: str = 'auto') -> torch.Tensor:
     use_edt = edt_type == 'edt' or (edt_type != 'monai' and not x.is_cuda)
     if use_edt:
         import edt
-        xedt = torch.from_numpy(edt.edt(x[0].cpu().numpy(), black_border=False))
-        x = torch_onehot(x)[0] * xedt.to(x.device)
+        H, W = x.shape[-2:]
+        # edt.edt is label-aware: it already yields the correct per-instance
+        # distance for every pixel in a single [H, W] map. Normalise each
+        # instance by its own max via a 1-D scatter_reduce over label ids,
+        # avoiding the dense [C, H, W] one-hot tensor (O(H*W) vs O(C*H*W) mem).
+        labels = x.reshape(H, W).long()
+        xedt = torch.from_numpy(
+            edt.edt(x[0].cpu().numpy(), black_border=False)
+        ).to(x.device).reshape(H, W).float()
+
+        flat_labels = labels.reshape(-1)
+        flat_edt = xedt.reshape(-1)
+        n_labels = int(flat_labels.max().item()) + 1
+        max_per_label = torch.zeros(n_labels, device=x.device, dtype=flat_edt.dtype)
+        max_per_label.scatter_reduce_(
+            0, flat_labels, flat_edt, reduce='amax', include_self=False
+        )
+        out = flat_edt / max_per_label[flat_labels].clamp_min(1e-6)
+        out[flat_labels == 0] = 0.0
+        x = out.reshape(H, W)
     else:
         import monai
         x = torch_onehot(x)
         x = monai.transforms.utils.distance_transform_edt(x[0])
 
-    # Normalize instance distances to have max 1
-    x = x / (x.flatten(1).max(1)[0]).view(-1, 1, 1)
-    x = x.sum(0)
+        # Normalize instance distances to have max 1
+        x = x / (x.flatten(1).max(1)[0]).view(-1, 1, 1)
+        x = x.sum(0)
 
     if is_mps:
         x = x.type(torch.FloatTensor).to('mps')
