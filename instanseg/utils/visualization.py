@@ -319,6 +319,7 @@ def save_image_with_label_overlay(im: np.ndarray,
     :return: The input image with corresponding label overlay if lab is a torch Tensor, or nothing otherwise.
     """
     import imageio
+    from scipy import ndimage as ndi
     from skimage.segmentation import find_boundaries
     from skimage import morphology
 
@@ -331,8 +332,8 @@ def save_image_with_label_overlay(im: np.ndarray,
 
         if lab.shape[0] == 1:
             lab = lab[0]
-            image_overlay = save_image_with_label_overlay(im, lab=lab, return_image=True, label_boundary_mode="thick",
-                                                          label_colors=label_colors, thickness=5, alpha=1)
+            image_overlay = save_image_with_label_overlay(im, lab=lab, return_image=True, label_boundary_mode="inner",
+                                                          label_colors=label_colors, thickness=1, alpha=1)
         elif lab.shape[0] == 2:
             nuclei_labels_for_display = lab[0]
             cell_labels_for_display = lab[1]
@@ -377,16 +378,33 @@ def save_image_with_label_overlay(im: np.ndarray,
 
     # Convert labels to boundaries, if required
     if label_boundary_mode is not None:
-        bw_boundaries = find_boundaries(lab, mode=label_boundary_mode)
         lab = lab.copy()
-        # Need to expand labels for outer boundaries, but have to avoid overwriting known labels
         if label_boundary_mode in ['thick', 'outer']:
-            lab2 = morphology.dilation(lab, footprint=np.ones((thickness, thickness)))
+            # Outer boundary: grow each instance outward into the background only.
+            # Background boundary pixels are assigned to their *nearest* instance
+            # (via the EDT) rather than the max label in a window, so a neighbour's
+            # colour can never leak across the gap between two instances.
+            bw_boundaries = find_boundaries(lab, mode=label_boundary_mode)
+            if thickness > 1:
+                _, (yi, xi) = ndi.distance_transform_edt(lab == 0, return_indices=True)
+                nearest = lab[yi, xi]
+            else:
+                nearest = morphology.dilation(lab, footprint=np.ones((3, 3)))
             mask_dilated = bw_boundaries & (lab == 0)
-
-            lab[mask_dilated] = lab2[mask_dilated]
-        lab[~bw_boundaries] = 0
-        mask_temp = bw_boundaries
+            lab[mask_dilated] = nearest[mask_dilated]
+            lab[~bw_boundaries] = 0
+            mask_temp = lab != 0
+        else:
+            # Inner boundary: stays strictly within each instance, so colours never
+            # bleed across instance borders. Thickness is an inner erosion ring so
+            # every ring pixel keeps its own instance's label.
+            if thickness > 1:
+                eroded = morphology.erosion(lab, footprint=morphology.disk(thickness))
+                bw_boundaries = (lab != eroded) & (lab != 0)
+            else:
+                bw_boundaries = find_boundaries(lab, mode=label_boundary_mode) & (lab != 0)
+            lab[~bw_boundaries] = 0
+            mask_temp = bw_boundaries
     else:
         mask_temp = lab != 0
 
@@ -463,13 +481,13 @@ def _display_overlay(im, lab):
     if output_dimension == 1:  # Nucleus or cell mask
         labels_for_display = lab[0, 0].cpu().numpy()  # Shape is 1,H,W
         image_overlay = save_image_with_label_overlay(im_for_display, lab=labels_for_display, return_image=True,
-                                                      label_boundary_mode="thick", label_colors=None, thickness=10,
+                                                      label_boundary_mode="inner", label_colors=None, thickness=1,
                                                       alpha=0.5)
     elif output_dimension == 2:  # Nucleus and cell mask
         nuclei_labels_for_display = lab[0, 0].cpu().numpy()
         cell_labels_for_display = lab[0, 1].cpu().numpy()  # Shape is 1,H,W
         image_overlay = save_image_with_label_overlay(im_for_display, lab=nuclei_labels_for_display, return_image=True,
-                                                      label_boundary_mode="thick", label_colors="red", thickness=10)
+                                                      label_boundary_mode="inner", label_colors="red", thickness=2)
         image_overlay = save_image_with_label_overlay(image_overlay, lab=cell_labels_for_display, return_image=True,
                                                       label_boundary_mode="inner", label_colors="green", thickness=1)
     return image_overlay

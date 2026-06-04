@@ -354,8 +354,9 @@ def _sliding_window_inference(input_tensor,
  
     assert len(tile_list) > 0, "No tiles generated"
 
+    from instanseg.utils.pytorch_utils import amp_dtype
     with torch.no_grad():
-        with torch.amp.autocast("cuda"):
+        with torch.amp.autocast("cuda", dtype=amp_dtype()):
             batch_list = [torch.stack(tile_list[batch_size * i:batch_size * (i+1)]) for i in range(int(np.ceil(len(tile_list)/batch_size)))]
             label_list = torch.cat([predictor(tile.to(sw_device),**instanseg_kwargs).to(device) for tile in tqdm(batch_list, disable= not show_progress,leave = False, colour = "blue")])
  

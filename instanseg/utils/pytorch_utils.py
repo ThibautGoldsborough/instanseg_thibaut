@@ -4,6 +4,26 @@ from typing import Tuple, Union
 import numpy as np
 
 
+def amp_dtype() -> torch.dtype:
+    """Pick the autocast dtype for CUDA inference.
+
+    The default `torch.amp.autocast('cuda')` uses float16, whose ~65504 range
+    is exceeded by intermediate activations in larger MaxViT backbones (e.g.
+    maxvit_large) at certain spatial sizes. The overflow becomes ``inf`` and
+    then ``NaN`` inside MaxViT's global (grid-attention) ops, which contaminates
+    the entire feature map -> empty seed map -> zero detected objects. This is
+    size-dependent (it tracks the attention window/grid partitioning), so it
+    surfaces intermittently and never appeared with maxvit_tiny.
+
+    bfloat16 has float32's exponent range (so no overflow) with float16-class
+    speed/memory, and matches the float32 output here to 3+ decimals. We use it
+    when supported, falling back to float32 otherwise.
+    """
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float32
+
+
 def remap_values(remapping: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     """
     This remaps the values in x according to the pairs in the remapping tensor.

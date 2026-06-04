@@ -21,7 +21,11 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
 
     # Pixel size range for augmentation (min_pixel_size, max_pixel_size)
     pixel_size_range_light = (pixel_size * 0.9, pixel_size * 1.1) if pixel_size else None  # ±10%
-    pixel_size_range_heavy = (pixel_size * 0.5, pixel_size * 1.5) if pixel_size else None  # ±50%
+    # Heavy range matches the Cellpose-SAM size augmentation: the applied resize
+    # scale is log-uniform over 0.25x–4x (i.e. ±2 octaves), sampled in
+    # augmentations.torch_rescale by drawing requested_pixel_size log-uniformly
+    # from this 0.25x–4x window around the nominal pixel size.
+    pixel_size_range_heavy = (pixel_size * 0.25, pixel_size * 4.0) if pixel_size else None  # 0.25x–4x, log-uniform
     
     # Channel subsample probability: always run if dim_in==1 (to reduce multi-channel to 1), else skip
     channel_subsample_prob = 1 if dim_in == 1 else 0

@@ -1003,9 +1003,15 @@ class Augmentations(object):
                 elif augmentation == "torch_rescale":
                     _, requested_pixel_size, pixel_size_range = values
                     if isinstance(pixel_size_range, tuple) and len(pixel_size_range) == 2:
-                        # Randomly sample pixel size from range (min_ps, max_ps)
+                        # Log-uniformly sample the requested pixel size from
+                        # (min_ps, max_ps). Sampling requested_pixel_size
+                        # log-uniformly in [min_ps, max_ps] is equivalent to
+                        # sampling the applied resize scale (= current / requested)
+                        # log-uniformly over the inverse range, matching the
+                        # Cellpose-SAM scale augmentation (scale = 2**(4*rand - 2)).
                         min_ps, max_ps = pixel_size_range
-                        requested_pixel_size = min_ps + torch.rand(1).item() * (max_ps - min_ps)
+                        log_min, log_max = np.log(min_ps), np.log(max_ps)
+                        requested_pixel_size = float(np.exp(log_min + torch.rand(1).item() * (log_max - log_min)))
                         
                     image, labels = self.torch_rescale(image, labels, current_pixel_size=None,
                                                        requested_pixel_size=requested_pixel_size, 
