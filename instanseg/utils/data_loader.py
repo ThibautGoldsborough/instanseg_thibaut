@@ -315,11 +315,12 @@ def get_loaders(train_images_local, train_labels_local, val_images_local, val_la
         import torch
         torch.manual_seed(args.rng_seed)
 
-    augmentation_dict = get_augmentation_dict(args.dim_in, 
-                                              nuclei_channel=None, 
+    augmentation_dict = get_augmentation_dict(args.dim_in,
+                                              nuclei_channel=None,
                                               amount=args.transform_intensity,
                                               pixel_size=args.requested_pixel_size,
-                                              augmentation_type=args.augmentation_type)
+                                              augmentation_type=args.augmentation_type,
+                                              use_instance_channels=args.use_instance_channels)
 
     train_data = Segmentation_Dataset(train_images_local, 
                                       train_labels_local, 

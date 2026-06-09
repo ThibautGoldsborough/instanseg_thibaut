@@ -153,6 +153,7 @@ def _build_eval_dataset(train_dataset, args):
         amount=args.transform_intensity,
         pixel_size=args.requested_pixel_size,
         augmentation_type=args.augmentation_type,
+        use_instance_channels=args.use_instance_channels,
     )
     return Segmentation_Dataset(
         train_dataset.X,

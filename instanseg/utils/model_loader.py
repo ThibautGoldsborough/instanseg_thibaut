@@ -186,6 +186,8 @@ def build_model_from_dict(build_model_dictionary, random_seed = None):
                 # matches, so any nested autocast is a no-op instead of a
                 # dtype-switching mid-forward mismatch.
                 amp_dtype=_torch.float16 if _use_fp16 else _torch.bfloat16,
+                compile=bool(build_model_dictionary.get("compile", False)),
+                compile_mode=build_model_dictionary.get("compile_mode", "default"),
             )
             # "maxvit" alone is treated as the tiny preset for back-compat.
             if maxvit_name in ("maxvit", "maxvit_tiny"):

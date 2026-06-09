@@ -686,6 +686,42 @@ class Augmentations(object):
 
         return out, labels
 
+    def add_instance_channels(self, image, labels=None, n_instances=5, amount=None, metadata=None):
+        """Append binary masks of randomly chosen ground-truth instances as new image channels.
+
+        Picks a random number (1..``n_instances``) of distinct instances from the first
+        label channel and concatenates each as its own binary (0/1) channel to the image.
+        Acts as a prompt/hint signal; only meaningful for channel-invariant models since it
+        changes the channel count. No-op if there are no labelled instances.
+
+        :param image: A tensor of shape C,H,W.
+        :param labels: Instance labels of shape C,H,W; instances are sampled from ``labels[0]``.
+        :param n_instances: Maximum number of instance-mask channels to append.
+        """
+        if self.debug:
+            orig = torch.clone(image)
+
+        if labels is None or labels.shape[0] == 0:
+            return image, labels
+
+        lab = labels[0]
+        instance_ids = torch.unique(lab)
+        instance_ids = instance_ids[instance_ids > 0]
+
+        if len(instance_ids) == 0:
+            return image, labels
+
+        n_to_add = int(np.random.randint(1, min(int(n_instances), len(instance_ids)) + 1))
+        chosen = instance_ids[torch.randperm(len(instance_ids))[:n_to_add]]
+
+        masks = torch.stack([(lab == iid) for iid in chosen]).to(image.dtype)  # (n_to_add, H, W)
+        out = torch.cat([image, masks], dim=0)
+
+        if self.debug:
+            print("Add instance channels")
+            show_images([orig, out], titles=["Original", "Transformed"])
+        return out, labels
+
     # @measure_time
     def add_gradient(self, image, labels=None, amount=0, metadata=None):
         if self.debug:
@@ -1025,6 +1061,10 @@ class Augmentations(object):
                 elif augmentation == "add_noisy_channels":
                     _, max_channels = values
                     image, labels = self.add_noisy_channels(image, labels, metadata=metadata, max_channels=max_channels, amount = 0.5)
+
+                elif augmentation == "add_instance_channels":
+                    _, n_instances = values
+                    image, labels = self.add_instance_channels(image, labels, n_instances=n_instances, metadata=metadata)
 
                 else:
                     p, *rest = values

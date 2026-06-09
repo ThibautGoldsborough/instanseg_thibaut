@@ -1,6 +1,6 @@
 import collections
 
-def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentation_type="minimal"):
+def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentation_type="minimal", use_instance_channels=True):
 
     """
     This function returns the augmentation dictionary for the training and test sets.
@@ -11,7 +11,8 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
         nuclei_channel (int): The channel that contains the nuclei
         amount (float): The amount of augmentation to apply (between 0 and 1)
         minmax (tuple): The min and max values instance surface area to rescale the image to. If None, rescaling is done on a per image basis.
-    
+        use_instance_channels (bool): Whether to enable the add_instance_channels augmentation (appends binary masks of random GT instances as extra channels). Only active for channel-invariant models.
+
     In the augmentations.py file, the image modality is automatically determined by checking if the mean pixel
     values under the labels is darker than the mean pixel values of the background. If so, the image is assumed to be brightfield.
     
@@ -35,6 +36,14 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
     # fluorescence to coerce to 3 channels (it early-returns on already-3ch /
     # brightfield). For channel-invariant models it is only an optional aug.
     colourize_reduce = dim_in == 3
+
+    # Master switch for the instance-mask prompt augmentation (add_instance_channels):
+    # appends binary masks of random GT instances as extra channels. Only valid for
+    # channel-invariant models since it changes the channel count, so it is gated on
+    # channel_invariance regardless. Controlled by the `use_instance_channels`
+    # argument (CLI: --use_instance_channels); set to False to disable everywhere.
+    add_instance_channels_prob = 0.3 if (use_instance_channels and channel_invariance) else 0
+    add_instance_channels_max = 5
 
     if augmentation_type == "minimal":
 
@@ -159,6 +168,7 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                     ("RandGaussianNoise", [0.2, amount]),#Probability/Amount
                     ("perspective", [0.2, amount]),#Probability/Amount
                     ("elastic", [0.2, amount]),#Probability/Amount
+                    ("add_instance_channels", [add_instance_channels_prob, add_instance_channels_max]),  #proba, max instance-mask channels
                 ]),
                 "phase-contrast": collections.OrderedDict([
                     ("to_tensor", [1]), #Probability
@@ -167,6 +177,7 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                     ("flips", [1]),#Probability
                     ("rotate", [1]),#Probability
                     ("kornia_base_augmentations", [1]),
+                    ("add_instance_channels", [add_instance_channels_prob, add_instance_channels_max]),  #proba, max instance-mask channels
                 ]),
                 "Fluorescence": collections.OrderedDict([
                     ("to_tensor", [1]),
@@ -190,6 +201,7 @@ def get_augmentation_dict(dim_in,nuclei_channel,amount,pixel_size=0.5, augmentat
                     ("add_noisy_channels", [0.3 if channel_invariance else 0, 5]),#Probability/ max total channels
                     ("channel_suppress", [1 if channel_invariance else 0, 0.3]),  #proba, supression_factor
                     ("channel_shuffle", [0.5, amount]),  #Probability/Amount (unused), randomly permutes channels
+                    ("add_instance_channels", [add_instance_channels_prob, add_instance_channels_max]),  #proba, max instance-mask channels
                 ])
             },
             "test": {
