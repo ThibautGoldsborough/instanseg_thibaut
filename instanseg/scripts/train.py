@@ -68,7 +68,7 @@ parser.add_argument('-dim_seeds', '--dim_seeds', default=1, type=int, help = "Nu
 parser.add_argument('-norm', '--norm', default="BATCH", type=str, help = "Norm layer to use: None, INSTANCE, INSTANCE_INVARIANT, BATCH")
 parser.add_argument('-mlp_w', '--mlp_width', default=5, type=int, help = "Width of the MLP hidden dim")
 parser.add_argument('-augmentation_type', '--augmentation_type', default="minimal", type=str, help = "'minimal' or 'heavy' or 'brightfield_only'")
-parser.add_argument('-use_instance_channels', '--use_instance_channels', default=True, type=lambda x: (str(x).lower() == 'true'), help = "Enable the add_instance_channels augmentation (appends binary masks of random GT instances as extra channels). Only active for channel-invariant models.")
+parser.add_argument('-use_instance_channels', '--use_instance_channels', default=False, type=lambda x: (str(x).lower() == 'true'), help = "Enable the add_instance_channels augmentation (appends binary masks of random GT instances as extra channels). Only active for channel-invariant models.")
 parser.add_argument('-show_augmentations', '--show_augmentations', default=False, type=lambda x: (str(x).lower() == 'true'), help = "Save 10 example augmented image+label pairs to the output folder")
 parser.add_argument('-adaptor_net', '--adaptor_net_str', default="1", type=str, help = "Adaptor net to use")
 parser.add_argument('-freeze', '--freeze_main_model', default=False, type=lambda x: (str(x).lower() == 'true'), help = "Whether to freeze the main model")
