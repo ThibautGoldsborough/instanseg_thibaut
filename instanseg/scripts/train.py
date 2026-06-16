@@ -38,7 +38,7 @@ parser.add_argument('-len_epoch', '--length_of_epoch', default=1000, type=int, h
 parser.add_argument('-len_eval', '--length_of_eval', default=200, type=int, help = "Number of validation samples per epoch")
 parser.add_argument("-lr", "--lr", type=float, default=0.001, help = "Learning rate")
 parser.add_argument("-optim", "--optimizer", type=str, default="adamw", help = "Optimizer to use, adam, sgd or adamw")
-parser.add_argument("-m", "--model_str", type=str, default="InstanSeg_UNet", help = "Model backbone to use")
+parser.add_argument("-m", "--model_str", type=str, default="maxvit_base", help = "Model backbone to use")
 parser.add_argument("-s", "--save", type=bool, default=True, help = "Whether to save model outputs every time a new best F1 score is achieved")
 parser.add_argument("-l_fn", "--loss_function", type=str, default='instanseg_loss', help = "Method to use for segmentation, only instanseg_loss is supported")
 parser.add_argument("-n_sigma", "--n_sigma", type=int, default=2, help = "Number of sigma channels, must be at least 1")

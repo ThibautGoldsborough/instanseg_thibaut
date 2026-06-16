@@ -150,8 +150,9 @@ def build_model_from_dict(build_model_dictionary, random_seed = None):
                             dropout=build_model_dictionary["dropprob"])
 
 
-    elif build_model_dictionary["model_str"].lower() in {"maxvit", "maxvit_tiny", "maxvit_base", "maxvit_large"}:
-            from instanseg.utils.models.MaxViT import MaxViT, maxvit_tiny, maxvit_base, maxvit_large
+    elif (build_model_dictionary["model_str"].lower() in {"maxvit_pico", "maxvit_tiny", "maxvit_base", "maxvit_large"}
+          or build_model_dictionary["model_str"].lower().startswith(("maxvit_", "maxxvit"))):
+            from instanseg.utils.models.MaxViT import MaxViT, maxvit_pico, maxvit_tiny, maxvit_base, maxvit_large
             maxvit_name = build_model_dictionary["model_str"].lower()
             print(f"Generating {maxvit_name}")
             multihead = build_model_dictionary["multihead"]
@@ -189,13 +190,32 @@ def build_model_from_dict(build_model_dictionary, random_seed = None):
                 compile=bool(build_model_dictionary.get("compile", False)),
                 compile_mode=build_model_dictionary.get("compile_mode", "default"),
             )
-            # "maxvit" alone is treated as the tiny preset for back-compat.
-            if maxvit_name in ("maxvit", "maxvit_tiny"):
-                model = maxvit_tiny(**common_kwargs)
-            elif maxvit_name == "maxvit_base":
-                model = maxvit_base(**common_kwargs)
+            # Preset names match timm's size names (pico/tiny/base/large). Legacy
+            # checkpoints used maxvit/maxvit_tiny (=pico) and maxvit_base
+            # (=timm tiny); their experiment_log.csv files were migrated to
+            # maxvit_pico / maxvit_tiny, so only the new preset names are handled
+            # by the builders. Any other maxvit_*/maxxvit* string is treated as a
+            # raw timm backbone name and passed straight to MaxViT (the build path
+            # reads embed_dim/depths/stem_width generically from the timm cfg).
+            preset_builders = {
+                "maxvit_pico": maxvit_pico,
+                "maxvit_tiny": maxvit_tiny,
+                "maxvit_base": maxvit_base,
+                "maxvit_large": maxvit_large,
+            }
+            if maxvit_name in preset_builders:
+                model = preset_builders[maxvit_name](**common_kwargs)
             else:
-                model = maxvit_large(**common_kwargs)
+                # Heavy backbones need gradient checkpointing to fit in memory,
+                # mirroring the maxvit_large preset. Allow an explicit override
+                # via the experiment config key `gradient_checkpointing`.
+                _gc = bool(build_model_dictionary.get(
+                    "gradient_checkpointing",
+                    any(s in maxvit_name for s in ("base", "large", "xlarge")),
+                ))
+                print(f"  raw timm backbone, gradient_checkpointing={_gc}")
+                model = MaxViT(timm_name=maxvit_name,
+                               gradient_checkpointing=_gc, **common_kwargs)
 
 
     elif build_model_dictionary["model_str"].lower() == "instanseg_sam":

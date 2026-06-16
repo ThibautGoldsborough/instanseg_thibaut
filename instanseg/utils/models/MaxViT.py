@@ -1,5 +1,5 @@
 import dataclasses
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
@@ -7,15 +7,30 @@ import torch.nn.functional as F
 
 from instanseg.utils.models.InstanSeg_UNet import conv_norm_act
 
+# Type accepted by MaxViT.forward(condition=...): a single class (applied to the
+# whole batch) or one entry per batch item.
+Condition = Union[str, int, Sequence[Union[str, int]], torch.Tensor]
+
+DEFAULT_ADALN_CLASSES: tuple[str, ...] = ("Class A", "Class B", "Class C")
+
 
 # Preset -> (timm arch name, default training resolution used to fetch pretrained).
+# Preset names mirror timm's own size names (pico/tiny/large) so there is no
+# off-by-one confusion: our "tiny" IS timm's tiny, etc.
 # We pick the `*_rmlp_*_rw_*` variants where possible: relative MLP position bias
 # is resolution-agnostic, so the pretrained weights transfer cleanly to 256x256
 # inputs. `large` falls back to a `_tf_*` variant (no rmlp equivalent exists) —
 # its window-based rel_pos_bias tables are interpolated by timm at load time.
+#
+# NOTE: these names were rebased on 2026-06-12. The old presets were shifted one
+# size below timm: old "tiny" was timm pico, old "base" was timm tiny. Old model
+# checkpoints recorded `model_str` as maxvit/maxvit_tiny (=pico) or maxvit_base
+# (=timm tiny); their experiment_log.csv files were migrated to the new names
+# (maxvit_pico / maxvit_tiny) so they still load the architecture they trained.
 _PRESETS: dict[str, dict] = {
-    "tiny":  dict(timm_name="maxvit_rmlp_pico_rw_256"),
-    "base":  dict(timm_name="maxvit_rmlp_tiny_rw_256"),
+    "pico":  dict(timm_name="maxvit_rmlp_pico_rw_256"),
+    "tiny":  dict(timm_name="maxvit_rmlp_tiny_rw_256"),
+    "base":  dict(timm_name="maxvit_rmlp_base_rw_384"),
     "large": dict(timm_name="maxvit_large_tf_512"),
 }
 
@@ -46,9 +61,15 @@ def _build_timm_maxvit(timm_name: str, in_channels: int, img_size: int,
         global_pool="",
         drop_path_rate=drop_path_rate,
     )
-    # tf_* variants hard-code window_size at training res; pass img_size to rebuild.
-    if "_tf_" in timm_name:
-        kwargs["img_size"] = (img_size, img_size)
+    # Pass img_size so timm rebuilds the window/grid partition sizes to
+    # img_size//32. tf_* variants hard-code window_size at their training res and
+    # MUST be rebuilt; rmlp _rw_ variants whose native res != img_size (e.g. the
+    # base backbone is _384 -> window 12) also need it, else window_partition's
+    # divisibility assert fails on our 256 crops. For an rmlp _256 backbone at
+    # img_size=256 this is a structural+numerical no-op (verified bit-exact), so
+    # it is safe to pass unconditionally. The rmlp relative-position bias is
+    # resolution-agnostic, so pretrained weights still transfer under the rebuild.
+    kwargs["img_size"] = (img_size, img_size)
     return timm.create_model(timm_name, **kwargs)
 
 
@@ -194,6 +215,86 @@ class _MaxViTDecoder(nn.Module):
         return torch.cat([h(x) for h in self.heads], dim=1)
 
 
+class AdaLNConditioner(nn.Module):
+    """Class-conditional AdaLN (FiLM-style modulation of LayerNorm outputs).
+
+    Holds one ``nn.Embedding`` row per class name and, for every hooked
+    LayerNorm, a linear projection ``cond_dim -> 2*C`` producing (gamma, beta).
+    Forward hooks (see ``_adaln_hook``) rewrite each norm's output as
+    ``out * (1 + gamma) + beta``. Projections are zero-initialised, so the
+    modulation is an exact identity at start and pretrained / warm-started
+    behaviour is unchanged until training moves the weights.
+
+    The active condition lives on ``_current`` (plain attribute, not a buffer),
+    set by ``MaxViT.forward``. It is deliberately *sticky* — not cleared after
+    forward — so gradient-checkpoint recomputation during backward sees the
+    same condition it saw during forward.
+    """
+
+    def __init__(self, class_names: Sequence[str], cond_dim: int,
+                 norm_dims: dict[str, int]):
+        super().__init__()
+        self.class_names: list[str] = list(class_names)
+        self.class_to_index: dict[str, int] = {n: i for i, n in enumerate(self.class_names)}
+        self.cond_dim: int = int(cond_dim)
+        self.embedding = nn.Embedding(len(self.class_names), self.cond_dim)
+        self.proj = nn.ModuleDict()
+        for key, dim in norm_dims.items():
+            lin = nn.Linear(self.cond_dim, 2 * dim)
+            nn.init.zeros_(lin.weight)
+            nn.init.zeros_(lin.bias)
+            self.proj[key] = lin
+        self._current: Optional[torch.Tensor] = None
+
+    @staticmethod
+    def key_for(module_name: str) -> str:
+        """nn.ModuleDict forbids '.' in keys; map module paths to safe keys."""
+        return module_name.replace(".", "__")
+
+    def encode(self, condition: Condition, device: torch.device, batch: int) -> torch.Tensor:
+        """Normalize a condition spec to a 1-D LongTensor of class indices
+        (length 1 = broadcast over the batch, or length ``batch``)."""
+        if isinstance(condition, str):
+            idx = torch.tensor([self.class_to_index[condition]], device=device)
+        elif isinstance(condition, int):
+            idx = torch.tensor([condition], device=device)
+        elif isinstance(condition, torch.Tensor):
+            idx = condition.to(device=device, dtype=torch.long).reshape(-1)
+        else:
+            idx = torch.tensor(
+                [self.class_to_index[c] if isinstance(c, str) else int(c) for c in condition],
+                device=device,
+            )
+        if idx.numel() not in (1, batch):
+            raise ValueError(
+                f"condition has {idx.numel()} entries; expected 1 or batch size {batch}"
+            )
+        return idx
+
+    def modulate(self, key: str, out: torch.Tensor) -> torch.Tensor:
+        """Apply ``out * (1 + gamma) + beta`` for an NHWC norm output."""
+        idx = self._current
+        assert idx is not None
+        emb = self.embedding(idx)                          # (B or 1, cond_dim)
+        gamma, beta = self.proj[key](emb).chunk(2, dim=-1)  # each (B or 1, C)
+        gamma = gamma.to(out.dtype).view(gamma.shape[0], 1, 1, -1)
+        beta = beta.to(out.dtype).view(beta.shape[0], 1, 1, -1)
+        return out * (1 + gamma) + beta
+
+
+def _adaln_hook(conditioner: AdaLNConditioner, key: str):
+    """Forward hook modulating one LayerNorm's output. NB: captures
+    ``conditioner`` by closure — a deepcopy of the model keeps hooks pointing
+    at the *original* conditioner (re-wire after deepcopy, e.g. for EMA)."""
+
+    def hook(_module: nn.Module, _inputs: tuple, output: torch.Tensor) -> Optional[torch.Tensor]:
+        if conditioner._current is None:
+            return None  # unconditioned forward: leave output untouched
+        return conditioner.modulate(key, output)
+
+    return hook
+
+
 class MaxViT(nn.Module):
     """Pretrained timm MaxViT encoder + symmetric UNet-style decoder.
 
@@ -215,7 +316,7 @@ class MaxViT(nn.Module):
         self,
         in_channels: int,
         out_channels,
-        timm_name: str = "maxvit_rmlp_tiny_rw_256",
+        timm_name: str = "maxvit_rmlp_base_rw_384",
         pretrained: bool = True,
         img_size: int = 256,
         dec_depths: Optional[Sequence[int]] = None,
@@ -231,6 +332,9 @@ class MaxViT(nn.Module):
         gradient_checkpointing: bool = False,
         init_decoder_from_encoder: Optional[bool] = None,
         drop_path_rate: float = 0.0,
+        adaln: bool = False,
+        adaln_classes: Sequence[str] = DEFAULT_ADALN_CLASSES,
+        adaln_cond_dim: int = 128,
     ):
         super().__init__()
 
@@ -315,6 +419,11 @@ class MaxViT(nn.Module):
         if init_decoder_from_encoder:
             self._warm_start_decoder_from_encoder()
 
+        # --- AdaLN class conditioning ----------------------------------------
+        self.adaln: Optional[AdaLNConditioner] = None
+        if adaln:
+            self._wire_adaln(adaln_classes, adaln_cond_dim)
+
         # --- Runtime flags (amp / channels_last / compile) -------------------
         self._amp = amp
         self._amp_dtype = amp_dtype
@@ -345,6 +454,31 @@ class MaxViT(nn.Module):
                 report[f"enc_stage[{stage_idx}]->dec_up{stage_idx+1}"] = f"{n}/{len(dst_blocks)} blocks"
         self._warm_start_report = report
 
+    # ------------------------------------------------------------------ adaln
+    def _wire_adaln(self, class_names: Sequence[str], cond_dim: int) -> None:
+        """Register AdaLN forward hooks on every transformer LayerNorm.
+
+        Targets the pre-attention / pre-MLP norms inside the MaxxVit attention
+        blocks (``attn_block.norm*``, ``attn_grid.norm*``) of both encoder and
+        decoders. These norms run on full NHWC feature maps *before*
+        window/grid partitioning, so the batch dim is intact and per-sample
+        (B, 1, 1, C) modulation broadcasts cleanly. The conv halves of the
+        network (MBConv / fuse / ConvBlock) use BatchNorm and are untouched.
+        """
+        targets = {
+            name: mod
+            for name, mod in self.named_modules()
+            if isinstance(mod, nn.LayerNorm)
+            and (".attn_block.norm" in name or ".attn_grid.norm" in name)
+        }
+        norm_dims = {
+            AdaLNConditioner.key_for(name): int(mod.normalized_shape[-1])
+            for name, mod in targets.items()
+        }
+        self.adaln = AdaLNConditioner(class_names, cond_dim, norm_dims)
+        for name, mod in targets.items():
+            mod.register_forward_hook(_adaln_hook(self.adaln, AdaLNConditioner.key_for(name)))
+
     # ------------------------------------------------------------------ introspection
     def get_embedding_tap(self) -> nn.Module:
         return self.encoder.stages[-1]
@@ -362,7 +496,17 @@ class MaxViT(nn.Module):
         skips = [stem, s0, s1, s2]
         return torch.cat([dec(s3, skips, input_size) for dec in self.decoders], dim=1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, condition: Optional[Condition] = None) -> torch.Tensor:
+        # AdaLN: stash the encoded condition on the conditioner; the forward
+        # hooks pick it up. Sticky on purpose (see AdaLNConditioner docstring).
+        if self.adaln is not None:
+            self.adaln._current = (
+                None if condition is None
+                else self.adaln.encode(condition, x.device, batch=x.shape[0])
+            )
+        elif condition is not None:
+            raise ValueError("condition was passed but the model was built with adaln=False")
+
         # Accept arbitrary (H, W), square or not, by replicate-padding up to
         # the next multiple of self._pad_multiple in each dim (Swin/SwinIR
         # "pad-and-crop" recipe, e.g. https://arxiv.org/abs/2108.10257). For
@@ -396,6 +540,10 @@ def _make_preset(name: str, in_channels: int, out_channels, **overrides) -> MaxV
     cfg = dict(_PRESETS[name])
     cfg.update(overrides)
     return MaxViT(in_channels=in_channels, out_channels=out_channels, **cfg)
+
+
+def maxvit_pico(in_channels: int, out_channels, **kwargs) -> MaxViT:
+    return _make_preset("pico", in_channels, out_channels, **kwargs)
 
 
 def maxvit_tiny(in_channels: int, out_channels, **kwargs) -> MaxViT:
@@ -453,7 +601,7 @@ class MaxViTPadCropWrapper(nn.Module):
 if __name__ == "__main__":
     # No network: exercise architecture with pretrained=False so the test runs
     # offline. Warm-start is skipped automatically in this mode.
-    for name, builder in [("tiny", maxvit_tiny), ("base", maxvit_base), ("large", maxvit_large)]:
+    for name, builder in [("pico", maxvit_pico), ("tiny", maxvit_tiny), ("base", maxvit_base), ("large", maxvit_large)]:
         print(f"--- maxvit_{name} ---")
         m = builder(in_channels=3, out_channels=[[2, 2, 1]], pretrained=False)
         p = sum(x.numel() for x in m.parameters()) / 1e6
@@ -466,3 +614,34 @@ if __name__ == "__main__":
             y = m(torch.randn(1, 3, 256, 256))
         assert y.shape[-2:] == (256, 256), f"Bad output shape: {y.shape}"
         print(f"  input (256,256) -> {tuple(y.shape)}")
+
+    # --- AdaLN conditioning ---------------------------------------------
+    print("--- adaln (maxvit_tiny) ---")
+    torch.manual_seed(0)
+    m = maxvit_tiny(in_channels=3, out_channels=[[2, 2, 1]], pretrained=False, adaln=True)
+    m.eval()
+    assert m.adaln is not None
+    n_hooked = len(m.adaln.proj)
+    n_params = sum(p.numel() for p in m.adaln.parameters())
+    print(f"  hooked norms: {n_hooked}, conditioner params: {n_params/1e6:.2f}M")
+    x = torch.randn(2, 3, 256, 256)
+    with torch.no_grad():
+        y_uncond = m(x)
+        y_a = m(x, condition="Class A")
+        # Zero-init projections: conditioning must be an exact identity.
+        assert torch.equal(y_uncond, y_a), "AdaLN not identity at init"
+        # Perturb one projection: classes must now diverge, per-sample too.
+        next(iter(m.adaln.proj.values())).weight.data.normal_(std=0.1)
+        y_a = m(x, condition="Class A")
+        y_b = m(x, condition="Class B")
+        y_ab = m(x, condition=["Class A", "Class B"])
+        assert not torch.equal(y_a, y_b), "Classes A/B should differ after perturbation"
+        # atol: broadcast (1,1,1,C) vs (2,1,1,C) takes different kernels -> ~1e-7 noise.
+        assert torch.allclose(y_ab[0], y_a[0], atol=1e-5) and torch.allclose(y_ab[1], y_b[1], atol=1e-5), \
+            "Per-sample conditioning mismatch"
+    # Gradients must reach the embedding for trained classes only.
+    m.train()
+    m(x, condition="Class C").sum().backward()
+    g = m.adaln.embedding.weight.grad
+    assert g is not None and g[2].abs().sum() > 0 and g[:2].abs().sum() == 0
+    print("  identity-at-init, class divergence, per-sample broadcast, grads: OK")
