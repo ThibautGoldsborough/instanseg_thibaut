@@ -62,6 +62,7 @@ parser.add_argument('-o_h', '--optimize_hyperparameters', default=False, type=la
 parser.add_argument('-hotstart', '--hotstart_training', default=10, type=int, help = "Number of epochs to train the model with ce before starting the main training loop (default=10)")
 parser.add_argument('-window', '--window_size', default=128, type=int, help = "Size of the window containing each instance")
 parser.add_argument('-multihead', '--multihead', default= False, type=lambda x: (str(x).lower() == 'true'), help = "Whether to branch the decoder into multiple heads.")
+parser.add_argument('-adaln', '--adaln', default=False, type=lambda x: (str(x).lower() == 'true'), help = "MaxViT only: condition a single-head model on cell-vs-nucleus via AdaLN. Each training sample picks one available label map (C or N) at random and passes it to the model as a condition. Requires a maxvit backbone.")
 parser.add_argument('-dim_coords', '--dim_coords', default=2, type=int, help = "Dimensionality of the coordinate system. Little support for anything but 2")
 parser.add_argument('-dim_seeds', '--dim_seeds', default=1, type=int, help = "Number of seed maps to produce. Little support for anything but 1")
 parser.add_argument('-norm', '--norm', default="BATCH", type=str, help = "Norm layer to use: None, INSTANCE, INSTANCE_INVARIANT, BATCH")
@@ -196,7 +197,7 @@ def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name=
             dict_to_print["w_seed"] = math.exp(-method.log_var_seed.item())
             dict_to_print["w_inst"] = math.exp(-method.log_var_inst.item())
 
-        if args.cells_and_nuclei:
+        if args.dual_head_output:
             f1_list.append(f1_score[0])
             f1_list_cells.append(f1_score[1])
             dict_to_print["f1_score_nuclei"] = f1_score[0]
@@ -263,7 +264,7 @@ def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name=
         if is_main:
             print(", ".join(f"{k}: {v:.5g}" for k, v in dict_to_print.items()))
             save_training_plot(train_losses, test_losses, f1_list, f1_list_cells,
-                               args.output_path, args.cells_and_nuclei, hotstart_epoch=hotstart_epoch)
+                               args.output_path, args.dual_head_output, hotstart_epoch=hotstart_epoch)
 
     return model, train_losses, test_losses, f1_list, f1_list_cells
 
@@ -360,7 +361,26 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         args.cells_and_nuclei = True
     else:
         args.cells_and_nuclei = False
-        
+
+    # AdaLN conditioning makes the model single-head (it predicts whichever of
+    # C/N the per-sample condition selects), so model output, loss, and F1
+    # metrics are single-channel even though the data still carries both label
+    # maps. `dual_head_output` is the effective "two channels out" flag.
+    if args.adaln:
+        if not args.model_str.lower().startswith(("maxvit", "maxxvit")):
+            raise ValueError(f"--adaln requires a maxvit backbone, got model_str={args.model_str!r}")
+        # Conditioning is cell-vs-nucleus, so both label maps must be loaded.
+        # With a single target only one class is ever sampled and the other
+        # embedding never trains, silently making --adaln a no-op. Require NC.
+        if not ("N" in args.target_segmentation.upper() and "C" in args.target_segmentation.upper()):
+            raise ValueError(
+                f"--adaln conditions on cell-vs-nucleus and needs both label maps; "
+                f"pass `-target NC` (got -target {args.target_segmentation!r}). "
+                f"With a single target only one condition is ever sampled and the "
+                f"other class embedding never trains."
+            )
+    args.dual_head_output = args.cells_and_nuclei and not args.adaln
+
     device = accelerator.device
     args.device = device
 
@@ -381,7 +401,7 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
                         seed_loss_fn = args.seed_loss_fn,
                         device = device,
                         n_sigma=n_sigma,
-                        cells_and_nuclei=args.cells_and_nuclei,
+                        cells_and_nuclei=args.dual_head_output,
                         window_size = args.window_size,
                         dim_coords= args.dim_coords,
                         dim_seeds = args.dim_seeds,
@@ -856,7 +876,7 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
     plt.savefig(args.output_path / "loss.png")
     plt.close()
 
-    if args.cells_and_nuclei:
+    if args.dual_head_output:
         fig = plt.plot(f1_list, label="f1 score nuclei")
         plt.plot(f1_list_cells, label="f1 score cells")
         plt.ylim(0, 1)

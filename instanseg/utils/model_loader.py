@@ -156,9 +156,16 @@ def build_model_from_dict(build_model_dictionary, random_seed = None):
             maxvit_name = build_model_dictionary["model_str"].lower()
             print(f"Generating {maxvit_name}")
             multihead = build_model_dictionary["multihead"]
+            # AdaLN conditioning: the model predicts a SINGLE segmentation and is
+            # told (per-sample, via an embedding) whether it is cell ("C") or
+            # nucleus ("N"). So even when cells_and_nuclei is set on the data
+            # side, the model output is single-head. This rule lives here so it
+            # is identical on build and on reload (the `adaln` key is persisted
+            # in the model dict).
+            adaln = bool(build_model_dictionary.get("adaln", False))
+            n_seeds = build_model_dictionary["dim_seeds"]
 
-            if build_model_dictionary["cells_and_nuclei"]:
-                n_seeds = build_model_dictionary["dim_seeds"]
+            if build_model_dictionary["cells_and_nuclei"] and not adaln:
                 if not multihead:
                     from itertools import chain
                     out_channels = [[build_model_dictionary["dim_coords"], build_model_dictionary["n_sigma"], n_seeds] for i in range(2)]
@@ -166,7 +173,6 @@ def build_model_from_dict(build_model_dictionary, random_seed = None):
                 else:
                     out_channels = [[build_model_dictionary["dim_coords"], build_model_dictionary["n_sigma"], n_seeds] for i in range(2)]
             else:
-                n_seeds = build_model_dictionary["dim_seeds"]
                 if not multihead:
                     out_channels = [[build_model_dictionary["dim_coords"], build_model_dictionary["n_sigma"], n_seeds]]
                 else:
@@ -190,6 +196,13 @@ def build_model_from_dict(build_model_dictionary, random_seed = None):
                 compile=bool(build_model_dictionary.get("compile", False)),
                 compile_mode=build_model_dictionary.get("compile_mode", "default"),
             )
+            if adaln:
+                # Cell vs nucleus conditioning. Classes are ("N","C") so channel
+                # 0 (nucleus) -> "N" and channel 1 (cell) -> "C", matching the
+                # label channel order produced by data_loader._format_labels.
+                common_kwargs["adaln"] = True
+                common_kwargs["adaln_classes"] = ("N", "C")
+                common_kwargs["adaln_cond_dim"] = int(build_model_dictionary.get("adaln_cond_dim", 128))
             # Preset names match timm's size names (pico/tiny/base/large). Legacy
             # checkpoints used maxvit/maxvit_tiny (=pico) and maxvit_base
             # (=timm tiny); their experiment_log.csv files were migrated to

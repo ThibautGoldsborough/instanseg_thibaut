@@ -186,10 +186,15 @@ class _AdaptorNetWrapper(torch.nn.Module):
 
         self.model=initialize_AdaptorNet(model,adaptornet=adaptornet,adaptor_net_str = adaptor_net_str, **kwargs)
 
-    def forward(self,x):
+    def forward(self, x, condition=None):
 
         x = self.model.AdaptorNet(x)
-        out = self.model(x)
+        # Only forward `condition` when set, so wrapped models that don't accept
+        # it (e.g. InstanSeg_UNet) keep working unchanged.
+        if condition is None:
+            out = self.model(x)
+        else:
+            out = self.model(x, condition=condition)
         return out
     
 

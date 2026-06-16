@@ -12,6 +12,53 @@ from instanseg.utils.utils import show_images
 import warnings
 
 
+def _channel_classes(target_segmentation: str) -> list[str]:
+    """Map label-channel index -> AdaLN condition name.
+
+    data_loader._format_labels stacks (nucleus, cell) for the two-target case,
+    so channel 0 is always "N" and channel 1 is "C". For a single target the
+    only channel is whatever letter was requested ("N" or "C").
+    """
+    return ["N", "C"] if len(target_segmentation) == 2 else [target_segmentation]
+
+
+def _pick_condition(labels: torch.Tensor,
+                    class_for_channel: list[str],
+                    generator: "torch.Generator | None" = None):
+    """Reduce a (B, K, H, W) label tensor (K in {1,2}, absent channel == all -1)
+    to a single label map per sample plus its AdaLN condition.
+
+    For each sample we pick one non-empty channel uniformly at random and use
+    its class name as the condition. Returns ``(single_labels (B,1,H,W),
+    conditions list[str] of length B)``. Samples with no instance-bearing
+    channel fall back to channel 0; the loss skips/treats those as empty anyway.
+
+    "Non-empty" == contains at least one positive instance id (``> 0``). We test
+    ``<= 0`` rather than ``< 0`` so the absence check is robust to padding: an
+    absent map is the all-(-1) sentinel, but augmentation/padding can fill it
+    with 0 (background), making it a -1/0 mix that ``< 0`` would mis-read as
+    present. Background (0) carries no instance to segment, so a 0/-1 map is
+    correctly "empty" under ``<= 0``.
+    """
+    B, K = labels.shape[0], labels.shape[1]
+    # non-empty[b, c] is True when channel c of sample b has any instance.
+    non_empty = (~(labels <= 0).all(dim=3).all(dim=2)).cpu()
+    chosen = torch.zeros(B, dtype=torch.long)
+    for b in range(B):
+        idxs = torch.nonzero(non_empty[b], as_tuple=False).flatten()
+        if idxs.numel() == 0:
+            chosen[b] = 0
+        elif idxs.numel() == 1:
+            chosen[b] = int(idxs[0])
+        else:
+            r = int(torch.randint(idxs.numel(), (1,), generator=generator))
+            chosen[b] = int(idxs[r])
+    chosen_dev = chosen.to(labels.device).view(B, 1, 1, 1).expand(B, 1, labels.shape[2], labels.shape[3])
+    single_labels = labels.gather(1, chosen_dev)
+    conditions = [class_for_channel[int(c)] for c in chosen]
+    return single_labels, conditions
+
+
 global_step = 0
 def train_epoch(train_model,
                 train_device,
@@ -34,12 +81,20 @@ def train_epoch(train_model,
     is_main = accelerator.is_main_process if accelerator is not None else True
     device = accelerator.device if accelerator is not None else train_device
 
+    use_adaln = getattr(args, "adaln", False)
+    class_for_channel = _channel_classes(args.target_segmentation) if use_adaln else None
+
     for image_batch, labels_batch, _ in tqdm(train_dataloader, disable=args.on_cluster or not is_main):
 
         image_batch = image_batch.to(device, non_blocking=True)
         labels = labels_batch.to(device, non_blocking=True)
 
-        output = train_model(image_batch)
+        if use_adaln:
+            # Pick one label map (C or N) per sample and tell the model which.
+            labels, conditions = _pick_condition(labels, class_for_channel)
+            output = train_model(image_batch, condition=conditions)
+        else:
+            output = train_model(image_batch)
         loss = train_loss_fn(output, labels.clone()).mean()
 
         # DDP: sync the skip decision across ranks. If any rank has a non-finite
@@ -114,12 +169,22 @@ def test_epoch(test_model,
     test_model.eval()
     test_loss = []
 
+    use_adaln = getattr(args, "adaln", False)
+    class_for_channel = _channel_classes(args.target_segmentation) if use_adaln else None
+    # Seed the per-sample C/N pick so validation conditions are stable across
+    # epochs (comparable F1) rather than reshuffling every evaluation.
+    cond_generator = torch.Generator().manual_seed(0) if use_adaln else None
+
     current_f1_list = []
     with torch.no_grad():
         for image_batch, labels_batch, _ in tqdm(test_dataloader, disable=args.on_cluster or not is_main):
             image_batch = image_batch.to(device, non_blocking=True)
             labels = labels_batch.to(device, non_blocking=True)
-            output = test_model(image_batch)
+            if use_adaln:
+                labels, conditions = _pick_condition(labels, class_for_channel, generator=cond_generator)
+                output = test_model(image_batch, condition=conditions)
+            else:
+                output = test_model(image_batch)
             loss = test_loss_fn(output, labels.clone()).mean()
             test_loss.append(loss.detach().cpu().numpy())
 

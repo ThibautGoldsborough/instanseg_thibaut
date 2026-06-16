@@ -983,15 +983,29 @@ class Augmentations(object):
             pixel_size = meta.get("pixel_size")
             
             if not isinstance(pixel_size, float) or pixel_size is None:
-                avg_area = measure_average_instance_area(labels)
-                if avg_area > 0:
-                    # Cell masks are ~3x larger than nucleus masks
-                    if self.target_segmentation == "C":
-                        expected_area = 105  # ~35 µm² × 3 for cells
-                        warnings.warn("Pixel size not available, using pseudo pixel size based on average cell area (~105 µm²)")
+                # Calibrate the pseudo pixel size consistently: divide a measured
+                # average instance area by that SAME modality's expected µm²
+                # (nuclei ~35, cells ~105 ≈ 3× larger). For the two-channel
+                # (N, C) case (e.g. -target NC) prefer the nucleus channel —
+                # nuclei are more uniform across tissues — and fall back to the
+                # cell channel only when nuclei are absent. Measuring the max of
+                # both channels but always dividing by 35 (the old behaviour)
+                # biased NC pixel sizes ~sqrt(3) small.
+                if hasattr(labels, "shape") and len(labels.shape) == 3 and labels.shape[0] == 2:
+                    area_nucleus = measure_average_instance_area(labels[0])  # stack order: (N, C)
+                    area_cell = measure_average_instance_area(labels[1])
+                    if area_nucleus > 0:
+                        expected_area, avg_area, modality_str = 35, area_nucleus, "nucleus"
                     else:
-                        expected_area = 35  # ~35 µm² for nuclei
-                        warnings.warn("Pixel size not available, using pseudo pixel size based on average nucleus area (~35 µm²)")
+                        expected_area, avg_area, modality_str = 105, area_cell, "cell"
+                else:
+                    avg_area = measure_average_instance_area(labels)
+                    if self.target_segmentation == "C":
+                        expected_area, modality_str = 105, "cell"  # ~35 µm² × 3 for cells
+                    else:
+                        expected_area, modality_str = 35, "nucleus"  # ~35 µm² for nuclei
+                if avg_area > 0:
+                    warnings.warn(f"Pixel size not available, using pseudo pixel size based on average {modality_str} area (~{expected_area} µm²)")
                     pixel_size = np.sqrt(expected_area / avg_area)
 
         if meta is not None and "channel_names" in meta.keys():
