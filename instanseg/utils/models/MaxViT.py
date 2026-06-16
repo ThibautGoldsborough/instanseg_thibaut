@@ -216,33 +216,20 @@ class _MaxViTDecoder(nn.Module):
 
 
 class AdaLNConditioner(nn.Module):
-    """Class-conditional modulation of a MaxViT, driven by an ``nn.Embedding``.
+    """Class-conditional modulation: shared ``nn.Embedding(K, cond_dim)`` →
+    per-site zero-init ``Linear(cond_dim, 2C|C)``, applied via forward hooks.
+    Two site kinds: ``affine`` FiLMs a norm output ``out*(1+gamma)+beta`` (LN
+    pre-norms, NHWC; decoder/head BatchNorms, NCHW); ``gate`` scales a residual
+    branch ``out*(1+alpha)`` (LayerScale ls1/ls2 slots).
 
-    Holds one embedding row per class and, for every hooked *site*, a zero-init
-    linear projection from the class embedding to that site's modulation. Three
-    site kinds are applied via forward hooks (see ``_adaln_hook``):
+    Zero-init ⇒ identity at init (gamma=beta=alpha=0), so a warm-started model is
+    unchanged until trained. Gate is ``1+alpha`` (not DiT's bare ``alpha``) to
+    avoid zeroing attention branches at init. ``cond_dim`` is small (default 8):
+    the bottleneck makes class-conditioning low-rank, which regularises/stabilises
+    (an unbottlenecked per-class table trains less stably here).
 
-    - ``affine`` — FiLM a normalisation output: ``out * (1 + gamma) + beta``.
-      Used on the attention pre-norms (channels-last ``nn.LayerNorm``, layout
-      ``nhwc``) and on the decoder/head ``BatchNorm2d`` (layout ``nchw``), so
-      the segmentation-producing path is conditioned, not just attention inputs.
-    - ``gate`` — scale a residual branch's contribution: ``out * (1 + alpha)``.
-      Hooked on the LayerScale slots (``ls1``/``ls2``) sitting between each
-      attention/MLP branch and its residual add, this is AdaLN-zero-style gating
-      letting the condition turn whole attention/MLP branches up or down.
-
-    Every projection is zero-initialised, so at init gamma=beta=alpha=0 → both
-    the FiLM and the gate are exact identities (``1 + 0`` / ``+0``). The
-    conditioned model is therefore byte-identical to the unconditioned,
-    pretrained-warm-started model until training moves the weights. (Note the
-    gate is ``1 + alpha`` not the bare ``alpha`` of DiT's AdaLN-zero: a bare
-    gate would zero the attention branches at init and throw away the ImageNet
-    warm-start.)
-
-    The active condition lives on ``_current`` (plain attribute, not a buffer),
-    set by ``MaxViT.forward``. It is deliberately *sticky* — not cleared after
-    forward — so gradient-checkpoint recomputation during backward sees the
-    same condition it saw during forward.
+    ``_current`` (the active condition) is a plain attribute set by
+    ``MaxViT.forward`` and left *sticky* so gradient-checkpoint recompute sees it.
     """
 
     def __init__(self, class_names: Sequence[str], cond_dim: int,
@@ -369,7 +356,7 @@ class MaxViT(nn.Module):
         drop_path_rate: float = 0.0,
         adaln: bool = False,
         adaln_classes: Sequence[str] = DEFAULT_ADALN_CLASSES,
-        adaln_cond_dim: int = 128,
+        adaln_cond_dim: int = 8,  # small shared bottleneck (see AdaLNConditioner)
     ):
         super().__init__()
 
@@ -491,26 +478,10 @@ class MaxViT(nn.Module):
 
     # ------------------------------------------------------------------ adaln
     def _wire_adaln(self, class_names: Sequence[str], cond_dim: int) -> None:
-        """Register class-conditional modulation hooks across the network.
-
-        Three families of sites (see ``AdaLNConditioner``):
-
-        1. ``affine`` on attention pre-norms (``attn_block.norm*`` /
-           ``attn_grid.norm*``, channels-last ``nn.LayerNorm``, NHWC). These run
-           on full feature maps before window/grid partitioning, so the batch
-           dim is intact and per-sample modulation broadcasts cleanly.
-        2. ``affine`` on every decoder ``BatchNorm2d`` (NCHW) — the fuse convs,
-           the decoder MBConv norms, ``final_conv`` and the output ``heads``.
-           This conditions the segmentation-producing path, which is otherwise
-           shared across classes and was the main reason conditioning felt weak.
-        3. ``gate`` on the LayerScale slots (``ls1``/``ls2``) of each attention
-           block — AdaLN-zero-style gating of the attention/MLP residual
-           branches (these slots are ``nn.Identity`` for the ``_rw`` presets, so
-           the hook output *is* the branch contribution before the residual add).
-
-        Every projection is zero-init, so the conditioned net starts identical
-        to the unconditioned, warm-started one.
-        """
+        """Register modulation hooks: affine on attention pre-norms (NHWC LN) and
+        all decoder BatchNorms (NCHW, conditions the output-producing path), gate
+        on the attention/MLP LayerScale slots ls1/ls2 (nn.Identity for _rw, so the
+        hook output is the branch pre-residual). See ``AdaLNConditioner``."""
         modules_by_name = dict(self.named_modules())
         sites: dict[str, tuple] = {}
         hook_targets: list[tuple[str, nn.Module]] = []
@@ -695,7 +666,7 @@ if __name__ == "__main__":
         # Zero-init projections (FiLM gamma/beta AND gate alpha): conditioning
         # must be an exact identity at init, preserving warm-started behaviour.
         assert torch.equal(y_uncond, y_n), "AdaLN not identity at init"
-        # Perturb one site of each kind: classes must diverge, per-sample too.
+        # Perturb the projections (every gate + one affine): classes must diverge.
         for key, kind in kinds.items():
             if kind == "gate":
                 m.adaln.proj[key].weight.data.normal_(std=0.1)
@@ -708,9 +679,13 @@ if __name__ == "__main__":
         # atol: broadcast (1,1,1,C) vs (2,1,1,C) takes different kernels -> ~1e-7 noise.
         assert torch.allclose(y_nc[0], y_n[0], atol=1e-5) and torch.allclose(y_nc[1], y_c[1], atol=1e-5), \
             "Per-sample conditioning mismatch"
-    # Gradients must reach the embedding for trained class only.
+    # Gradient must reach the shared embedding for the used class only. (NB at a
+    # truly fresh init the zero-init projections would block embedding gradient
+    # on step 1 — the projections perturbed above provide a non-zero path, which
+    # is why this check runs after that.)
     m.train()
-    m(x, condition="C").sum().backward()
+    m(x, condition="C").sum().backward()  # class C == index 1
     g = m.adaln.embedding.weight.grad
-    assert g is not None and g[1].abs().sum() > 0 and g[0].abs().sum() == 0
+    assert g is not None and g[1].abs().sum() > 0 and g[0].abs().sum() == 0, \
+        "class-C embedding row must get grad, class-N row none"
     print("  identity-at-init, class divergence, per-sample broadcast, grads: OK")

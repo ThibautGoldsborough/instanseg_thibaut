@@ -200,9 +200,11 @@ def build_model_from_dict(build_model_dictionary, random_seed = None):
                 # Cell vs nucleus conditioning. Classes are ("N","C") so channel
                 # 0 (nucleus) -> "N" and channel 1 (cell) -> "C", matching the
                 # label channel order produced by data_loader._format_labels.
+                # Small shared bottleneck (cond_dim, default 8) for stable,
+                # low-rank conditioning; overridable via the config key.
                 common_kwargs["adaln"] = True
                 common_kwargs["adaln_classes"] = ("N", "C")
-                common_kwargs["adaln_cond_dim"] = int(build_model_dictionary.get("adaln_cond_dim", 128))
+                common_kwargs["adaln_cond_dim"] = int(build_model_dictionary.get("adaln_cond_dim", 8))
             # Preset names match timm's size names (pico/tiny/base/large). Legacy
             # checkpoints used maxvit/maxvit_tiny (=pico) and maxvit_base
             # (=timm tiny); their experiment_log.csv files were migrated to
