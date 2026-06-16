@@ -216,14 +216,28 @@ class _MaxViTDecoder(nn.Module):
 
 
 class AdaLNConditioner(nn.Module):
-    """Class-conditional AdaLN (FiLM-style modulation of LayerNorm outputs).
+    """Class-conditional modulation of a MaxViT, driven by an ``nn.Embedding``.
 
-    Holds one ``nn.Embedding`` row per class name and, for every hooked
-    LayerNorm, a linear projection ``cond_dim -> 2*C`` producing (gamma, beta).
-    Forward hooks (see ``_adaln_hook``) rewrite each norm's output as
-    ``out * (1 + gamma) + beta``. Projections are zero-initialised, so the
-    modulation is an exact identity at start and pretrained / warm-started
-    behaviour is unchanged until training moves the weights.
+    Holds one embedding row per class and, for every hooked *site*, a zero-init
+    linear projection from the class embedding to that site's modulation. Three
+    site kinds are applied via forward hooks (see ``_adaln_hook``):
+
+    - ``affine`` — FiLM a normalisation output: ``out * (1 + gamma) + beta``.
+      Used on the attention pre-norms (channels-last ``nn.LayerNorm``, layout
+      ``nhwc``) and on the decoder/head ``BatchNorm2d`` (layout ``nchw``), so
+      the segmentation-producing path is conditioned, not just attention inputs.
+    - ``gate`` — scale a residual branch's contribution: ``out * (1 + alpha)``.
+      Hooked on the LayerScale slots (``ls1``/``ls2``) sitting between each
+      attention/MLP branch and its residual add, this is AdaLN-zero-style gating
+      letting the condition turn whole attention/MLP branches up or down.
+
+    Every projection is zero-initialised, so at init gamma=beta=alpha=0 → both
+    the FiLM and the gate are exact identities (``1 + 0`` / ``+0``). The
+    conditioned model is therefore byte-identical to the unconditioned,
+    pretrained-warm-started model until training moves the weights. (Note the
+    gate is ``1 + alpha`` not the bare ``alpha`` of DiT's AdaLN-zero: a bare
+    gate would zero the attention branches at init and throw away the ImageNet
+    warm-start.)
 
     The active condition lives on ``_current`` (plain attribute, not a buffer),
     set by ``MaxViT.forward``. It is deliberately *sticky* — not cleared after
@@ -232,18 +246,27 @@ class AdaLNConditioner(nn.Module):
     """
 
     def __init__(self, class_names: Sequence[str], cond_dim: int,
-                 norm_dims: dict[str, int]):
+                 sites: dict[str, tuple]):
+        # sites[key] = (channels, kind, layout); kind in {"affine","gate"},
+        # layout in {"nhwc","nchw"}.
         super().__init__()
         self.class_names: list[str] = list(class_names)
         self.class_to_index: dict[str, int] = {n: i for i, n in enumerate(self.class_names)}
         self.cond_dim: int = int(cond_dim)
         self.embedding = nn.Embedding(len(self.class_names), self.cond_dim)
         self.proj = nn.ModuleDict()
-        for key, dim in norm_dims.items():
-            lin = nn.Linear(self.cond_dim, 2 * dim)
+        # kind/layout are plain dicts (no params); rebuilt by _wire_adaln on every
+        # construction (build and reload) so they need not live in the state_dict.
+        self.kind: dict[str, str] = {}
+        self.layout: dict[str, str] = {}
+        for key, (channels, kind, layout) in sites.items():
+            out_dim = 2 * channels if kind == "affine" else channels
+            lin = nn.Linear(self.cond_dim, out_dim)
             nn.init.zeros_(lin.weight)
             nn.init.zeros_(lin.bias)
             self.proj[key] = lin
+            self.kind[key] = kind
+            self.layout[key] = layout
         self._current: Optional[torch.Tensor] = None
 
     @staticmethod
@@ -271,19 +294,31 @@ class AdaLNConditioner(nn.Module):
             )
         return idx
 
+    def _broadcast(self, vec: torch.Tensor, layout: str) -> torch.Tensor:
+        # vec: (B or 1, C) -> (B,1,1,C) for NHWC, (B,C,1,1) for NCHW.
+        if layout == "nhwc":
+            return vec.view(vec.shape[0], 1, 1, -1)
+        return vec.view(vec.shape[0], -1, 1, 1)
+
     def modulate(self, key: str, out: torch.Tensor) -> torch.Tensor:
-        """Apply ``out * (1 + gamma) + beta`` for an NHWC norm output."""
+        """FiLM (``affine``) or branch-gate (``gate``) the module output."""
         idx = self._current
         assert idx is not None
-        emb = self.embedding(idx)                          # (B or 1, cond_dim)
-        gamma, beta = self.proj[key](emb).chunk(2, dim=-1)  # each (B or 1, C)
-        gamma = gamma.to(out.dtype).view(gamma.shape[0], 1, 1, -1)
-        beta = beta.to(out.dtype).view(beta.shape[0], 1, 1, -1)
-        return out * (1 + gamma) + beta
+        emb = self.embedding(idx)                  # (B or 1, cond_dim)
+        params = self.proj[key](emb)               # (B or 1, 2C) or (B or 1, C)
+        layout = self.layout[key]
+        if self.kind[key] == "affine":
+            gamma, beta = params.chunk(2, dim=-1)
+            gamma = self._broadcast(gamma, layout).to(out.dtype)
+            beta = self._broadcast(beta, layout).to(out.dtype)
+            return out * (1 + gamma) + beta
+        # gate: scale the whole residual-branch contribution.
+        alpha = self._broadcast(params, layout).to(out.dtype)
+        return out * (1 + alpha)
 
 
 def _adaln_hook(conditioner: AdaLNConditioner, key: str):
-    """Forward hook modulating one LayerNorm's output. NB: captures
+    """Forward hook applying one site's modulation. NB: captures
     ``conditioner`` by closure — a deepcopy of the model keeps hooks pointing
     at the *original* conditioner (re-wire after deepcopy, e.g. for EMA)."""
 
@@ -456,28 +491,51 @@ class MaxViT(nn.Module):
 
     # ------------------------------------------------------------------ adaln
     def _wire_adaln(self, class_names: Sequence[str], cond_dim: int) -> None:
-        """Register AdaLN forward hooks on every transformer LayerNorm.
+        """Register class-conditional modulation hooks across the network.
 
-        Targets the pre-attention / pre-MLP norms inside the MaxxVit attention
-        blocks (``attn_block.norm*``, ``attn_grid.norm*``) of both encoder and
-        decoders. These norms run on full NHWC feature maps *before*
-        window/grid partitioning, so the batch dim is intact and per-sample
-        (B, 1, 1, C) modulation broadcasts cleanly. The conv halves of the
-        network (MBConv / fuse / ConvBlock) use BatchNorm and are untouched.
+        Three families of sites (see ``AdaLNConditioner``):
+
+        1. ``affine`` on attention pre-norms (``attn_block.norm*`` /
+           ``attn_grid.norm*``, channels-last ``nn.LayerNorm``, NHWC). These run
+           on full feature maps before window/grid partitioning, so the batch
+           dim is intact and per-sample modulation broadcasts cleanly.
+        2. ``affine`` on every decoder ``BatchNorm2d`` (NCHW) — the fuse convs,
+           the decoder MBConv norms, ``final_conv`` and the output ``heads``.
+           This conditions the segmentation-producing path, which is otherwise
+           shared across classes and was the main reason conditioning felt weak.
+        3. ``gate`` on the LayerScale slots (``ls1``/``ls2``) of each attention
+           block — AdaLN-zero-style gating of the attention/MLP residual
+           branches (these slots are ``nn.Identity`` for the ``_rw`` presets, so
+           the hook output *is* the branch contribution before the residual add).
+
+        Every projection is zero-init, so the conditioned net starts identical
+        to the unconditioned, warm-started one.
         """
-        targets = {
-            name: mod
-            for name, mod in self.named_modules()
-            if isinstance(mod, nn.LayerNorm)
-            and (".attn_block.norm" in name or ".attn_grid.norm" in name)
-        }
-        norm_dims = {
-            AdaLNConditioner.key_for(name): int(mod.normalized_shape[-1])
-            for name, mod in targets.items()
-        }
-        self.adaln = AdaLNConditioner(class_names, cond_dim, norm_dims)
-        for name, mod in targets.items():
-            mod.register_forward_hook(_adaln_hook(self.adaln, AdaLNConditioner.key_for(name)))
+        modules_by_name = dict(self.named_modules())
+        sites: dict[str, tuple] = {}
+        hook_targets: list[tuple[str, nn.Module]] = []
+
+        for name, mod in modules_by_name.items():
+            key = AdaLNConditioner.key_for(name)
+            if isinstance(mod, nn.LayerNorm) and (".attn_block.norm" in name or ".attn_grid.norm" in name):
+                sites[key] = (int(mod.normalized_shape[-1]), "affine", "nhwc")
+                hook_targets.append((key, mod))
+            elif isinstance(mod, nn.BatchNorm2d) and name.startswith("decoders"):
+                sites[key] = (int(mod.num_features), "affine", "nchw")
+                hook_targets.append((key, mod))
+            elif name.endswith((".attn_block.ls1", ".attn_block.ls2",
+                                 ".attn_grid.ls1", ".attn_grid.ls2")):
+                # LayerScale slot has no channel count of its own; take it from
+                # the sibling norm in the same attention block (ls1<->norm1,
+                # ls2<->norm2). ls output is channels-last like its block.
+                norm_name = name.rsplit(".", 1)[0] + (".norm1" if name.endswith("1") else ".norm2")
+                channels = int(modules_by_name[norm_name].normalized_shape[-1])
+                sites[key] = (channels, "gate", "nhwc")
+                hook_targets.append((key, mod))
+
+        self.adaln = AdaLNConditioner(class_names, cond_dim, sites)
+        for key, mod in hook_targets:
+            mod.register_forward_hook(_adaln_hook(self.adaln, key))
 
     # ------------------------------------------------------------------ introspection
     def get_embedding_tap(self) -> nn.Module:
@@ -618,30 +676,41 @@ if __name__ == "__main__":
     # --- AdaLN conditioning ---------------------------------------------
     print("--- adaln (maxvit_tiny) ---")
     torch.manual_seed(0)
-    m = maxvit_tiny(in_channels=3, out_channels=[[2, 2, 1]], pretrained=False, adaln=True)
+    m = maxvit_tiny(in_channels=3, out_channels=[[2, 2, 1]], pretrained=False,
+                    adaln=True, adaln_classes=("N", "C"))
     m.eval()
     assert m.adaln is not None
-    n_hooked = len(m.adaln.proj)
+    kinds = m.adaln.kind
+    n_ln = sum(k == "affine" and m.adaln.layout[key] == "nhwc" for key, k in kinds.items())
+    n_bn = sum(k == "affine" and m.adaln.layout[key] == "nchw" for key, k in kinds.items())
+    n_gate = sum(k == "gate" for k in kinds.values())
     n_params = sum(p.numel() for p in m.adaln.parameters())
-    print(f"  hooked norms: {n_hooked}, conditioner params: {n_params/1e6:.2f}M")
+    print(f"  sites: {n_ln} LN-affine + {n_bn} BN-affine + {n_gate} branch-gates, "
+          f"conditioner params: {n_params/1e6:.2f}M")
+    assert n_bn > 0 and n_gate > 0, "decoder/head FiLM and residual gating must be wired"
     x = torch.randn(2, 3, 256, 256)
     with torch.no_grad():
         y_uncond = m(x)
-        y_a = m(x, condition="Class A")
-        # Zero-init projections: conditioning must be an exact identity.
-        assert torch.equal(y_uncond, y_a), "AdaLN not identity at init"
-        # Perturb one projection: classes must now diverge, per-sample too.
-        next(iter(m.adaln.proj.values())).weight.data.normal_(std=0.1)
-        y_a = m(x, condition="Class A")
-        y_b = m(x, condition="Class B")
-        y_ab = m(x, condition=["Class A", "Class B"])
-        assert not torch.equal(y_a, y_b), "Classes A/B should differ after perturbation"
+        y_n = m(x, condition="N")
+        # Zero-init projections (FiLM gamma/beta AND gate alpha): conditioning
+        # must be an exact identity at init, preserving warm-started behaviour.
+        assert torch.equal(y_uncond, y_n), "AdaLN not identity at init"
+        # Perturb one site of each kind: classes must diverge, per-sample too.
+        for key, kind in kinds.items():
+            if kind == "gate":
+                m.adaln.proj[key].weight.data.normal_(std=0.1)
+        for key in list(kinds)[:1]:
+            m.adaln.proj[key].weight.data.normal_(std=0.1)  # one BN/LN affine too
+        y_n = m(x, condition="N")
+        y_c = m(x, condition="C")
+        y_nc = m(x, condition=["N", "C"])
+        assert not torch.equal(y_n, y_c), "Classes N/C should differ after perturbation"
         # atol: broadcast (1,1,1,C) vs (2,1,1,C) takes different kernels -> ~1e-7 noise.
-        assert torch.allclose(y_ab[0], y_a[0], atol=1e-5) and torch.allclose(y_ab[1], y_b[1], atol=1e-5), \
+        assert torch.allclose(y_nc[0], y_n[0], atol=1e-5) and torch.allclose(y_nc[1], y_c[1], atol=1e-5), \
             "Per-sample conditioning mismatch"
-    # Gradients must reach the embedding for trained classes only.
+    # Gradients must reach the embedding for trained class only.
     m.train()
-    m(x, condition="Class C").sum().backward()
+    m(x, condition="C").sum().backward()
     g = m.adaln.embedding.weight.grad
-    assert g is not None and g[2].abs().sum() > 0 and g[:2].abs().sum() == 0
+    assert g is not None and g[1].abs().sum() > 0 and g[0].abs().sum() == 0
     print("  identity-at-init, class divergence, per-sample broadcast, grads: OK")
