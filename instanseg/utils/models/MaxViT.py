@@ -602,6 +602,44 @@ class MaxViTRunWrapper(nn.Module):
         return self._inner._run(x)
 
 
+class MaxViTCondRunWrapper(nn.Module):
+    """Like ``MaxViTRunWrapper`` but exposes the AdaLN class index as a real
+    forward input. It sets ``adaln._current = cond`` then runs ``_run``; because
+    ``cond`` is the tensor the hooks read for the embedding lookup, tracing
+    records that lookup as a graph input, so the traced core is switchable at
+    runtime (cond=0 -> class 0, cond=1 -> class 1, ...)."""
+    def __init__(self, inner: nn.Module):
+        super().__init__()
+        self._inner = inner
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        self._inner.adaln._current = cond
+        return self._inner._run(x)
+
+
+class MaxViTCondPadCropWrapper(nn.Module):
+    """Pad-and-crop wrapper around a traced cond-aware core (takes (x, cond))."""
+    pad_multiple: int
+
+    def __init__(self, core: nn.Module, pad_multiple: int):
+        super().__init__()
+        self.core = core
+        self.pad_multiple = pad_multiple
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        H = x.shape[-2]
+        W = x.shape[-1]
+        m = self.pad_multiple
+        pad_h = (-H) % m
+        pad_w = (-W) % m
+        if pad_h > 0 or pad_w > 0:
+            x = F.pad(x, [0, pad_w, 0, pad_h], mode='replicate')
+        y = self.core(x, cond)
+        if pad_h > 0 or pad_w > 0:
+            y = y[..., :H, :W]
+        return y
+
+
 class MaxViTPadCropWrapper(nn.Module):
     """Scripted pad-and-crop wrapper around a traced MaxViT core. Pads H/W up
     to the next multiple of ``pad_multiple`` (replicate), calls the core, then

@@ -103,6 +103,14 @@ def read_model_args_from_csv(path=r"../results/", folder=""):
         build_model_dictionary["seed_merging"] = bool(eval(str(build_model_dictionary["seed_merging"])))
     else:
         build_model_dictionary["seed_merging"] = False
+    # NB the CSV stores everything as strings, so the string "False" is truthy —
+    # normalise adaln to a real bool here (and adaln_cond_dim to int).
+    if "adaln" in build_model_dictionary.keys():
+        build_model_dictionary["adaln"] = bool(eval(str(build_model_dictionary["adaln"]).capitalize()))
+    else:
+        build_model_dictionary["adaln"] = False
+    if "adaln_cond_dim" in build_model_dictionary.keys():
+        build_model_dictionary["adaln_cond_dim"] = int(build_model_dictionary["adaln_cond_dim"])
 
     return build_model_dictionary
 
@@ -162,7 +170,9 @@ def build_model_from_dict(build_model_dictionary, random_seed = None):
             # side, the model output is single-head. This rule lives here so it
             # is identical on build and on reload (the `adaln` key is persisted
             # in the model dict).
-            adaln = bool(build_model_dictionary.get("adaln", False))
+            # Robust to the CSV-string "False" (which is truthy under bool()).
+            _adaln_raw = build_model_dictionary.get("adaln", False)
+            adaln = _adaln_raw if isinstance(_adaln_raw, bool) else bool(eval(str(_adaln_raw).capitalize()))
             n_seeds = build_model_dictionary["dim_seeds"]
 
             if build_model_dictionary["cells_and_nuclei"] and not adaln:
