@@ -396,9 +396,17 @@ def get_loaders(train_images_local, train_labels_local, val_images_local, val_la
     # With the dataset held as in-memory arrays, persistent workers slowly
     # privatize those arrays via copy-on-write refcount writes, growing RSS every
     # epoch until OOM (~epoch 17 on 6-rank DDP). Re-forking resets that each epoch.
+    # persistent_workers / prefetch_factor are CLI-overridable (default to the
+    # safe legacy behaviour). prefetch_factor is only a valid DataLoader kwarg
+    # when num_workers > 0, so only pass it then.
+    persistent_workers = getattr(args, "persistent_workers", False)
+    loader_kwargs = {}
+    if args.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = getattr(args, "prefetch_factor", 2)
+
     train_loader = DataLoader(train_data, collate_fn=collate_fn, batch_size=args.batch_size, num_workers=args.num_workers,
-                              sampler=train_sampler, persistent_workers=False, drop_last=True)
+                              sampler=train_sampler, persistent_workers=persistent_workers, drop_last=True, **loader_kwargs)
     test_loader = DataLoader(test_data, collate_fn=collate_fn, batch_size=args.batch_size, num_workers=args.num_workers,
-                             sampler=test_sampler, persistent_workers=False, drop_last=True)
+                             sampler=test_sampler, persistent_workers=persistent_workers, drop_last=True, **loader_kwargs)
 
     return train_loader, test_loader

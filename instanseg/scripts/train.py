@@ -26,6 +26,8 @@ parser.add_argument("-o_p", "--output_path", type=str, default=r"../models", hel
 parser.add_argument("-e_s", "--experiment_str", type=str, default="my_first_instanseg", help = "String to identify the experiment")
 parser.add_argument("-d", "--device", type=str, default=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"))
 parser.add_argument('-num_workers', '--num_workers', default=3, type=int, help = "Number of CPU cores to use for data loading")
+parser.add_argument('-prefetch_factor', '--prefetch_factor', default=2, type=int, help = "Number of batches each DataLoader worker prefetches ahead. Higher hides per-item augmentation/IO variance (the per-iter speed sawtooth) at the cost of RAM. Ignored when num_workers=0.")
+parser.add_argument('-persistent_workers', '--persistent_workers', default=False, type=lambda x: (str(x).lower() == 'true'), help = "Keep DataLoader workers alive across epochs (avoids the slow per-epoch worker respawn). WARNING: with the in-memory-array dataset this leaks RSS via copy-on-write and can OOM after ~17 epochs — see data_loader.py.")
 parser.add_argument('-ci', '--channel_invariant', default=False, type=lambda x: (str(x).lower() == 'true'), help = "Whether to add a channel invariant model to the pipeline")
 parser.add_argument('-target', '--target_segmentation', default="N",type=str, help = " Cells or nuclei or both? Accepts: C,N, NC")  
 parser.add_argument('-pixel_size', '--requested_pixel_size', default=None, type=float, help = "Requested pixel size to rescale the input images")
