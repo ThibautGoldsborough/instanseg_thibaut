@@ -89,6 +89,7 @@ parser.add_argument('-batched_instance_loss', '--batched_instance_loss', default
 parser.add_argument('-preemptable', '--preemptable', default=False, type=lambda x: (str(x).lower() == 'true'), help="Enable preemption-safe training: saves full training state and auto-resumes from checkpoint if preempted on SLURM")
 parser.add_argument('-preempt_interval', '--preempt_save_interval', default=10, type=int, help="Save preemptable checkpoint every N epochs (default=1). Higher values reduce I/O for large models at the cost of losing more progress on preemption.")
 parser.add_argument('-skip_bad_batches', '--skip_bad_batches', default=True, type=lambda x: (str(x).lower() == 'true'), help="Skip training batches whose loss or gradient norm is non-finite (NaN/Inf) and warn. Default=True.")
+parser.add_argument('-reset_optimizer', '--reset_optimizer', default=False, type=lambda x: (str(x).lower() == 'true'), help="When hotstarting from --model_folder, start with a fresh optimizer (discard the saved optimizer state/moments) instead of restoring it. Use when finetuning onto a new task/dataset where the old Adam moments describe a different objective. Default=False (restore optimizer state). No effect on LoRA / warm-started NC heads / channel-invariant runs, which always reset.")
 
 _bool = lambda x: (str(x).lower() == 'true')
 parser.add_argument('-compile', '--compile', default=False, type=_bool, help="Whether to torch.compile the model")
@@ -491,6 +492,14 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
                 if is_main:
                     print("Warm-started NC heads: skipping optimizer state dict "
                           "(parameter groups changed)")
+            elif args.reset_optimizer:
+                optimizer = get_optimizer(model.parameters(), args)
+                # Explicitly requested fresh optimizer — discard saved moments.
+                # Use when finetuning onto a new task/dataset where the old
+                # Adam moments describe a different objective.
+                if is_main:
+                    print("--reset_optimizer: starting with a fresh optimizer "
+                          "(discarded saved optimizer state)")
             else:
                 optimizer = get_optimizer(model.parameters(),args)
                 optimizer.load_state_dict(model_dict['optimizer_state_dict'])
