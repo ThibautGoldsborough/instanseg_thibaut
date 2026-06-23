@@ -396,6 +396,18 @@ def test_epoch(test_model,
 
             global_step_test += 1
 
+    # Empty val loader (no batches iterated): bail out gracefully instead of an
+    # UnboundLocalError on image_batch/test_loss below. Consistent across ranks
+    # (even_batches keeps per-rank counts equal, so all ranks see 0), so no
+    # collective is entered unevenly. Should be rare now that the eval loader uses
+    # drop_last=False; left as a guard against a too-small --length_of_eval.
+    if len(test_loss) == 0:
+        if is_main:
+            warnings.warn("Validation loader produced no batches — skipping evaluation "
+                          "this epoch (check --length_of_eval vs batch_size / num GPUs).")
+        n_cols = 2 if getattr(args, "dual_head_output", False) else 1
+        return float('nan'), np.full(n_cols, np.nan), time.time() - start
+
     # Gather per-batch F1 values across ranks so mean_f1 reflects the whole val set.
     if accelerator is not None and accelerator.num_processes > 1 and len(current_f1_list) > 0:
         f1_local = np.stack([np.atleast_1d(x) for x in current_f1_list]).astype(np.float32)

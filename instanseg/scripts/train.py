@@ -632,8 +632,12 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
                                            verbose=is_main)
         if accelerator is not None and accelerator.num_processes > 1:
             # All ranks must agree on batch size; take the min that fits everywhere.
-            local_bs = int(accelerator.reduce(torch.tensor([local_bs], device=device),
-                                              reduction="min").item())
+            # NB accelerator.reduce(reduction="min") is NOT honored (falls back to
+            # SUM), so use torch.distributed's MIN op directly.
+            import torch.distributed as dist
+            t = torch.tensor([local_bs], device=device)
+            dist.all_reduce(t, op=dist.ReduceOp.MIN)
+            local_bs = int(t.item())
         args.batch_size = local_bs
         if is_main:
             print(f"[find_batch_size] using batch_size={args.batch_size}")
