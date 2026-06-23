@@ -28,10 +28,18 @@ def _pick_condition(labels: torch.Tensor,
     """Reduce a (B, K, H, W) label tensor (K in {1,2}, absent channel == all -1)
     to a single label map per sample plus its AdaLN condition.
 
-    For each sample we pick one non-empty channel uniformly at random and use
-    its class name as the condition. Returns ``(single_labels (B,1,H,W),
-    conditions list[str] of length B)``. Samples with no instance-bearing
-    channel fall back to channel 0; the loss skips/treats those as empty anyway.
+    For each sample we pick one non-empty channel uniformly at random. Returns
+    ``(single_labels (B,1,H,W), conditions)`` where ``conditions`` is a device
+    LongTensor of chosen channel indices — these equal the AdaLN class indices
+    (both ordered ("N","C"): channel 0 = nucleus = "N", channel 1 = cell = "C"),
+    so the model consumes them directly via ``AdaLNConditioner.encode`` with no
+    host sync. Samples with no instance-bearing channel fall back to channel 0;
+    the loss treats those as empty anyway. ``class_for_channel`` is retained for
+    that index↔class correspondence (the model maps the indices to embeddings).
+
+    Fully on-device: no ``.cpu()`` / Python loop, so it adds no per-step GPU→CPU
+    sync (those stalls were hurting GPU utilisation, especially once the backbone
+    is compiled).
 
     "Non-empty" == contains at least one positive instance id (``> 0``). We test
     ``<= 0`` rather than ``< 0`` so the absence check is robust to padding: an
@@ -41,22 +49,156 @@ def _pick_condition(labels: torch.Tensor,
     correctly "empty" under ``<= 0``.
     """
     B, K = labels.shape[0], labels.shape[1]
-    # non-empty[b, c] is True when channel c of sample b has any instance.
-    non_empty = (~(labels <= 0).all(dim=3).all(dim=2)).cpu()
-    chosen = torch.zeros(B, dtype=torch.long)
-    for b in range(B):
-        idxs = torch.nonzero(non_empty[b], as_tuple=False).flatten()
-        if idxs.numel() == 0:
-            chosen[b] = 0
-        elif idxs.numel() == 1:
-            chosen[b] = int(idxs[0])
-        else:
-            r = int(torch.randint(idxs.numel(), (1,), generator=generator))
-            chosen[b] = int(idxs[r])
-    chosen_dev = chosen.to(labels.device).view(B, 1, 1, 1).expand(B, 1, labels.shape[2], labels.shape[3])
-    single_labels = labels.gather(1, chosen_dev)
-    conditions = [class_for_channel[int(c)] for c in chosen]
-    return single_labels, conditions
+    # non_empty[b, c]: channel c of sample b has any instance. All on-device.
+    non_empty = ~(labels <= 0).all(dim=3).all(dim=2)  # (B, K) bool
+    # Uniform pick among non-empty channels == argmax of iid uniforms with empty
+    # channels masked to -1 (the max of iid uniforms is a uniform index). All
+    # channels empty -> argmax picks channel 0.
+    if generator is not None:
+        scores = torch.rand(B, K, generator=generator).to(labels.device)
+    else:
+        scores = torch.rand(B, K, device=labels.device)
+    chosen = scores.masked_fill(~non_empty, -1.0).argmax(dim=1)  # (B,), on device
+    single_labels = labels.gather(
+        1, chosen.view(B, 1, 1, 1).expand(B, 1, labels.shape[2], labels.shape[3]))
+    return single_labels, chosen
+
+
+def find_optimal_batch_size(model, loss_fn, dataset, args, device,
+                            max_bs: int = 512, mem_fraction: float = 0.9,
+                            probe_sizes: tuple[int, int] = (2, 4),
+                            pool_size: int = 32, compiled: bool = False,
+                            amp_dtype=None, verbose: bool = True) -> int:
+    """Estimate the largest batch size that fits in GPU memory and return it.
+
+    Runs real forward+backward steps (activation+gradient memory captured) but NOT
+    ``optimizer.step()`` — weights are never mutated, so no warm-start corruption
+    and no state restore. AdamW optimizer state is reserved analytically.
+
+    ``compiled``: match the training mode. When the model is ``torch.compile``d,
+    measure compiled memory (accurate) by calling ``torch._dynamo.reset()`` before
+    each probe size — every size compiles from a clean dynamo state, which avoids
+    the cross-size guard contamination that otherwise trips an inductor recompile
+    assert; a final ``reset()`` leaves a clean slate so training compiles fresh.
+    Costs a full recompile per probe size (a few minutes), negligible before a long
+    run. When not compiled, the model is eager already and no reset is needed.
+
+    Measures *steady-state* peak (resets stats after a warmup step), then linearly
+    extrapolates peak(bs) = fixed + per_sample·bs to the memory budget — only 2
+    measurements + 1 verify, no deliberate OOM. Rounds down to a multiple of 8 and
+    backs off 15% if the verify step doesn't fit.
+    """
+    if not torch.cuda.is_available() or len(dataset) == 0:
+        return getattr(args, "batch_size", probe_sizes[0])
+
+    # The maxvit+AdaLN compiled graph hits an inductor size/stride assert at very
+    # small batch sizes (bs 2/4 crash; bs>=8 compile fine), so probe larger sizes
+    # when compiled. The verify step backs off gracefully if a size won't compile.
+    if compiled and probe_sizes == (2, 4):
+        probe_sizes = (8, 16)
+
+    use_adaln = getattr(args, "adaln", False)
+    class_for_channel = _channel_classes(args.target_segmentation) if use_adaln else None
+    total_mem = torch.cuda.get_device_properties(device).total_memory
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    opt_reserve = 2 * n_params * 4  # AdamW: 2 fp32 moments/param (probe skips optim.step)
+    budget = mem_fraction * total_mem - opt_reserve
+
+    rng = np.random.default_rng(0)
+    pool = [dataset[int(i)] for i in rng.integers(0, len(dataset), size=min(pool_size, len(dataset)))]
+
+    def _make_batch(bs):
+        items = [pool[j % len(pool)] for j in range(bs)]
+        imgs, labs, _ = collate_fn([(it[0], it[1]) for it in items])
+        return imgs.to(device), labs.to(device)
+
+    def _reset_dynamo():
+        if compiled and hasattr(torch, "_dynamo"):
+            torch._dynamo.reset()  # fresh compile per size; clears contaminating guards
+
+    model.train()
+
+    import contextlib
+    def _autocast():
+        return (torch.autocast(device_type="cuda", dtype=amp_dtype)
+                if amp_dtype is not None else contextlib.nullcontext())
+
+    def _step(images, labels):
+        model.zero_grad(set_to_none=True)
+        with _autocast():  # match training's mixed precision (memory + compile context)
+            if use_adaln:
+                lab, cond = _pick_condition(labels, class_for_channel)
+                out = model(images, condition=cond)
+            else:
+                lab, out = labels, model(images)
+            loss = loss_fn(out, lab.clone()).mean()
+        loss.backward()
+
+    def _measure(bs):
+        """Steady-state peak bytes for a fwd+bwd at batch size ``bs`` (warmup +
+        measured step). Returns None on OOM or, when compiled, on a compile failure
+        at this size (so the search backs off instead of crashing training)."""
+        try:
+            _reset_dynamo()                             # fresh compile per size (compiled only)
+            torch.cuda.empty_cache()
+            images, labels = _make_batch(bs)
+            _step(images, labels)                       # warmup (compiles if compiled)
+            torch.cuda.synchronize(device)
+            torch.cuda.reset_peak_memory_stats(device)
+            _step(images, labels)                       # measured
+            torch.cuda.synchronize(device)
+            peak = torch.cuda.max_memory_allocated(device)
+            del images, labels
+            return peak
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            return None
+        except Exception as e:  # noqa: BLE001
+            msg = str(e).lower()
+            if "out of memory" in msg:
+                torch.cuda.empty_cache()
+                return None
+            if compiled:  # a compile failure at this size — skip it, don't crash startup
+                if verbose:
+                    print(f"[find_batch_size] bs={bs}: compile/probe failed ({type(e).__name__}: "
+                          f"{str(e)[:120]}) — treating as does-not-fit")
+                torch.cuda.empty_cache()
+                return None
+            raise
+
+    mode = "compiled" if compiled else "eager"
+    try:
+        b1, b2 = probe_sizes
+        m1, m2 = _measure(b1), _measure(b2)
+        if m1 is None or m2 is None or m2 <= m1:
+            chosen = b1 if m1 is not None else max(1, b1 // 2)
+            if verbose:
+                print(f"[find_batch_size] probe OOM/degenerate at small sizes; using {chosen}")
+            return chosen
+        per_sample = (m2 - m1) / (b2 - b1)
+        fixed = m1 - per_sample * b1
+        est = int((budget - fixed) / per_sample)
+        est = max(b2, min(est, max_bs))
+        chosen = max(b2, (est // 8) * 8)               # round down to multiple of 8
+
+        peak = _measure(chosen)                         # verify
+        while (peak is None or peak > budget) and chosen > b2:
+            chosen = max(b2, int(chosen * 0.85) // 8 * 8)
+            peak = _measure(chosen)
+
+        if verbose:
+            verified = f"{peak/1e9:.2f}GB" if peak is not None else "n/a"
+            print(f"[find_batch_size] {mode} probe | GPU={total_mem/1e9:.1f}GB "
+                  f"budget={budget/1e9:.1f}GB ({int(mem_fraction*100)}% - {opt_reserve/1e9:.1f}GB optim) | "
+                  f"peak(bs={b1})={m1/1e9:.2f}GB peak(bs={b2})={m2/1e9:.2f}GB "
+                  f"~{per_sample/1e9:.3f}GB/sample | estimate {est}, verified bs={chosen} @ {verified}")
+            note = "" if compiled else " (eager probe; with --compile the true fit is usually larger)"
+            print(f"[find_batch_size] selected batch_size = {chosen}{note}")
+        return chosen
+    finally:
+        model.zero_grad(set_to_none=True)
+        torch.cuda.empty_cache()
+        _reset_dynamo()  # clean dynamo slate so training compiles fresh at the chosen size
 
 
 global_step = 0
@@ -84,18 +226,44 @@ def train_epoch(train_model,
     use_adaln = getattr(args, "adaln", False)
     class_for_channel = _channel_classes(args.target_segmentation) if use_adaln else None
 
+    # Optional per-epoch timing breakdown (data-load wait vs GPU compute) to
+    # diagnose dataloader bottlenecks (low GPU util). Adds per-iter cuda syncs,
+    # so it slows the run slightly and is off by default.
+    prof = getattr(args, "time_dataloading", False)
+    use_cuda = torch.cuda.is_available()
+
+    def _sync():
+        if prof and use_cuda:
+            torch.cuda.synchronize(device)
+
+    t_data = t_h2d = t_cond = t_model = t_loss = t_bwd = t_step = 0.0
+    n_iter = 0
+    _end = time.time()
+
     for image_batch, labels_batch, _ in tqdm(train_dataloader, disable=args.on_cluster or not is_main):
+        if prof:
+            _t_iter = time.time()
+            t_data += _t_iter - _end  # time blocked waiting on the dataloader
 
         image_batch = image_batch.to(device, non_blocking=True)
         labels = labels_batch.to(device, non_blocking=True)
+        if prof:
+            _sync(); _m_h2d = time.time(); t_h2d += _m_h2d - _t_iter
 
+        _mark = _m_h2d if prof else None
         if use_adaln:
             # Pick one label map (C or N) per sample and tell the model which.
             labels, conditions = _pick_condition(labels, class_for_channel)
+            if prof:
+                _sync(); _t = time.time(); t_cond += _t - _mark; _mark = _t
             output = train_model(image_batch, condition=conditions)
         else:
             output = train_model(image_batch)
+        if prof:
+            _sync(); _t = time.time(); t_model += _t - _mark; _mark = _t
         loss = train_loss_fn(output, labels.clone()).mean()
+        if prof:
+            _sync(); _m_loss = time.time(); t_loss += _m_loss - _mark
 
         # DDP: sync the skip decision across ranks. If any rank has a non-finite
         # loss, *all* ranks must skip — otherwise the surviving ranks call
@@ -113,6 +281,8 @@ def train_epoch(train_model,
                 warnings.warn(f"Skipping batch: non-finite loss ({loss.item()})")
             train_optimizer.zero_grad(set_to_none=True)
             skipped_loss += 1
+            if prof:
+                _end = time.time()
             continue
 
         train_optimizer.zero_grad()
@@ -122,6 +292,9 @@ def train_epoch(train_model,
         else:
             loss.backward()
             total_norm = torch.nn.utils.clip_grad_norm_(train_model.parameters(), args.clip)
+        if prof:
+            # includes the non-finite-loss check above (a small .item() host sync)
+            _sync(); _m_bwd = time.time(); t_bwd += _m_bwd - _m_loss
 
         # accelerator.clip_grad_norm_ returns the synced (global) norm, so the
         # skip decision below is already identical on every rank — no extra
@@ -130,12 +303,32 @@ def train_epoch(train_model,
             warnings.warn(f"Skipping batch: non-finite gradient norm ({total_norm.item()})")
             train_optimizer.zero_grad(set_to_none=True)
             skipped_grad += 1
+            if prof:
+                _end = time.time()
             continue
         train_optimizer.step()
 
         train_loss.append(loss.detach().cpu().numpy())
+        if prof:
+            _sync(); _t = time.time(); t_step += _t - _m_bwd
+            n_iter += 1
+            _end = time.time()
 
     end = time.time()
+
+    if prof and is_main:
+        wall = end - start
+        compute = t_h2d + t_cond + t_model + t_loss + t_bwd + t_step
+        imgs = n_iter * args.batch_size
+        ni = max(n_iter, 1)
+        print(f"[timing] wall={wall:.1f}s | dataload_wait={t_data:.1f}s ({100*t_data/wall:.0f}%) "
+              f"compute={compute:.1f}s ({100*compute/wall:.0f}%) | "
+              f"{n_iter} iters, {imgs/wall:.1f} img/s"
+              + (f" (x{accelerator.num_processes} ranks ~= {imgs/wall*accelerator.num_processes:.1f} global)"
+                 if accelerator is not None and accelerator.num_processes > 1 else ""))
+        print(f"[timing]   per-iter ms: h2d={1000*t_h2d/ni:.1f} adaln_pick={1000*t_cond/ni:.1f} "
+              f"model_fwd={1000*t_model/ni:.1f} loss={1000*t_loss/ni:.1f} "
+              f"backward={1000*t_bwd/ni:.1f} optim_step={1000*t_step/ni:.1f}")
 
     if (skipped_loss or skipped_grad) and is_main:
         print(f"[skip_bad_batches] skipped {skipped_loss} batch(es) for non-finite loss, "

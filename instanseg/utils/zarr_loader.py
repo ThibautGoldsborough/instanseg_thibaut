@@ -36,51 +36,53 @@ def _trim_augmentation_dict(aug_dict: dict) -> dict:
     return aug_dict
 
 
+def _norm_src(s) -> str:
+    """Normalize a source identifier so ``open_ai``/``open-ai`` and
+    ``DeepBacs``/``deepbacs`` compare equal (mirrors the builder's ``_norm``)."""
+    return str(s).lower().replace("-", "_")
+
+
 def _source_filter(source_dataset) -> set[str] | None:
     if source_dataset in ("all", ["all"], None):
         return None
     if isinstance(source_dataset, str):
-        return {source_dataset.lower()}
-    return {str(s).lower() for s in source_dataset}
+        return {_norm_src(source_dataset)}
+    return {_norm_src(s) for s in source_dataset}
 
 
 def ensure_zarr_dataset(zarr_root: str | Path, data_dir: str | Path,
                         monolith_name: str = "segmentation_dataset.pth",
                         splits: tuple[str, ...] = ("Train", "Validation"),
-                        accelerator=None) -> Path:
-    """Return the manifest path, building the full zarr dataset once if missing.
+                        accelerator=None, source_dataset="all") -> Path:
+    """Return the manifest path, building only the requested ``source_dataset``.
 
-    Idempotent: a present ``manifest.parquet`` (written atomically + last by the
-    builder) means "already built" and the build is skipped. DDP-safe: only the
-    main process builds; the others wait at a barrier. A crashed build leaves no
-    manifest, so the next run rebuilds (clear ``zarr_root`` manually if partial
-    item folders accumulate).
+    Source-scoped + change-aware: each source (a ``parent_dataset``) is written
+    from its part file if one exists, else from the monolith, and is rebuilt
+    automatically when that provenance ``.pth`` changes on disk (mtime/size). A
+    source already built and unchanged is skipped, so this is cheap to call every
+    run. The combined ``manifest.parquet`` is the union of all built sources;
+    switching to a smaller ``--source_dataset`` does not delete previously built
+    sources (they stay available, just unselected by the loader's filter).
+
+    DDP-safe: only the main process builds; the others wait at a barrier. State
+    is committed per source, so an interrupted build resumes cleanly next run.
     """
-    import shutil
+    from instanseg.scripts.build_zarr_dataset import incremental_build
     zarr_root = Path(zarr_root)
-    manifest = zarr_root / "manifest.parquet"
     is_main = accelerator is None or accelerator.is_main_process
 
-    if not manifest.exists():
-        if is_main:
-            from instanseg.scripts.build_zarr_dataset import run_build
-            print(f"[zarr] dataset not found at {zarr_root} — building once "
-                  f"from {data_dir} (this runs only on first use) ...", flush=True)
-            # Build into a temp dir and publish atomically: the final path only
-            # ever exists complete, and a crashed/partial build is discarded here.
-            building = zarr_root.with_name(zarr_root.name + ".building")
-            if building.exists():
-                shutil.rmtree(building)
-            run_build(out=building, data_dir=data_dir, monolith_name=monolith_name,
-                      all_sources=True, splits=list(splits), verbose=True)
-            if zarr_root.exists():  # stale partial from an earlier failed build
-                shutil.rmtree(zarr_root)
-            building.replace(zarr_root)  # atomic on the same filesystem
-        if accelerator is not None:
-            accelerator.wait_for_everyone()
-    elif is_main:
-        print(f"[zarr] using existing dataset at {zarr_root}", flush=True)
-    return manifest
+    if is_main:
+        if source_dataset in ("all", ["all"], None):
+            requested = None
+        elif isinstance(source_dataset, str):
+            requested = [source_dataset]
+        else:
+            requested = list(source_dataset)
+        incremental_build(out=zarr_root, data_dir=data_dir, monolith_name=monolith_name,
+                          requested=requested, splits=list(splits), verbose=True)
+    if accelerator is not None:
+        accelerator.wait_for_everyone()
+    return zarr_root / "manifest.parquet"
 
 
 class ZarrSegmentationDataset(torch.utils.data.Dataset):
@@ -99,7 +101,7 @@ class ZarrSegmentationDataset(torch.utils.data.Dataset):
         m = m[m["split"] == split]
         srcs = _source_filter(getattr(args, "source_dataset", "all"))
         if srcs is not None:
-            m = m[m["parent_dataset"].str.lower().isin(srcs)]
+            m = m[m["parent_dataset"].map(_norm_src).isin(srcs)]
         mod = getattr(args, "modality_filter", None)
         if mod:
             m = m[m["modality"].str.lower() == mod.lower()]

@@ -1538,9 +1538,13 @@ class InstanSeg(nn.Module):
         if type(loss) != torch.Tensor:
             loss = spatial_emb * 0
 
-        # Store component losses for logging
-        self.last_seed_loss = float(total_seed_loss) / (b + 1)
-        self.last_instance_loss = float(total_instance_loss)
+        # Store component losses for logging. Keep them as detached tensors (no
+        # float()/.item() here) to avoid a per-step GPU→CPU sync — they are read
+        # only once per epoch (train.py), which coerces them to float there.
+        self.last_seed_loss = (total_seed_loss / (b + 1)).detach() \
+            if isinstance(total_seed_loss, torch.Tensor) else float(total_seed_loss) / (b + 1)
+        self.last_instance_loss = total_instance_loss.detach() \
+            if isinstance(total_instance_loss, torch.Tensor) else float(total_instance_loss)
 
         return loss
     

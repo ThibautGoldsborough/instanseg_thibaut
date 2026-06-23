@@ -36,6 +36,8 @@ parser.add_argument('--force_pseudo_pixel_size', default=False, type=lambda x: (
 
 #advanced usage
 parser.add_argument("-bs", "--batch_size", type=int, default=3)
+parser.add_argument('-find_bs', '--find_batch_size', default=False, type=lambda x: (str(x).lower() == 'true'), help="Before training, probe the largest batch size that fits in GPU memory (fwd+bwd, weights untouched) and use it. Overrides --batch_size. DDP-safe (min across ranks).")
+parser.add_argument('-max_bs', '--max_batch_size', default=512, type=int, help="Upper cap for --find_batch_size probing.")
 parser.add_argument("-e", "--num_epochs", type=int, default=500)
 parser.add_argument('-len_epoch', '--length_of_epoch', default=1000, type=int, help = "Number of training samples per epoch")
 parser.add_argument('-len_eval', '--length_of_eval', default=200, type=int, help = "Number of validation samples per epoch")
@@ -195,8 +197,10 @@ def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name=
                          "testing_time": int(test_time)}
 
         if hasattr(method, 'last_seed_loss'):
-            dict_to_print["seed_loss"] = method.last_seed_loss
-            dict_to_print["instance_loss"] = method.last_instance_loss
+            # last_*_loss are detached tensors (de-synced in the loss); coerce
+            # to float here — this once-per-epoch read is the only sync needed.
+            dict_to_print["seed_loss"] = float(method.last_seed_loss)
+            dict_to_print["instance_loss"] = float(method.last_instance_loss)
         if method.uncertainty_weighting:
             import math
             dict_to_print["w_seed"] = math.exp(-method.log_var_seed.item())
@@ -295,12 +299,17 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
     from accelerate import Accelerator
     from accelerate.utils import DistributedDataParallelKwargs
 
-    # AdaLN's grad-participation set changes between steps (zero-init ramp + random
-    # C/N pick), which static_graph forbids. Use find_unused_parameters for --adaln
-    # (slower but dynamic); keep the fast static_graph route otherwise. Mutually exclusive.
+    # static_graph=True is REQUIRED: the loss reuses pixel_classifier once per
+    # instance per image in a single backward (instanseg_loss.py:1453/1483) —
+    # "reused parameters", which only static_graph supports (find_unused_parameters
+    # raises "marked ready twice"). It is also valid under --adaln: AdaLN's
+    # grad-participation set is static, NOT dynamic — the shared nn.Embedding is
+    # dense so every row gets a (possibly zero) gradient whatever class the batch
+    # picks, and the per-site proj Linears apply FiLM on every forward. So no
+    # find_unused_parameters branch (it was unnecessary and broke the reuse).
     ddp_kwargs = DistributedDataParallelKwargs(
-        static_graph=not args.adaln,
-        find_unused_parameters=args.adaln,
+        static_graph=True,
+        find_unused_parameters=False,
         gradient_as_bucket_view=True,
     )
     accelerator = Accelerator(
@@ -602,7 +611,33 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
     args.manifest_path = ensure_zarr_dataset(zarr_root, data_dir=args.data_path,
                                              monolith_name=monolith_name,
                                              splits=("Train", "Validation"),
-                                             accelerator=accelerator)
+                                             accelerator=accelerator,
+                                             source_dataset=args.source_dataset)
+    if args.find_batch_size:
+        from instanseg.utils.AI_utils import find_optimal_batch_size
+        from instanseg.utils.zarr_loader import ZarrSegmentationDataset
+        model.to(device)
+        probe_ds = ZarrSegmentationDataset(args.manifest_path, "Train", args, is_train=True)
+        _amp = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(
+            getattr(accelerator, "mixed_precision", "no"))
+        # With drop_last=True a batch larger than the per-epoch/eval sample counts
+        # yields an empty loader; cap so train and val always have >=1 batch.
+        per_rank = max(1, accelerator.num_processes if accelerator is not None else 1)
+        eff_max = min(args.max_batch_size,
+                      args.length_of_epoch // per_rank,
+                      (args.length_of_eval or args.max_batch_size) // per_rank)
+        local_bs = find_optimal_batch_size(model, method, probe_ds, args, device,
+                                           max_bs=max(2, eff_max),
+                                           compiled=bool(args.compile), amp_dtype=_amp,
+                                           verbose=is_main)
+        if accelerator is not None and accelerator.num_processes > 1:
+            # All ranks must agree on batch size; take the min that fits everywhere.
+            local_bs = int(accelerator.reduce(torch.tensor([local_bs], device=device),
+                                              reduction="min").item())
+        args.batch_size = local_bs
+        if is_main:
+            print(f"[find_batch_size] using batch_size={args.batch_size}")
+
     # DDP sharding is handled by accelerator.prepare(train_loader, test_loader)
     # below — the lazy dataset needs no manual per-rank slicing.
     args._dataloader_was_sharded = False

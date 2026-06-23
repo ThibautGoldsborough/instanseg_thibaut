@@ -21,8 +21,10 @@ Examples
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
+import shutil
 import traceback
 from pathlib import Path
 
@@ -41,6 +43,13 @@ from instanseg.utils.zarr_dataset import (
 
 SPLIT_DIRNAME = {"Train": "Train", "Validation": "Validation", "Test": "Test"}
 _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _norm(s: str) -> str:
+    """Normalize a source identifier so part-file stems, ``parent_dataset`` values
+    and user ``--source_dataset`` entries compare equal (``open_ai``/``open-ai``,
+    ``DeepBacs``/``deepbacs``). Mirrors ``data_loader._read_images_from_pth``."""
+    return str(s).lower().replace("-", "_")
 
 
 def _safe(s: str, maxlen: int = 48) -> str:
@@ -190,6 +199,263 @@ def run_build(out: Path, data_dir: Path = Path("instanseg/datasets"),
         print(f"Manifest: {manifest_path}")
         print(manifest.groupby(["split", "parent_dataset"]).size())
     return manifest_path
+
+
+# --- incremental, source-scoped build ----------------------------------------
+# Only the requested sources are written, and a source is rebuilt automatically
+# when its provenance .pth file changes on disk. State lives in build_state.json;
+# each built source also has a manifest fragment under _fragments/, and the
+# combined manifest.parquet is the union of all fragments.
+STATE_NAME = "build_state.json"
+FRAG_DIRNAME = "_fragments"
+
+
+def resolve_sources(data_dir: Path, monolith_name: str) -> tuple[dict[str, Path], Path]:
+    """Map normalized part-stem -> part path, and return the monolith path.
+
+    A "source" (a ``parent_dataset``) is provided by ``parts/<stem>.pth`` when a
+    matching part exists, otherwise by the monolith.
+    """
+    parts_dir = data_dir / "parts"
+    parts_by_norm: dict[str, Path] = {}
+    if parts_dir.is_dir():
+        for p in sorted(parts_dir.glob("*.pth")):
+            parts_by_norm[_norm(p.stem)] = p
+    return parts_by_norm, data_dir / monolith_name
+
+
+def _provenance(path: Path) -> dict:
+    st = path.stat()
+    return {"provenance": str(path), "mtime": st.st_mtime, "size": st.st_size}
+
+
+def _provenance_changed(path: Path, mtime, size) -> bool:
+    """True iff ``path`` exists and its (mtime, size) differ from the recorded pair.
+    Unknown baseline or a missing file -> not changed (nothing to rebuild from)."""
+    if mtime is None or size is None or not path.exists():
+        return False
+    st = path.stat()
+    return st.st_mtime != mtime or st.st_size != size
+
+
+def _state_path(out: Path) -> Path:
+    return out / STATE_NAME
+
+
+def _frag_path(out: Path, source: str) -> Path:
+    return out / FRAG_DIRNAME / f"{source}.parquet"
+
+
+def _load_state(out: Path) -> dict | None:
+    sp = _state_path(out)
+    if not sp.exists():
+        return None
+    try:
+        return json.loads(sp.read_text()).get("sources", {})
+    except Exception:
+        return None
+
+
+def _save_state(out: Path, state: dict) -> None:
+    sp = _state_path(out)
+    tmp = sp.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"version": 1, "sources": state}, indent=2))
+    tmp.replace(sp)
+
+
+def _write_fragment(out: Path, source: str, df: pd.DataFrame) -> None:
+    frag_dir = out / FRAG_DIRNAME
+    frag_dir.mkdir(parents=True, exist_ok=True)
+    fp = _frag_path(out, source)
+    tmp = fp.with_suffix(".parquet.tmp")
+    df.to_parquet(tmp, index=False)
+    tmp.replace(fp)
+
+
+def _monolith_sources(state: dict, monolith: Path) -> list[str]:
+    return [s for s, v in state.items() if v.get("provenance") == str(monolith)]
+
+
+def _clean_source(out: Path, state: dict, source: str) -> None:
+    """Remove a source's zarr item folder + manifest fragment before a rebuild."""
+    entry = state.get(source, {})
+    folder = entry.get("folder")
+    if folder:
+        shutil.rmtree(out / folder, ignore_errors=True)
+    _frag_path(out, source).unlink(missing_ok=True)
+
+
+def _build_one_pth(pth_path: Path, out_root: Path, keep: set[str] | None,
+                   splits: list[str], verbose: bool) -> dict[str, list[dict]]:
+    """Convert one .pth, keeping items whose normalized parent_dataset is in
+    ``keep`` (or all when ``keep`` is None). Returns {source_norm: [rows]}."""
+    if verbose:
+        print(f"Loading {pth_path} ...", flush=True)
+    data = torch.load(str(pth_path), weights_only=False)
+    rows_by_src: dict[str, list[dict]] = {}
+    counters: dict[tuple, int] = {}
+    for split in splits:
+        items = data.get(split, [])
+        for item in items:
+            src = _norm(item.get("parent_dataset", "unknown"))
+            if keep is not None and src not in keep:
+                continue
+            key = (src, split)
+            idx = counters.get(key, 0)
+            counters[key] = idx + 1
+            try:
+                row = convert_item(item, split, idx, out_root)
+            except Exception:
+                print(f"\n[error] {split} {src} item {idx}:\n{traceback.format_exc()}")
+                continue
+            if row is not None:
+                rows_by_src.setdefault(src, []).append(row)
+    return rows_by_src
+
+
+def _migrate_from_manifest(out: Path, parts_by_norm: dict[str, Path],
+                           monolith: Path) -> dict:
+    """Bootstrap incremental state from a legacy full manifest.parquet (no state).
+
+    Splits the existing manifest into per-source fragments and stamps each
+    source's provenance with the *current* mtime/size — i.e. assumes the on-disk
+    build matches the current .pth files (true right after a full build). This
+    avoids rebuilding data that is already present; later changes are detected
+    normally.
+    """
+    state: dict = {}
+    mp = out / "manifest.parquet"
+    if mp.exists():
+        m = pd.read_parquet(mp)
+        for parent, g in m.groupby("parent_dataset"):
+            s = _norm(parent)
+            p = parts_by_norm.get(s, monolith)
+            _write_fragment(out, s, g.reset_index(drop=True))
+            prov = _provenance(p) if p.exists() else {"provenance": str(p), "mtime": None, "size": None}
+            state[s] = {**prov, "folder": str(g["rel_path"].iloc[0]).split("/")[0],
+                        "n_items": int(len(g))}
+        print(f"[zarr] migrated existing manifest into incremental state "
+              f"({len(state)} sources).", flush=True)
+    _save_state(out, state)
+    return state
+
+
+def _is_stale(out: Path, state: dict, source: str, prov_path: Path) -> bool:
+    """A requested source needs (re)building if it was never built, its items or
+    fragment are missing, or its provenance .pth changed."""
+    entry = state.get(source)
+    if entry is None:
+        return True
+    folder = entry.get("folder")
+    if folder and not (out / folder).exists():
+        return True
+    if entry.get("n_items", 0) > 0 and not _frag_path(out, source).exists():
+        return True
+    return _provenance_changed(prov_path, entry.get("mtime"), entry.get("size"))
+
+
+def _monolith_dirty(out: Path, state: dict, monolith: Path) -> bool:
+    """For an ``all`` build: rebuild every monolith source if the monolith file
+    changed, was never built, or any monolith source's items went missing."""
+    if not monolith.exists():
+        return False
+    mono = {s: state[s] for s in _monolith_sources(state, monolith)}
+    if not mono:
+        return True
+    v = next(iter(mono.values()))
+    if _provenance_changed(monolith, v.get("mtime"), v.get("size")):
+        return True
+    for s, e in mono.items():
+        folder = e.get("folder")
+        if folder and not (out / folder).exists():
+            return True
+        if e.get("n_items", 0) > 0 and not _frag_path(out, s).exists():
+            return True
+    return False
+
+
+def _rebuild_manifest(out: Path, state: dict) -> Path:
+    """Concatenate all per-source fragments into manifest.parquet (atomic)."""
+    frames = [pd.read_parquet(_frag_path(out, s)) for s in state
+              if _frag_path(out, s).exists()]
+    if not frames:
+        raise SystemExit(f"No items built under {out} — check the source selection.")
+    manifest = pd.concat(frames, ignore_index=True)
+    tmp = out / "manifest.parquet.tmp"
+    mp = out / "manifest.parquet"
+    manifest.to_parquet(tmp, index=False)
+    tmp.replace(mp)
+    return mp
+
+
+def incremental_build(out: Path, data_dir: Path = Path("instanseg/datasets"),
+                      monolith_name: str = "segmentation_dataset.pth",
+                      requested: list[str] | None = None,
+                      splits: list[str] = ("Train", "Validation"),
+                      verbose: bool = True) -> Path:
+    """Build only the ``requested`` sources (None = all) into the zarr layout,
+    (re)building a source whenever its provenance .pth changed. Returns the
+    manifest path. Each source is loaded from its part file if one exists, else
+    from the monolith. Safe to call repeatedly: unchanged sources are skipped.
+    """
+    out = Path(out)
+    data_dir = Path(data_dir)
+    os.environ.setdefault("INSTANSEG_DATASET_PATH", str(data_dir.resolve()))
+    out.mkdir(parents=True, exist_ok=True)
+    splits = list(splits)
+
+    parts_by_norm, monolith = resolve_sources(data_dir, monolith_name)
+    state = _load_state(out)
+    if state is None:  # first run on this root (possibly a legacy full build)
+        state = _migrate_from_manifest(out, parts_by_norm, monolith)
+
+    requested_norm = None if requested is None else {_norm(s) for s in requested}
+
+    # Plan: provenance .pth -> set of source norms to (re)build (None = every
+    # source found in that file, used only for the monolith on an `all` build).
+    plan: dict[Path, set[str] | None] = {}
+    if requested_norm is None:
+        for s, p in parts_by_norm.items():
+            if _is_stale(out, state, s, p):
+                plan.setdefault(p, set()).add(s)
+        if _monolith_dirty(out, state, monolith):
+            plan[monolith] = None
+    else:
+        for s in requested_norm:
+            p = parts_by_norm.get(s, monolith)
+            if _is_stale(out, state, s, p):
+                plan.setdefault(p, set()).add(s)
+
+    if not plan:
+        if verbose:
+            sel = "all sources" if requested_norm is None else f"{sorted(requested_norm)}"
+            print(f"[zarr] {sel} already up to date at {out}", flush=True)
+        return _rebuild_manifest(out, state)
+
+    for pth, keep in plan.items():
+        if not pth.exists():
+            print(f"[zarr] skipping missing source file {pth}", flush=True)
+            continue
+        clean_targets = list(keep) if keep is not None else _monolith_sources(state, monolith)
+        for s in clean_targets:
+            _clean_source(out, state, s)
+        if verbose:
+            label = "ALL parent_datasets" if keep is None else sorted(keep)
+            print(f"[zarr] building {label} from {pth.name} ...", flush=True)
+        rows_by_src = _build_one_pth(pth, out, keep, splits, verbose)
+        prov = _provenance(pth)
+        for s, rows in rows_by_src.items():
+            _write_fragment(out, s, pd.DataFrame(rows))
+            state[s] = {**prov, "folder": rows[0]["rel_path"].split("/")[0],
+                        "n_items": len(rows)}
+        # Requested sources that yielded nothing: record state so we don't reload
+        # the (possibly huge) provenance file again until it actually changes.
+        if keep is not None:
+            for s in keep - set(rows_by_src):
+                state[s] = {**prov, "folder": state.get(s, {}).get("folder"), "n_items": 0}
+        _save_state(out, state)
+
+    return _rebuild_manifest(out, state)
 
 
 def main() -> None:
