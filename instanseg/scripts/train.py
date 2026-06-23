@@ -19,6 +19,7 @@ parser = argparse.ArgumentParser()
 #basic usage
 parser.add_argument("-d_p", "--data_path", type=str, default=r"../datasets", help="Path to the .pth file")
 parser.add_argument("-data", "--dataset", type=str, default="segmentation", help="Name of the dataset to load")
+parser.add_argument("-zarr", "--zarr_root", type=str, default=None, help="Root of the zarr dataset (manifest.parquet lives here). Defaults to <data_path>/zarr. Built once from the .pth sources if missing.")
 parser.add_argument('-source', '--source_dataset', default="all", type=str, help = "Which datasets to use for training. Input is 'all' or a list of datasets (e.g. [TNBC_2018,LyNSeC,IHC_TMA,CoNSeP])")
 parser.add_argument("-m_f", "--model_folder", type=str, default=None, help = "Name of the model to resume training. This must be a folder inside model_path")
 parser.add_argument("-m_p", "--model_path", type=str, default=r"../models", help = "Path to the folder containing the models")
@@ -286,15 +287,19 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
 
     from instanseg.utils.utils import plot_average, _choose_device
     from instanseg.utils.model_loader import build_model_from_dict, load_model_weights
-    from instanseg.utils.data_loader import _read_images_from_pth, get_loaders
+    from instanseg.utils.zarr_loader import get_zarr_loaders, ensure_zarr_dataset
 
     # Accelerator setup (replaces nn.DataParallel). Initialize first so is_main_process
     # is available for guarding mkdir / prints / saves throughout.
     from accelerate import Accelerator
     from accelerate.utils import DistributedDataParallelKwargs
 
+    # AdaLN's grad-participation set changes between steps (zero-init ramp + random
+    # C/N pick), which static_graph forbids. Use find_unused_parameters for --adaln
+    # (slower but dynamic); keep the fast static_graph route otherwise. Mutually exclusive.
     ddp_kwargs = DistributedDataParallelKwargs(
-        static_graph=True,           # graph traced once → handles unused + reused params
+        static_graph=not args.adaln,
+        find_unused_parameters=args.adaln,
         gradient_as_bucket_view=True,
     )
     accelerator = Accelerator(
@@ -581,38 +586,18 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         args.source_dataset = args.source_dataset.lower()
 
 
-    train_images, train_labels, train_meta, val_images, val_labels, val_meta = _read_images_from_pth(data_path = args.data_path, 
-                                                                                                     dataset = args.dataset,
-                                                                                                       data_slice = args.data_slice, 
-                                                                                                       dummy = args.dummy, 
-                                                                                                       args = args, 
-                                                                                                       sets= ["Train","Validation"],
-                                                                                                       complete_dataset=segmentation_dataset)
-
-    if args.force_pseudo_pixel_size:
-        for m in list(train_meta or []) + list(val_meta or []):
-            if isinstance(m, dict):
-                m.pop("pixel_size", None)
-
-    # Per-rank dataset shard (DDP). Scale len_epoch / len_eval down so total
-    # samples per epoch is preserved across ranks.
+    # Lazy zarr dataset. Built once from the .pth sources on first use (only on
+    # the main process; other ranks wait), then read lazily — no in-RAM dataset.
+    zarr_root = Path(args.zarr_root) if args.zarr_root else Path(args.data_path) / "zarr"
+    monolith_name = args.dataset if str(args.dataset).endswith(".pth") else f"{args.dataset}_dataset.pth"
+    args.manifest_path = ensure_zarr_dataset(zarr_root, data_dir=args.data_path,
+                                             monolith_name=monolith_name,
+                                             splits=("Train", "Validation"),
+                                             accelerator=accelerator)
+    # DDP sharding is handled by accelerator.prepare(train_loader, test_loader)
+    # below — the lazy dataset needs no manual per-rank slicing.
     args._dataloader_was_sharded = False
-    _do_shard = args.shard_dataset_per_rank and accelerator.num_processes > 1
-    if _do_shard:
-        rank = accelerator.process_index
-        n = accelerator.num_processes
-        train_images = train_images[rank::n]
-        train_labels = train_labels[rank::n]
-        train_meta   = train_meta[rank::n]
-        val_images   = val_images[rank::n]
-        val_labels   = val_labels[rank::n]
-        val_meta     = val_meta[rank::n]
-        args._dataloader_was_sharded = True
-        args.length_of_epoch = max(1, args.length_of_epoch // n)
-        if getattr(args, 'length_of_eval', None) is not None:
-            args.length_of_eval = max(1, args.length_of_eval // n)
-
-    train_loader, test_loader = get_loaders(train_images, train_labels, val_images, val_labels, train_meta, val_meta, args)
+    train_loader, test_loader = get_zarr_loaders(args)
 
     if args.show_augmentations and is_main:
         from instanseg.utils.visualization import show_images
@@ -620,8 +605,7 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         os.makedirs(aug_dir, exist_ok=True)
         train_dataset = train_loader.dataset
         for i in range(min(10, len(train_dataset))):
-            raw_img = train_dataset.X[i]
-            raw_lbl = train_dataset.Y[i]
+            raw_img, raw_lbl = train_dataset.raw_view(i)
             aug_img, aug_lbl = train_dataset[i][:2]
             show_images(raw_img, raw_lbl, aug_img, aug_lbl,
                         titles=["Raw image", "Raw label", "Aug image", "Aug label"],
@@ -739,31 +723,15 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
             method.update_mask_loss(args.mask_loss_fn)
         method.reset_uncertainty_weights()
 
-        # Cluster train images using the hotstart-trained model, then rebuild
-        # loaders with Leiden-weighted sampling for the main training run.
+        # Leiden cluster-weighted resampling depended on the in-RAM dataset +
+        # the old get_loaders; not yet ported to the lazy zarr pipeline.
         if args.cluster_sample:
-            from instanseg.utils.sampling import run_sampling
-            run_sampling(args, train_loader, train_meta, device, model=model)
-            args.weight = True
-            train_loader, test_loader = get_loaders(
-                train_images, train_labels, val_images, val_labels,
-                train_meta, val_meta, args,
-            )
+            raise NotImplementedError(
+                "--cluster_sample (Leiden cluster-weighted sampling) is not yet "
+                "supported by the zarr data pipeline. Use --weight for "
+                "parent-dataset frequency balancing, or set --cluster_sample 0.")
 
-    def _resample_train_loader():
-        from instanseg.utils.sampling import run_sampling
-        run_sampling(args, train_loader, train_meta, device, model=model)
-        args.weight = True
-        new_train, _ = get_loaders(
-            train_images, train_labels, val_images, val_labels,
-            train_meta, val_meta, args,
-        )
-        return new_train
-
-    _resample_kwargs = (
-        {'resample_fn': _resample_train_loader, 'resample_interval': args.cluster_sample}
-        if args.cluster_sample > 0 else {}
-    )
+    _resample_kwargs = {}
 
     if _preemptable_resuming and _preemptable_checkpoint is not None:
         _ckpt = _preemptable_checkpoint

@@ -4,7 +4,7 @@ import pdb
 
 from einops import rearrange
 from typing import Tuple, List, Union, Optional
-from instanseg.utils.pytorch_utils import torch_fastremap, torch_onehot,fast_sparse_intersection_over_minimum_area, remap_values, fast_iou, fast_sparse_iou, connected_components, flood_fill,fill_holes, expand_labels_map
+from instanseg.utils.pytorch_utils import torch_fastremap, torch_onehot,fast_sparse_intersection_over_minimum_area, remap_values, fast_iou, fast_sparse_iou, connected_components, flood_fill,fill_holes, expand_labels_map, amp_dtype
 from instanseg.utils.tiling import _instanseg_padding, _recover_padding
 
 import torch.nn.functional as F
@@ -1780,7 +1780,7 @@ class InstanSeg(nn.Module):
             self.cells_and_nuclei = False
 
             for t in transforms:
-                with torch.amp.autocast("cuda"):
+                with torch.amp.autocast("cuda", dtype=amp_dtype()):
                     augmented_image = t.augment_image(img)
                     augmented_image, pad = _instanseg_padding(augmented_image, extra_pad= 0, min_dim = 32)
                     prediction = model(augmented_image)[:,i * dim_out:(i+1) * dim_out]
@@ -1862,12 +1862,16 @@ class IdentityTransform:
 
         
 from instanseg.utils.biological_utils import resolve_cell_and_nucleus_boundaries
-from instanseg.utils.models.MaxViT import MaxViTRunWrapper, MaxViTPadCropWrapper
-from typing import Dict, Optional
+from instanseg.utils.models.MaxViT import MaxViTRunWrapper, MaxViTPadCropWrapper, MaxViTCondRunWrapper, MaxViTCondPadCropWrapper
+from typing import Dict, List, Optional, Tuple
 
 
 class InstanSeg_Torchscript(nn.Module):
-    def __init__(self, model, 
+    # Final so TorchScript constant-folds the `if self.is_adaln` branches and
+    # only compiles the matching self.fcn(...) call signature (x vs x,cond).
+    is_adaln: torch.jit.Final[bool]
+
+    def __init__(self, model,
                  cells_and_nuclei: bool = False,
                  pixel_size : float = 0, 
                  n_sigma: int = 2, 
@@ -1882,6 +1886,12 @@ class InstanSeg_Torchscript(nn.Module):
 
         use_mixed_precision = True
 
+        # AdaLN class-conditioned MaxViT: the traced core must take the class
+        # index as a real input so the export stays switchable (N vs C) at
+        # runtime. Only MaxViT carries `.adaln`, so this is mutually exclusive
+        # with the non-MaxViT trace branch.
+        is_adaln = getattr(model, "adaln", None) is not None
+
         with torch.amp.autocast("cuda", enabled=use_mixed_precision):
             with torch.no_grad():
                 example = torch.rand(1, backbone_dim_in, 256, 256)
@@ -1890,10 +1900,17 @@ class InstanSeg_Torchscript(nn.Module):
                     # wrap with a scripted pad-and-crop so the model accepts arbitrary
                     # input sizes. Direct trace bakes the pad conditional out as a constant.
                     pad_multiple = int(model._pad_multiple)
-                    core_traced = torch.jit.trace(MaxViTRunWrapper(model), example)
-                    self.fcn = MaxViTPadCropWrapper(core_traced, pad_multiple)
+                    if is_adaln:
+                        cond_example = torch.zeros(1, dtype=torch.long)
+                        core_traced = torch.jit.trace(MaxViTCondRunWrapper(model), (example, cond_example))
+                        self.fcn = MaxViTCondPadCropWrapper(core_traced, pad_multiple)
+                    else:
+                        core_traced = torch.jit.trace(MaxViTRunWrapper(model), example)
+                        self.fcn = MaxViTPadCropWrapper(core_traced, pad_multiple)
                 else:
                     self.fcn = torch.jit.trace(model, example)
+
+        self.is_adaln = is_adaln
 
         #from instanseg.utils.models.CellposeSam import SAM_UNet_inference
         #self.fcn = SAM_UNet_inference(self.fcn)
@@ -1912,7 +1929,10 @@ class InstanSeg_Torchscript(nn.Module):
             except AttributeError:
                 pass
 
-        self.cells_and_nuclei = cells_and_nuclei
+        # AdaLN models are single-head per conditioned pass; "both" N+C comes
+        # from two conditioned passes (see _forward_standard/_forward_tta), not
+        # a 2-head output, so force cells_and_nuclei off for the slicing logic.
+        self.cells_and_nuclei = cells_and_nuclei and not is_adaln
         self.pixel_size = pixel_size
         self.dim_coords = dim_coords
         self.dim_seeds = dim_seeds
@@ -1929,10 +1949,374 @@ class InstanSeg_Torchscript(nn.Module):
         self.default_overlap_threshold = self.params.get('overlap_threshold', 0.3)
         self.default_mean_threshold = self.params.get('mean_threshold', 0.0)
         self.default_fg_threshold = self.params.get('fg_threshold', 0.5)
-        self.default_window_size = self.params.get('window_size',64) #32
+        self.default_window_size = self.params.get('window_size',128) #32
         self.default_cleanup_fragments = self.params.get('cleanup_fragments', True)
         self.default_resolve_cell_and_nucleus = self.params.get('resolve_cell_and_nucleus', True)
 
+
+    def _decode_prediction(self, x: torch.Tensor, fg_threshold: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Decode a single-class prediction (dim_out, H, W) into the coordinate
+        # fields (with the coordinate map already added), sigma and seed/mask map.
+        height, width = x.size(1), x.size(2)
+        xxyy = generate_coordinate_map(mode="linear", spatial_dim=self.dim_coords, height=height, width=width, device=x.device)
+        fields = (torch.sigmoid(x[0:self.dim_coords]) - 0.5) * 8
+        sigma = x[self.dim_coords:self.dim_coords + self.n_sigma]
+        # inverse transform applied to edt during training.
+        mask_map = ((x[self.dim_coords + self.n_sigma]) / 15) + 0.5
+        if self.dim_seeds == 1:
+            mask_map = ((x[-1]) / 15) + 0.5
+        else:
+            binary_map = torch.sigmoid(x[-1])
+            mask_map = (x[-2] / 15).clone() + 0.5
+            mask_map[~(binary_map > fg_threshold)] = 0  # Set seed_map to 0 where binary_map is False
+        fields = fields + xxyy
+        return fields, sigma, mask_map
+
+    def _crops_from_seeds(self, fields: torch.Tensor, sigma: torch.Tensor, centroids_idx: torch.Tensor,
+                          window_size: int, mask_threshold: float, cleanup_fragments: bool,
+                          apply_min_size: bool, min_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Run the pixel classifier in a window around each seed and return the
+        # sigmoid crops (C,1,slice,slice) and their absolute coords (2,C,slice,slice).
+        fields_at_centroids = fields[:, centroids_idx[:, 0], centroids_idx[:, 1]]
+        x = fields
+        c = fields_at_centroids.T
+        h, w = x.shape[-2], x.shape[-1]
+        C = c.shape[0]
+
+        window_size = min(window_size, h, w)
+        centroids = centroids_idx.clone().cpu()  # C,2
+        centroids[:, 0].clamp_(min=window_size, max=h - window_size)
+        centroids[:, 1].clamp_(min=window_size, max=w - window_size)
+        window_slices = centroids[:, None].to(x.device) + torch.tensor([[-1, -1], [1, 1]], device=x.device, dtype=centroids.dtype) * window_size
+
+        slice_size = window_size * 2
+
+        # Create grids of indices for slice windows
+        grid_x, grid_y = torch.meshgrid(
+            torch.arange(slice_size, device=x.device, dtype=self.index_dtype),
+            torch.arange(slice_size, device=x.device, dtype=self.index_dtype), indexing="ij")
+        mesh = torch.stack((grid_x, grid_y))
+
+        mesh_grid = mesh.expand(C, 2, slice_size, slice_size)  # C,2,2*window_size,2*window_size
+        mesh_grid_flat = torch.flatten(mesh_grid, 2).permute(1, 0, -1)  # 2,C,2*window_size*2*window_size
+        idx = window_slices[:, 0].permute(1, 0)[:, :, None]
+        mesh_grid_flat = mesh_grid_flat + idx
+        mesh_grid_flat = torch.flatten(mesh_grid_flat, 1)  # 2,C*2*window_size*2*window_size
+
+        x = feature_engineering_slow(x, c, sigma, torch.tensor(window_size).int(), mesh_grid_flat)
+        x = torch.sigmoid(self.pixel_classifier(x))
+        x = x.reshape(C, 1, slice_size, slice_size)
+        coords = mesh_grid_flat.reshape(2, C, slice_size, slice_size)
+
+        if min_size > 0 and apply_min_size:
+            # reshape(-1) -> (C,) regardless of C. A bare .squeeze() collapses to a
+            # 0-d scalar when C == 1 and triggers a CUDA boolean-indexing assert.
+            valid_objects = (x >= mask_threshold).sum((2, 3)).reshape(-1) > min_size
+            x = x[valid_objects]
+            coords = coords[:, valid_objects]
+            centroids_idx = centroids_idx[valid_objects]
+            window_slices = window_slices[valid_objects]
+
+        C = x.shape[0]
+        if C == 0:
+            return x, coords
+
+        if cleanup_fragments:
+            top_left = window_slices[:, 0, :]
+            shifted_centroid = centroids_idx - top_left
+
+            seeds = torch.zeros_like(x)
+            seeds[torch.arange(C, device=x.device), 0, shifted_centroid[:, 0], shifted_centroid[:, 1]] = 1
+
+            filled = flood_fill((x >= mask_threshold), seeds) > 0
+            holes = torch.bitwise_xor(fill_holes(filled), filled)
+
+            x[~filled] = 0  # remove fragments
+            x[holes] = mask_threshold  # fill holes
+
+        return x, coords
+
+    def _labels_from_crops(self, x: torch.Tensor, coords: torch.Tensor, h: int, w: int,
+                           mask_threshold: float, overlap_threshold: float) -> torch.Tensor:
+        # Paint the (sigmoid) crops into a full label map and merge overlapping
+        # objects via sparse IoU + connected components.
+        C = x.shape[0]
+        slice_size = coords.shape[-1]
+
+        if x.is_mps:
+            x = x.to('cpu')
+            coords = coords.to('cpu')
+
+        mesh_grid_flat = coords.flatten(1)
+
+        labels = convert(x, coords, size=(h, w), mask_threshold=mask_threshold)[None]
+
+        idx = torch.arange(1, C + 1, device=x.device, dtype=self.index_dtype)
+        stack_ID = torch.ones((C, slice_size, slice_size), device=x.device, dtype=self.index_dtype)
+        stack_ID = stack_ID * (idx[:, None, None] - 1)
+
+        iidd = torch.stack((stack_ID.flatten(), mesh_grid_flat[0] * w + mesh_grid_flat[1]))
+
+        fg = x.flatten() >= mask_threshold
+        x = x.flatten()[fg]
+        sparse_onehot = torch.sparse_coo_tensor(
+            iidd[:, fg],
+            (x.flatten() >= mask_threshold).float(),
+            size=(C, h * w),
+            dtype=x.dtype,
+            device=x.device
+        )
+
+        iou = fast_sparse_intersection_over_minimum_area(sparse_onehot)
+       # iou = fast_sparse_iou(sparse_onehot)
+        remapping = find_connected_components((iou > overlap_threshold).to(self.index_dtype))
+        labels = remap_values(remapping, labels)
+        return labels.squeeze()
+
+    def _aug(self, img: torch.Tensor, hflip: bool, vflip: bool, rot_k: int) -> torch.Tensor:
+        # Apply a D4 transform (h-flip, then v-flip, then rot90 k) on the last two dims.
+        if hflip:
+            img = torch.flip(img, dims=[-1])
+        if vflip:
+            img = torch.flip(img, dims=[-2])
+        if rot_k != 0:
+            img = torch.rot90(img, rot_k, dims=[-2, -1])
+        return img
+
+    def _deaug(self, x: torch.Tensor, hflip: bool, vflip: bool, rot_k: int) -> torch.Tensor:
+        # Inverse of _aug: undo in reverse order (un-rot, then un-vflip, un-hflip).
+        if rot_k != 0:
+            x = torch.rot90(x, -rot_k, dims=[-2, -1])
+        if vflip:
+            x = torch.flip(x, dims=[-2])
+        if hflip:
+            x = torch.flip(x, dims=[-1])
+        return x
+
+    def _forward_tta(self, x: torch.Tensor,
+                     target_segmentation: torch.Tensor,
+                     min_size: int, mask_threshold: float, peak_distance: int,
+                     seed_threshold: float, overlap_threshold: float, mean_threshold: float,
+                     fg_threshold: float, window_size: int, cleanup_fragments: bool,
+                     resolve_cell_and_nucleus: bool) -> torch.Tensor:
+        # Test-time augmentation over the D4 group, mirroring InstanSeg.TTA_postprocessing
+        # on the scriptable postprocessing path. Seeds are found once on the fused
+        # (canonical-space) mask map so crops correspond object-for-object across views;
+        # mask maps are fused by mean, per-object crops by median.
+        transforms: List[Tuple[bool, bool, int]] = [
+            (False, False, 0), (False, False, 1), (False, False, 2), (False, False, 3),
+            (True, False, 0), (True, False, 1), (True, False, 2), (True, False, 3),
+        ]
+        n_t = len(transforms)
+
+        with torch.no_grad():
+            output_labels_list: List[torch.Tensor] = []
+
+            for image_index in range(x.shape[0]):
+                img_i = x[image_index:image_index + 1]  # 1,C,H,W
+
+                # `iterations` holds the semantic class indices to produce (0=N,
+                # 1=C). For a 2-head model the backbone runs once over all views
+                # (shared) and we slice; for an AdaLN model the views depend on
+                # the class, so they are recomputed per class inside the loop.
+                view_preds: List[torch.Tensor] = []
+                dim_out = 0
+                if self.is_adaln:
+                    iterations = torch.tensor([0, 1])[target_segmentation.squeeze().to("cpu") > 0]
+                else:
+                    # Run the backbone over every augmented view once (shared by both classes).
+                    for t in range(n_t):
+                        aug = self._aug(img_i, transforms[t][0], transforms[t][1], transforms[t][2])
+                        aug, pad = _instanseg_padding(aug, extra_pad=0, min_dim=32)
+                        pred = self.fcn(aug)
+                        pred = _recover_padding(pred, pad)  # 1,Cout,H,W (view space)
+                        view_preds.append(pred[0])
+
+                    dim_out = view_preds[0].shape[0]
+                    if self.cells_and_nuclei:
+                        iterations = torch.tensor([0, 1])[target_segmentation.squeeze().to("cpu") > 0]
+                        dim_out = int(dim_out / 2)
+                    else:
+                        iterations = torch.tensor([0])
+
+                labels_list: List[torch.Tensor] = []
+                for i in iterations:
+                    # AdaLN: recompute the views conditioned on this class.
+                    cond_views: List[torch.Tensor] = []
+                    if self.is_adaln:
+                        cond = i.reshape(1).to(x.device)
+                        for t in range(n_t):
+                            aug = self._aug(img_i, transforms[t][0], transforms[t][1], transforms[t][2])
+                            aug, padc = _instanseg_padding(aug, extra_pad=0, min_dim=32)
+                            predc = self.fcn(aug, cond)
+                            predc = _recover_padding(predc, padc)
+                            cond_views.append(predc[0])
+                    # --- stage 1: decode every view, deaugment + fuse the mask maps ---
+                    fields_list: List[torch.Tensor] = []
+                    sigma_list: List[torch.Tensor] = []
+                    mask_list: List[torch.Tensor] = []
+                    for t in range(n_t):
+                        if self.is_adaln:
+                            p = cond_views[t]
+                        elif i == 0:
+                            p = view_preds[t][0:dim_out]
+                        else:
+                            p = view_preds[t][dim_out:]
+                        fields, sigma, mask_map = self._decode_prediction(p, fg_threshold)
+                        fields_list.append(fields)
+                        sigma_list.append(sigma)
+                        mask_list.append(self._deaug(mask_map, transforms[t][0], transforms[t][1], transforms[t][2]))
+
+                    mask_fused = torch.mean(torch.stack(mask_list), dim=0)  # H,W canonical
+                    h, w = mask_fused.shape[-2], mask_fused.shape[-1]
+
+                    # --- stage 2: find seeds once, label them with IDs ---
+                    peak = torch_peak_local_max(mask_fused, neighbourhood_size=peak_distance,
+                                                minimum_value=seed_threshold, return_map=True)
+                    peak_nz = torch.nonzero(peak.squeeze() > 0)
+                    N = peak_nz.shape[0]
+                    if N == 0:
+                        labels_list.append(torch.zeros((h, w), dtype=torch.float32, device=mask_fused.device))
+                        continue
+                    seed_map = torch.zeros((h, w), dtype=torch.float32, device=mask_fused.device)
+                    seed_map[peak_nz[:, 0], peak_nz[:, 1]] = torch.arange(1, N + 1, device=mask_fused.device, dtype=torch.float32)
+
+                    # --- stage 3: per-view crops at the shared seeds, deaugmented ---
+                    crops_list: List[torch.Tensor] = []
+                    coords_id = torch.zeros((0,), device=mask_fused.device)  # identity-view coords (anchor)
+                    for t in range(n_t):
+                        seed_view = self._aug(seed_map, transforms[t][0], transforms[t][1], transforms[t][2])
+                        seed_nz = torch.nonzero(seed_view > 0)
+                        ids = seed_view[seed_nz[:, 0], seed_nz[:, 1]]
+                        order = torch.argsort(ids)
+                        centroids = torch.stack((seed_nz[:, 0][order], seed_nz[:, 1][order]), dim=1).long()
+                        crops, coords = self._crops_from_seeds(fields_list[t], sigma_list[t], centroids,
+                                                               window_size, mask_threshold, cleanup_fragments,
+                                                               apply_min_size=False, min_size=min_size)
+                        crops_list.append(self._deaug(crops, transforms[t][0], transforms[t][1], transforms[t][2]))
+                        if t == 0:
+                            coords_id = coords
+
+                    # --- stage 4: median-fuse crops, apply min_size, finalize ---
+                    fused_crops = torch.median(torch.stack(crops_list), dim=0)[0]
+                    if min_size > 0:
+                        valid = (fused_crops >= mask_threshold).sum((2, 3)).reshape(-1) > min_size
+                        fused_crops = fused_crops[valid]
+                        coords_id = coords_id[:, valid]
+                    if fused_crops.shape[0] == 0:
+                        labels_list.append(torch.zeros((h, w), dtype=torch.float32, device=mask_fused.device))
+                        continue
+                    labels = self._labels_from_crops(fused_crops, coords_id, h, w, mask_threshold, overlap_threshold)
+                    labels_list.append(labels)
+
+                for j, lab_j in enumerate(labels_list):
+                    if lab_j.is_mps:
+                        labels_list[j] = lab_j.to("cpu")
+
+                if len(labels_list) == 1:
+                    lab = labels_list[0][None, None]  # 1,1,H,W
+                else:
+                    lab = torch.stack(labels_list)[None]
+
+                if lab.shape[1] == 2 and resolve_cell_and_nucleus:  # nuclei and cells
+                    lab = resolve_cell_and_nucleus_boundaries(lab)
+
+                output_labels_list.append(lab[0])
+
+            lab = torch.stack(output_labels_list)  # B,C,H,W
+            return lab.to(torch.float32)
+
+    def _forward_standard(self, x: torch.Tensor,
+                          target_segmentation: torch.Tensor,
+                          min_size: int, mask_threshold: float, peak_distance: int,
+                          seed_threshold: float, overlap_threshold: float, fg_threshold: float,
+                          window_size: int, cleanup_fragments: bool, resolve_cell_and_nucleus: bool,
+                          precomputed_seeds: torch.Tensor) -> torch.Tensor:
+        # Standard (no-TTA) inference path. Kept in its own method so forward only
+        # dispatches: an early `return` followed by this large body in forward itself
+        # trips a TorchScript optimizer assert (ir.cpp outputs_[i]->uses().empty()).
+        x, pad = _instanseg_padding(x, extra_pad=0)
+
+        with torch.no_grad():
+
+            if self.is_adaln:
+                # One conditioned backbone pass per requested class (N=0, C=1),
+                # concatenated [class0 | class1 | ...] so the slicing loop below
+                # is identical to the 2-head path. `iterations` is positional
+                # here (the conditioned outputs are already in requested order).
+                sel = torch.tensor([0, 1])[target_segmentation.squeeze().to("cpu") > 0]
+                cond_outs: List[torch.Tensor] = []
+                for k in range(sel.shape[0]):
+                    cond_outs.append(self.fcn(x, sel[k].reshape(1).to(x.device)))
+                x_full = torch.cat(cond_outs, dim=1)
+                n_cls = int(sel.shape[0])
+                dim_out = int(x_full.shape[1] // n_cls) if n_cls > 0 else int(x_full.shape[1])
+                iterations = torch.arange(n_cls)
+            else:
+                x_full = self.fcn(x)
+
+                dim_out = x_full.shape[1]
+
+                if self.cells_and_nuclei:
+                    iterations = torch.tensor([0, 1])[target_segmentation.squeeze().to("cpu") > 0]
+                    dim_out = int(dim_out / 2)
+                else:
+                    iterations = torch.tensor([0])
+
+            output_labels_list = []
+
+            for image_index in range(x_full.shape[0]):
+                labels_list = []
+                for i in iterations:
+                    if i == 0:
+                        x = x_full[image_index, 0:dim_out, :, :]
+                    else:
+                        x = x_full[image_index, dim_out:, :, :]
+
+                    x = _recover_padding(x, pad)
+
+                    h, w = x.size(1), x.size(2)
+
+                    fields, sigma, mask_map = self._decode_prediction(x, fg_threshold)
+
+                    if precomputed_seeds is None or precomputed_seeds.shape[0] == 0:
+                        centroids_idx = torch_peak_local_max(mask_map, neighbourhood_size=peak_distance,
+                                                            minimum_value=seed_threshold, dtype=self.index_dtype)
+                    else:
+                        centroids_idx = precomputed_seeds.to(mask_map.device).long()
+
+                    if centroids_idx.shape[0] == 0:
+                        labels_list.append(torch.zeros(mask_map.shape, dtype=torch.float32, device=mask_map.device).squeeze())
+                        continue
+
+                    crops, coords = self._crops_from_seeds(fields, sigma, centroids_idx, window_size,
+                                                           mask_threshold, cleanup_fragments,
+                                                           True, min_size)
+
+                    if crops.shape[0] == 0:
+                        labels_list.append(torch.zeros(mask_map.shape, dtype=torch.float32, device=mask_map.device).squeeze())
+                        continue
+
+                    labels = self._labels_from_crops(crops, coords, h, w, mask_threshold, overlap_threshold)
+
+                    labels_list.append(labels)
+
+                for j in range(len(labels_list)):
+                    if labels_list[j].is_mps:
+                        labels_list[j] = labels_list[j].to("cpu")
+
+                if len(labels_list) == 1:
+                    lab = labels_list[0][None, None]  # 1,1,H,W
+                else:
+                    lab = torch.stack(labels_list)[None]
+
+                if lab.shape[1] == 2 and resolve_cell_and_nucleus:  # nuclei and cells
+                    lab = resolve_cell_and_nucleus_boundaries(lab)
+
+                output_labels_list.append(lab[0])
+
+            lab = torch.stack(output_labels_list)  # B,C,H,W
+            return lab.to(torch.float32)  # B,C,H,W
 
     def forward(self, x: torch.Tensor,
                 args: Optional[Dict[str, torch.Tensor]] = None,
@@ -1948,6 +2332,7 @@ class InstanSeg_Torchscript(nn.Module):
                 cleanup_fragments: Optional[bool] = None,
                 resolve_cell_and_nucleus: Optional[bool] = None,
                 precomputed_seeds: torch.Tensor = torch.tensor([]),
+                tta: bool = False,
                 ) -> torch.Tensor:
         
         min_size = int(min_size) if min_size is not None else self.default_min_size
@@ -1976,202 +2361,27 @@ class InstanSeg_Torchscript(nn.Module):
         cleanup_fragments = args.get('cleanup_fragments', torch.tensor(cleanup_fragments)).item()
         resolve_cell_and_nucleus = args.get('resolve_cell_and_nucleus', torch.tensor(resolve_cell_and_nucleus)).item()
         precomputed_seeds = args.get('precomputed_seeds', precomputed_seeds)
+        tta = bool(args.get('tta', torch.tensor(tta)).item())
 
         torch.clamp_max_(x, 3) #Safety check, please normalize inputs properly!
         torch.clamp_min_(x, -2)
 
-
-        x, pad = _instanseg_padding(x, extra_pad = 0)
-
-
-        with torch.no_grad():
-
-
-            x_full = self.fcn(x)
-
-            dim_out = x_full.shape[1]
-
-            if self.cells_and_nuclei:
-                iterations = torch.tensor([0,1]) [target_segmentation.squeeze().to("cpu") > 0 ]
-                dim_out = int(dim_out / 2)
-
-            else:
-                iterations = torch.tensor([0])
-                dim_out = dim_out
-
-            output_labels_list = []
-
-            for image_index in range(x_full.shape[0]):
-                labels_list = []
-                for i in iterations:
-                    if i == 0:
-                        x = x_full[image_index,0: dim_out, :, :]
-                    else:
-                        x = x_full[image_index,dim_out:, :, :]
-
-                    x = _recover_padding(x, pad)
-
-                    height, width = x.size(1), x.size(2)
-
-                    xxyy = generate_coordinate_map(mode = "linear", spatial_dim = self.dim_coords, height = height, width = width, device = x.device)
-
-
-                    fields = (torch.sigmoid(x[0:self.dim_coords])-0.5) * 8
-
-
-                    sigma = x[self.dim_coords:self.dim_coords + self.n_sigma]
-
-                    #mask_map = torch.sigmoid(x[self.dim_coords + self.n_sigma]) #legacy
-                    mask_map = ((x[self.dim_coords + self.n_sigma]) / 15) + 0.5 # inverse transform applied to edt during training.
-
-                    if self.dim_seeds == 1:
-                        mask_map = ((x[-1]) / 15) + 0.5
-                        binary_map = mask_map
-                    else:
-                        binary_map = torch.sigmoid(x[-1])
-                        mask_map = (x[-2] / 15).clone() + 0.5
-
-                        mask_map[~(binary_map > fg_threshold)] = 0  # Set seed_map to 0 where binary_map is False
-
-
-                    if precomputed_seeds is None or precomputed_seeds.shape[0] == 0:
-                        centroids_idx = torch_peak_local_max(mask_map, neighbourhood_size=peak_distance,
-                                                            minimum_value=seed_threshold, dtype= self.index_dtype)  # .to(prediction.device)
-                    else:
-                        centroids_idx = precomputed_seeds.to(mask_map.device).long()
-
-                    fields = fields + xxyy
-
-                    fields_at_centroids = fields[:, centroids_idx[:, 0], centroids_idx[:, 1]]
-
-                    x = fields
-                    c = fields_at_centroids.T
-                    E = x.shape[0]
-                    h, w = x.shape[-2:]
-                    C = c.shape[0]
-                    S = sigma.shape[0]
-
-                    if C == 0:
-                        label = torch.zeros(mask_map.shape, dtype= torch.float32, device=mask_map.device).squeeze()
-                        labels_list.append(label)
-                        continue
-
-                    window_size = min(window_size, height, width)
-                    centroids = centroids_idx.clone().cpu()  # C,2
-                    centroids[:, 0].clamp_(min=window_size, max=h - window_size)
-                    centroids[:, 1].clamp_(min=window_size, max=w - window_size)
-                    window_slices = centroids[:, None].to(x.device) + torch.tensor([[-1, -1], [1, 1]] , device = x.device, dtype=centroids.dtype) * window_size
-                    window_slices = window_slices  # C,2,2
-
-                    slice_size = window_size * 2
-
-                    # Create grids of indices for slice windows
-                    grid_x, grid_y = torch.meshgrid(
-                        torch.arange(slice_size, device=x.device, dtype=self.index_dtype),
-                        torch.arange(slice_size, device=x.device, dtype=self.index_dtype), indexing="ij")
-                    mesh = torch.stack((grid_x, grid_y))
-
-                    mesh_grid = mesh.expand(C, 2, slice_size, slice_size)  # C,2,2*window_size,2*window_size
-                    mesh_grid_flat = torch.flatten(mesh_grid, 2).permute(1, 0, -1)  # 2,C,2*window_size*2*window_size
-                    idx = window_slices[:, 0].permute(1, 0)[:, :, None]
-                    mesh_grid_flat = mesh_grid_flat + idx
-                    mesh_grid_flat = torch.flatten(mesh_grid_flat, 1)  # 2,C*2*window_size*2*window_size
-
-                #    x = self.traced_feature_engineering(x, c, sigma, torch.tensor(window_size).int(), mesh_grid_flat)
-                    x = feature_engineering_slow(x, c, sigma, torch.tensor(window_size).int(), mesh_grid_flat)
-
-                    x = torch.sigmoid(self.pixel_classifier(x))
-
-                    x = x.reshape(C, 1, slice_size, slice_size)
-
-                    coords = mesh_grid_flat.reshape(2, C, slice_size, slice_size)
-
-                    if min_size > 0:
-                        # reshape(-1) -> (C,) regardless of C. A bare .squeeze() (or chained
-                        # .squeeze(-1).squeeze(-1)) collapses to a 0-d scalar when C == 1 and
-                        # triggers a CUDA boolean-indexing assert (OffsetCalculator.cuh:115).
-                        valid_objects = (x >= mask_threshold).sum((2,3)).reshape(-1) > min_size
-                        x = x[valid_objects]
-                        coords = coords[:,valid_objects]
-                        mesh_grid_flat = coords.flatten(1)
-                        centroids = centroids[valid_objects]
-                        centroids_idx = centroids_idx[valid_objects]
-                        window_slices = window_slices[valid_objects]
-
-                    C = x.shape[0]
-
-                    if C == 0:
-                        label = torch.zeros(mask_map.shape, dtype= torch.float32, device=mask_map.device).squeeze()
-                        labels_list.append(label)
-                        continue
-
-                    if cleanup_fragments:
-
-                        top_left = window_slices[:,0,:]
-                        shifted_centroid = centroids_idx - top_left
-
-                        seeds = torch.zeros_like(x)
-                        seeds[torch.arange(C, device=x.device), 0, shifted_centroid[:,0], shifted_centroid[:,1]] = 1
-
-                        filled = flood_fill((x >= mask_threshold), seeds) > 0
-                        holes = torch.bitwise_xor(fill_holes(filled), filled)
-                    
-                        x[~filled] = 0 #remove fragments
-                        x[holes] = mask_threshold #fill holes
-
-
-                    if x.is_mps:
-                        device = 'cpu'
-                        mesh_grid_flat = mesh_grid_flat.to(device)
-                        x = x.to(device)
-                        mask_map = mask_map.to(device)
-
-                    labels = convert(x, coords, size=(h, w), mask_threshold=mask_threshold)[None]
-
-                    idx = torch.arange(1, C + 1, device=x.device, dtype = self.index_dtype)
-                    stack_ID = torch.ones((C, slice_size, slice_size), device=x.device, dtype=self.index_dtype)
-                    stack_ID = stack_ID * (idx[:, None, None] - 1)
-
-                    iidd = torch.stack((stack_ID.flatten(), mesh_grid_flat[0] * w + mesh_grid_flat[1]))
-
-                    fg = x.flatten() >= mask_threshold
-                    x = x.flatten()[fg]
-                    sparse_onehot = torch.sparse_coo_tensor(
-                        iidd[:, fg],
-                        (x.flatten() >= mask_threshold).float(),
-                        size=(C, h * w),
-                        dtype=x.dtype,
-                        device=x.device
-                    )
-
-                    iou = fast_sparse_iou(sparse_onehot)
-                   # iou = fast_sparse_intersection_over_minimum_area(sparse_onehot)
-
-                    remapping = find_connected_components((iou > overlap_threshold).to(self.index_dtype))
-                    
-                    labels = remap_values(remapping, labels)
-
-                    labels_list.append(labels.squeeze())
-
-                for i, lab in enumerate(labels_list):
-                    if lab.is_mps:
-                        labels_list[i] = lab.to("cpu")
-
-
-                if len(labels_list) == 1:
-                    lab = labels_list[0][None, None]  # 1,1,H,W
-                else:
-                    lab = torch.stack(labels_list)[None] 
-
-                if lab.shape[1] == 2 and resolve_cell_and_nucleus: #nuclei and cells
-                    lab = resolve_cell_and_nucleus_boundaries(lab)
-
-                output_labels_list.append(lab[0])
-            
-            lab = torch.stack(output_labels_list) # B,C,H,W
-
-
-            return lab.to(torch.float32) # B,C,H,W
+        # Dispatch only (no large body here): an early `return` followed by a big
+        # inline body in forward trips a TorchScript optimizer assert, so both the
+        # TTA and standard paths live in their own methods.
+        if tta:
+            # Test-time augmentation: run the model over the D4 (flip/rotation)
+            # group of views, fuse the seed maps, then median-fuse per-object crops.
+            out = self._forward_tta(x, target_segmentation, min_size, mask_threshold,
+                                    peak_distance, seed_threshold, overlap_threshold,
+                                    mean_threshold, fg_threshold, window_size,
+                                    bool(cleanup_fragments), bool(resolve_cell_and_nucleus))
+        else:
+            out = self._forward_standard(x, target_segmentation, min_size, mask_threshold,
+                                         peak_distance, seed_threshold, overlap_threshold,
+                                         fg_threshold, window_size, bool(cleanup_fragments),
+                                         bool(resolve_cell_and_nucleus), precomputed_seeds)
+        return out
 
 
 

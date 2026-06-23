@@ -452,6 +452,17 @@ class MaxViT(nn.Module):
         self._channels_last = channels_last
         if channels_last:
             self.to(memory_format=torch.channels_last)
+        if compile:
+            # Workaround a Triton/inductor codegen bug on Blackwell (sm_120,
+            # torch 2.11 / triton 3.6): the fused AdaLN BatchNorm-backward kernel
+            # assumes 16-byte-aligned buffers and emits vectorized loads that fault
+            # with `CUDA error: misaligned address` during autotune. Disabling the
+            # alignment assumption uses unaligned-safe loads (minor perf cost).
+            # Override with INSTANSEG_TRITON_DIVISIBLE_BY_16=1 if a newer stack fixes it.
+            import os as _os
+            if _os.environ.get("INSTANSEG_TRITON_DIVISIBLE_BY_16", "0") != "1":
+                import torch._inductor.config as _ind
+                _ind.triton.divisible_by_16 = False
         self._core = torch.compile(self._run, mode=compile_mode) if compile else self._run
 
     # ------------------------------------------------------------------ warm-start
