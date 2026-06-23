@@ -431,20 +431,19 @@ class Augmentations(object):
 
         if self.debug:
             orig = torch.clone(image)  # .copy()
-        perspective_transformer = RandomPerspective(distortion_scale=amount / 2, p=1.0,
-                                                    interpolation=torchvision.transforms.InterpolationMode.NEAREST,
-                                                    fill=float(image.max() if metadata[
-                                                                                  "image_modality"] == "Brightfield" else image.min()))
-        state = torch.get_rng_state()
 
-        out = perspective_transformer(image)
+        # Sample the perspective once and apply the SAME warp to image and labels.
+        # (Was: two RandomPerspective objects + get/set_rng_state to force matching
+        # params, which sampled params and built the transform twice.) Behaviour is
+        # preserved: NEAREST interpolation, brightfield->max / else->min image fill.
+        _, H, W = image.shape
+        is_brightfield = metadata is not None and metadata.get("image_modality") == "Brightfield"
+        img_fill = float(image.max() if is_brightfield else image.min())
+        startpoints, endpoints = RandomPerspective.get_params(W, H, distortion_scale=amount / 2)
+        interp = torchvision.transforms.InterpolationMode.NEAREST
 
-        perspective_transformer = RandomPerspective(distortion_scale=amount / 2, p=1.0,
-                                                    interpolation=torchvision.transforms.InterpolationMode.NEAREST,
-                                                    fill=0)
-
-        torch.set_rng_state(state)
-        labels = perspective_transformer(labels)
+        out = TF.perspective(image, startpoints, endpoints, interpolation=interp, fill=img_fill)
+        labels = TF.perspective(labels, startpoints, endpoints, interpolation=interp, fill=0)
 
         if self.debug:
             print("perspective")
@@ -452,7 +451,6 @@ class Augmentations(object):
         return out, labels
 
     def elastic(self, image, labels, amount=0, metadata=None):
-        from scipy.ndimage import gaussian_filter
         import torch.nn.functional as F
 
         if self.debug:
@@ -462,14 +460,24 @@ class Augmentations(object):
         alpha = amount * 50.0  # displacement magnitude scales with amount
         sigma = 5.0
 
-        dx = gaussian_filter(np.random.randn(H, W).astype(np.float32), sigma) * alpha
-        dy = gaussian_filter(np.random.randn(H, W).astype(np.float32), sigma) * alpha
+        # Smooth displacement field generated at low resolution (~sigma-px grid)
+        # and bilinear-upsampled, all in torch — avoids a full-res randn + scipy
+        # gaussian_filter (the old hot path). The field is renormalised to the
+        # std of the original gaussian-blurred white noise (1/(2*sqrt(pi)*sigma))
+        # so the distortion magnitude is unchanged; only the generation is cheaper.
+        factor = max(1, int(round(sigma)))
+        ch, cw = max(2, H // factor), max(2, W // factor)
+        disp = F.interpolate(torch.randn(1, 2, ch, cw), size=(H, W),
+                             mode='bilinear', align_corners=True)[0]
+        target_std = alpha / (2.0 * np.sqrt(np.pi) * sigma)
+        disp = disp / (disp.std() + 1e-8) * target_std
+        dx, dy = disp[0], disp[1]
 
         grid_y, grid_x = torch.meshgrid(
             torch.linspace(-1, 1, H), torch.linspace(-1, 1, W), indexing='ij'
         )
-        grid_x = grid_x + torch.from_numpy(dx) * (2.0 / W)
-        grid_y = grid_y + torch.from_numpy(dy) * (2.0 / H)
+        grid_x = grid_x + dx * (2.0 / W)
+        grid_y = grid_y + dy * (2.0 / H)
         grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)  # (1, H, W, 2)
 
         # Use modality-appropriate padding: max for brightfield, min for fluorescence

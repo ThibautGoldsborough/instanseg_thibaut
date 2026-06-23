@@ -95,6 +95,7 @@ parser.add_argument('-reset_optimizer', '--reset_optimizer', default=False, type
 _bool = lambda x: (str(x).lower() == 'true')
 parser.add_argument('-compile', '--compile', default=False, type=_bool, help="Whether to torch.compile the model")
 parser.add_argument('-compile_mode', '--compile_mode', default="default", type=str, help="torch.compile mode: default, reduce-overhead, max-autotune")
+parser.add_argument('-time_dataloading', '--time_dataloading', default=False, type=_bool, help="Print a per-epoch timing breakdown (dataload wait vs GPU compute) to diagnose dataloader bottlenecks. Adds per-iter cuda syncs (slightly slows the run).")
 parser.add_argument('-shard_dataset_per_rank', '--shard_dataset_per_rank', default=True, type=_bool, help="Per-rank dataset sharding under multi-GPU DDP. Each rank sees 1/N of the data; total samples per epoch is preserved by scaling length_of_epoch.")
 
 
@@ -588,7 +589,15 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
 
     # Lazy zarr dataset. Built once from the .pth sources on first use (only on
     # the main process; other ranks wait), then read lazily — no in-RAM dataset.
-    zarr_root = Path(args.zarr_root) if args.zarr_root else Path(args.data_path) / "zarr"
+    # Resolution order: explicit --zarr_root > $INSTANSEG_ZARR_ROOT (set by the
+    # cluster launcher train.sh, so it only applies on the HPC) > <data_path>/zarr.
+    _zarr_env = os.environ.get("INSTANSEG_ZARR_ROOT")
+    if args.zarr_root:
+        zarr_root = Path(args.zarr_root)
+    elif _zarr_env:
+        zarr_root = Path(_zarr_env)
+    else:
+        zarr_root = Path(args.data_path) / "zarr"
     monolith_name = args.dataset if str(args.dataset).endswith(".pth") else f"{args.dataset}_dataset.pth"
     args.manifest_path = ensure_zarr_dataset(zarr_root, data_dir=args.data_path,
                                              monolith_name=monolith_name,
