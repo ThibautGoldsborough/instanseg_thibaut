@@ -1335,6 +1335,7 @@ class InstanSeg(nn.Module):
         instance_loss_sum = 0
         all_dists = []
         all_crops = []
+        all_valid = []   # per-crop validity (1=real, 0=masked dummy)
 
         if self.cells_and_nuclei:
             dim_out = int(self.dim_out / 2)
@@ -1388,67 +1389,54 @@ class InstanSeg(nn.Module):
 
                     seed_loss += seed_loss_tmp
 
-                if w_inst == 0:
-                    seed_loss_sum += w_seed * seed_loss
-                    total_seed_loss += seed_loss
-                    continue
-
-                if instance.min() > 0:
-                    seed_loss_sum += w_seed * seed_loss
-                    total_seed_loss += seed_loss
-                    continue
-
-                instance_ids = instance.unique()
-                instance_ids = instance_ids[instance_ids != 0]
-
-                if len(instance_ids) > 0:
+                # Run compute_crops (=> pixel_classifier) once per image every iteration
+                # so the DDP static_graph reuse count is constant; degenerate images use
+                # one dummy seed, masked out of the loss value.
+                if w_inst != 0 and not (instance < 0).all():
+                    self.min_gt_instanseg_area = 10
+                    seed_map_tmp = torch.sigmoid(seed_map[0])  # seed_map may have 2 channels; keep the first
 
                     instance = torch_fastremap(instance)
 
-                    # Area-filter and cap on instance IDS *before* one-hot, so the
-                    # one-hot is at most (num_instance_cap, H, W) instead of
-                    # (num_instances, H, W). torch_onehot materialises an (N, H, W)
-                    # repeat, so building it for all N then capping makes the
-                    # transient scale with instance density — that uncapped spike on
-                    # dense images was the mid-epoch OOM. Selection is equivalent:
-                    # random cap among the area-passing instances.
-                    self.min_gt_instanseg_area = 10
-                    fg = instance[instance > 0].to(torch.long)
-                    ids = torch.unique(fg)
-                    if self.min_gt_instanseg_area is not None:
-                        counts = torch.bincount(fg.flatten())
-                        ids = ids[counts[ids] > self.min_gt_instanseg_area]
-                    if ids.numel() == 0:
-                        seed_loss_sum += w_seed * seed_loss
-                        total_seed_loss += seed_loss
-                        continue
-                    if self.num_instance_cap is not None and self.num_instance_cap < ids.numel():
-                        sel = torch.randperm(ids.numel(), device=ids.device)[:self.num_instance_cap]
-                        ids = ids[sel]
-                    onehot_labels = (instance[0] == ids.view(-1, 1, 1))  # (k, H, W) bool
+                    # Area-filtered, capped instance ids (empty for degenerate images).
+                    ids = instance.new_empty((0,), dtype=torch.long)
+                    if instance.min() <= 0:  # need some background for instance supervision
+                        fg = instance[instance > 0].to(torch.long)
+                        if fg.numel() > 0:
+                            ids = torch.unique(fg)
+                            if self.min_gt_instanseg_area is not None:
+                                counts = torch.bincount(fg.flatten())
+                                ids = ids[counts[ids] > self.min_gt_instanseg_area]
+                            if self.num_instance_cap is not None and self.num_instance_cap < ids.numel():
+                                sel = torch.randperm(ids.numel(), device=ids.device)[:self.num_instance_cap]
+                                ids = ids[sel]
 
+                    if ids.numel() > 0:
+                        onehot_labels = (instance[0] == ids.view(-1, 1, 1))  # (k, H, W) bool
+                        centroids = torch_peak_local_max(seed_map_tmp.squeeze() * onehot_labels.sum(0),
+                                                         neighbourhood_size=3, minimum_value=0.5).T  # (2, P)
+                        if self.num_instance_cap is not None and centroids.shape[1] > self.num_instance_cap:
+                            idx = torch.randperm(centroids.shape[1], device=centroids.device)[:self.num_instance_cap]
+                            centroids = centroids[:, idx]
+                    else:
+                        onehot_labels = None
+                        centroids = seed_map_tmp.new_zeros((2, 0), dtype=torch.long)
 
-                    seed_map_tmp = torch.sigmoid(seed_map[0]) #note seed_map may have 2 channels, we keep the first one.
+                    n_real = int(centroids.shape[1])
+                    if n_real == 0:
+                        # Dummy seed (image centre); its crop is masked out of the loss value.
+                        centroids = torch.tensor([[height // 2], [width // 2]],
+                                                 device=seed_map_tmp.device, dtype=centroids.dtype)
 
+                    centres = spatial_emb[:, centroids[0], centroids[1]].detach().T
 
-                    centroids = torch_peak_local_max(seed_map_tmp.squeeze() * onehot_labels.sum(0), neighbourhood_size = 3, minimum_value = 0.5).T
-
-                    centres = spatial_emb[:,centroids[0],centroids[1]].detach().T
-
-                    idx = torch.randperm(centroids.shape[1])[:self.num_instance_cap]
-
-                    centres = centres[idx]
-                    centroids = centroids[:,idx]
-
-                    instance_labels = onehot_labels[:,centroids[0],centroids[1]].float().argmax(0)
-                    onehot_labels = onehot_labels[instance_labels]
+                    # Per-centroid target = the instance containing it (all-zero for dummy seeds).
+                    if onehot_labels is not None and n_real > 0:
+                        instance_labels = onehot_labels[:, centroids[0], centroids[1]].float().argmax(0)
+                        sel_onehot = onehot_labels[instance_labels].float()  # (n_cent, H, W)
+                    else:
+                        sel_onehot = seed_map_tmp.new_zeros((centroids.shape[1], height, width))
                     centroids = centroids.T
-
-
-                    if len(centroids) == 0:
-                        seed_loss_sum += w_seed * seed_loss
-                        total_seed_loss += seed_loss
-                        continue
 
                     window_size = min(self.window_size, height, width)
 
@@ -1456,12 +1444,12 @@ class InstanSeg(nn.Module):
                                                  centres,
                                                  sigma,
                                                  centroids,
-                                                 feature_engineering = self.feature_engineering,
+                                                 feature_engineering=self.feature_engineering,
                                                  pixel_classifier=self.pixel_classifier,
-                                                 window_size = window_size)
+                                                 window_size=window_size)
 
                     # Seed merging: pool predictions across seeds via M
-                    if self.seed_merging and hasattr(self, 'seed_affinity_net'):
+                    if self.seed_merging and hasattr(self, 'seed_affinity_net') and n_real > 0:
                         sigma_at_seeds = sigma[:, centroids[:, 0], centroids[:, 1]].T  # [K, S]
                         M = compute_seed_merge_matrix(centres, sigma_at_seeds, self.seed_affinity_net, centroids.float())
                         dist = apply_seed_merging(dist, coords, M, height, width, window_size)
@@ -1470,16 +1458,21 @@ class InstanSeg(nn.Module):
                     if self.seed_loss is None:
                         dist = _gate_by_center_logit(dist, centroids, height, width, window_size)
 
-                    crop = onehot_labels.squeeze(1)[coords[0], coords[1], coords[2]].reshape(-1,window_size, window_size)
+                    crop = sel_onehot[coords[0], coords[1], coords[2]].reshape(-1, window_size, window_size)
+                    valid = torch.zeros(dist.shape[0], device=dist.device)
+                    valid[:n_real] = 1.0   # only real crops contribute to the loss value
+
                     if self.batched_instance_loss:
                         all_dists.append(dist)
                         all_crops.append(crop.float())
+                        all_valid.append(valid)
                     else:
                         image_dists = [dist]
                         image_crops = [crop.float()]
+                        image_valid = [valid]
 
                     # Grid-ensured maxima: fill empty grid cells with additional seeds
-                    if self.seed_merging and (grid_maxima := ensure_grid_maxima(seed_map_tmp.squeeze(), centroids, grid_size=16)).shape[0] > 0:
+                    if self.seed_merging and n_real > 0 and (grid_maxima := ensure_grid_maxima(seed_map_tmp.squeeze(), centroids, grid_size=16)).shape[0] > 0:
                         grid_centres = spatial_emb[:, grid_maxima[:, 0], grid_maxima[:, 1]].detach().T
 
                         dist_grid, coords_grid = compute_crops(spatial_emb,
@@ -1502,15 +1495,21 @@ class InstanSeg(nn.Module):
                         if self.batched_instance_loss:
                             all_dists.append(dist_grid)
                             all_crops.append(crop_grid.float())
+                            all_valid.append(torch.ones(dist_grid.shape[0], device=dist_grid.device))
                         else:
                             image_dists.append(dist_grid)
                             image_crops.append(crop_grid.float())
+                            image_valid.append(torch.ones(dist_grid.shape[0], device=dist_grid.device))
 
-                    # Unbatched: compute instance loss per image
                     if not self.batched_instance_loss:
                         img_d = torch.cat(image_dists, dim=0)
                         img_c = torch.cat(image_crops, dim=0)
-                        instance_loss_sum += self.instance_loss_fn(img_d, img_c)
+                        img_v = torch.cat(image_valid, dim=0).bool()
+                        keepalive = img_d.sum() * 0.0
+                        if img_v.any():
+                            instance_loss_sum = instance_loss_sum + self.instance_loss_fn(img_d[img_v], img_c[img_v]) + keepalive
+                        else:
+                            instance_loss_sum = instance_loss_sum + keepalive
 
                 seed_loss_sum += w_seed * seed_loss
                 total_seed_loss += seed_loss
@@ -1523,7 +1522,14 @@ class InstanSeg(nn.Module):
             if all_dists:
                 all_dists = torch.cat(all_dists, dim=0)
                 all_crops = torch.cat(all_crops, dim=0)
-                total_instance_loss = self.instance_loss_fn(all_dists, all_crops)
+                all_valid = torch.cat(all_valid, dim=0).bool()
+                # Loss value from real crops only; *0 keep-alive keeps every crop
+                # connected to pixel_classifier for constant DDP gradient-readiness.
+                keepalive = all_dists.sum() * 0.0
+                if all_valid.any():
+                    total_instance_loss = self.instance_loss_fn(all_dists[all_valid], all_crops[all_valid]) + keepalive
+                else:
+                    total_instance_loss = keepalive
             else:
                 total_instance_loss = 0
         else:
