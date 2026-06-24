@@ -1405,20 +1405,27 @@ class InstanSeg(nn.Module):
 
                     instance = torch_fastremap(instance)
 
-                    onehot_labels = torch_onehot(instance).squeeze(0)  # C x h x w
-
+                    # Area-filter and cap on instance IDS *before* one-hot, so the
+                    # one-hot is at most (num_instance_cap, H, W) instead of
+                    # (num_instances, H, W). torch_onehot materialises an (N, H, W)
+                    # repeat, so building it for all N then capping makes the
+                    # transient scale with instance density — that uncapped spike on
+                    # dense images was the mid-epoch OOM. Selection is equivalent:
+                    # random cap among the area-passing instances.
                     self.min_gt_instanseg_area = 10
+                    fg = instance[instance > 0].to(torch.long)
+                    ids = torch.unique(fg)
                     if self.min_gt_instanseg_area is not None:
-                        onehot_labels = onehot_labels[onehot_labels.sum((1,2)) > self.min_gt_instanseg_area]
-                        if onehot_labels.shape[0] == 0:
-                            seed_loss_sum += w_seed * seed_loss
-                            total_seed_loss += seed_loss
-                            continue
-
-                    if self.num_instance_cap is not None: #This is to cap the number of objects to avoid OOM errors.
-                         if self.num_instance_cap < onehot_labels.shape[0]:
-                            idx = torch.randperm(onehot_labels.shape[0])[:self.num_instance_cap]
-                            onehot_labels = onehot_labels[idx]
+                        counts = torch.bincount(fg.flatten())
+                        ids = ids[counts[ids] > self.min_gt_instanseg_area]
+                    if ids.numel() == 0:
+                        seed_loss_sum += w_seed * seed_loss
+                        total_seed_loss += seed_loss
+                        continue
+                    if self.num_instance_cap is not None and self.num_instance_cap < ids.numel():
+                        sel = torch.randperm(ids.numel(), device=ids.device)[:self.num_instance_cap]
+                        ids = ids[sel]
+                    onehot_labels = (instance[0] == ids.view(-1, 1, 1))  # (k, H, W) bool
 
 
                     seed_map_tmp = torch.sigmoid(seed_map[0]) #note seed_map may have 2 channels, we keep the first one.
