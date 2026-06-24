@@ -379,6 +379,7 @@ def test_epoch(test_model,
     test_loss = []
 
     use_adaln = getattr(args, "adaln", False)
+    use_mae = getattr(args, "mae", False)
     class_for_channel = _channel_classes(args.target_segmentation) if use_adaln else None
     # Seed the per-sample C/N pick so validation conditions are stable across
     # epochs (comparable F1) rather than reshuffling every evaluation.
@@ -396,6 +397,11 @@ def test_epoch(test_model,
                 output = test_model(image_batch)
             loss = test_loss_fn(output, labels.clone()).mean()
             test_loss.append(loss.detach().cpu().numpy())
+
+            if use_mae:
+                # Reconstruction objective: no instances to postprocess / score.
+                global_step_test += 1
+                continue
 
             if type(output) == list:
                 output = output[0]
@@ -423,6 +429,20 @@ def test_epoch(test_model,
                           "this epoch (check --length_of_eval vs batch_size / num GPUs).")
         n_cols = 2 if getattr(args, "dual_head_output", False) else 1
         return float('nan'), np.full(n_cols, np.nan), time.time() - start
+
+    if use_mae:
+        # MAE: report reconstruction loss only; F1 / overlays don't apply. Save
+        # diagnostic panels (original / masked / reconstruction / composite) for
+        # the first epochs or whenever the recon loss improves (best_f1 carries
+        # the prior best -loss, mirroring the segmentation save logic).
+        recon_loss = float(np.mean(test_loss))
+        if (save_bool or (best_f1 is not None and -recon_loss > best_f1)) and is_main:
+            from instanseg.utils.loss.mae import mae_make_panels
+            images, titles = mae_make_panels(output,
+                                             patch_size=getattr(args, "mae_patch_size", 16),
+                                             norm_target=getattr(args, "mae_norm_target", True))
+            show_images(images, save_str=save_str, titles=titles, n_cols=4, colorbar=False)
+        return recon_loss, np.array([np.nan], dtype=np.float32), time.time() - start
 
     # Gather per-batch F1 values across ranks so mean_f1 reflects the whole val set.
     if accelerator is not None and accelerator.num_processes > 1 and len(current_f1_list) > 0:

@@ -80,6 +80,10 @@ parser.add_argument('-hotstart', '--hotstart_training', default=10, type=int, he
 parser.add_argument('-window', '--window_size', default=128, type=int, help = "Size of the window containing each instance")
 parser.add_argument('-multihead', '--multihead', default= False, type=lambda x: (str(x).lower() == 'true'), help = "Whether to branch the decoder into multiple heads.")
 parser.add_argument('-adaln', '--adaln', default=False, type=lambda x: (str(x).lower() == 'true'), help = "MaxViT only: condition a single-head model on cell-vs-nucleus via AdaLN. Each training sample picks one available label map (C or N) at random and passes it to the model as a condition. Requires a maxvit backbone.")
+parser.add_argument('-mae', '--mae', default=False, type=lambda x: (str(x).lower() == 'true'), help = "Masked-image-modeling (MAE-style) self-supervised pretraining: mask input patches and reconstruct them. Reuses the full data/aug/schedule pipeline; replaces the segmentation loss. Skips hotstart and F1 eval.")
+parser.add_argument('-mae_mask_ratio', '--mae_mask_ratio', default=0.6, type=float, help = "MAE: fraction of input patches to mask (default 0.6).")
+parser.add_argument('-mae_patch_size', '--mae_patch_size', default=16, type=int, help = "MAE: patch size for masking and the reconstruction loss (must divide the crop size).")
+parser.add_argument('-mae_norm_target', '--mae_norm_target', default=True, type=lambda x: (str(x).lower() == 'true'), help = "MAE: normalize each target patch to zero-mean/unit-var before the loss (MAE-paper default).")
 parser.add_argument('-dim_coords', '--dim_coords', default=2, type=int, help = "Dimensionality of the coordinate system. Little support for anything but 2")
 parser.add_argument('-dim_seeds', '--dim_seeds', default=1, type=int, help = "Number of seed maps to produce. Little support for anything but 1")
 parser.add_argument('-norm', '--norm', default="BATCH", type=str, help = "Norm layer to use: None, INSTANCE, INSTANCE_INVARIANT, BATCH")
@@ -278,7 +282,7 @@ def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name=
                                                     best_f1=best_f1_score,
                                                     save_bool=save_epoch_outputs,
                                                     args=args,
-                                                    postprocessing_fn=method.postprocessing,
+                                                    postprocessing_fn=(method.postprocessing if method is not None else None),
                                                     method=method,
                                                     iou_threshold=iou_threshold,
                                                     use_amp=scaler is not None,
@@ -288,7 +292,7 @@ def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name=
         train_losses.append(train_loss)
         test_losses.append(test_loss)
 
-        if epoch % 10 ==0 and args.optimize_hyperparameters:
+        if epoch % 10 ==0 and args.optimize_hyperparameters and method is not None:
             best_params = optimize_hyperparameters(model,postprocessing_fn = method.postprocessing,data_loader= test_loader,verbose = not args.on_cluster, show_progressbar = not args.on_cluster)
             method.update_hyperparameters(best_params)
 
@@ -301,12 +305,18 @@ def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name=
             # to float here — this once-per-epoch read is the only sync needed.
             dict_to_print["seed_loss"] = float(method.last_seed_loss)
             dict_to_print["instance_loss"] = float(method.last_instance_loss)
-        if method.uncertainty_weighting:
+        if method is not None and method.uncertainty_weighting:
             import math
             dict_to_print["w_seed"] = math.exp(-method.log_var_seed.item())
             dict_to_print["w_inst"] = math.exp(-method.log_var_inst.item())
 
-        if args.dual_head_output:
+        if args.mae:
+            # No F1 for reconstruction; monitor the (negative) val loss so the
+            # best-checkpoint logic below saves the lowest-loss model.
+            f1_list.append(float('nan'))
+            dict_to_print["recon_loss"] = test_loss
+            f1_score = -test_loss
+        elif args.dual_head_output:
             f1_list.append(f1_score[0])
             f1_list_cells.append(f1_score[1])
             dict_to_print["f1_score_nuclei"] = f1_score[0]
@@ -397,7 +407,8 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
     # Accelerator setup (replaces nn.DataParallel). Initialize first so is_main_process
     # is available for guarding mkdir / prints / saves throughout.
     from accelerate import Accelerator
-    from accelerate.utils import DistributedDataParallelKwargs
+    from accelerate.utils import DistributedDataParallelKwargs, InitProcessGroupKwargs
+    from datetime import timedelta
 
     # static_graph=True is REQUIRED: the loss reuses pixel_classifier once per
     # instance per image in a single backward (instanseg_loss.py:1453/1483) —
@@ -412,9 +423,14 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         find_unused_parameters=False,
         gradient_as_bucket_view=True,
     )
+    # Raise the NCCL collective timeout well above the 600s default: with --compile
+    # (per-rank compile of the probe + first graph can take many minutes and varies
+    # across ranks) and the one-off rank-0 zarr dataset build, a straggler can lag
+    # past 10min and trip the watchdog on the prepare() param broadcast.
+    pg_kwargs = InitProcessGroupKwargs(timeout=timedelta(minutes=120))
     accelerator = Accelerator(
         mixed_precision="bf16" if args.fp16 else "no",
-        kwargs_handlers=[ddp_kwargs],
+        kwargs_handlers=[ddp_kwargs, pg_kwargs],
     )
     is_main = accelerator.is_main_process
     args.accelerator = accelerator   # consumed by train_epoch / test_epoch
@@ -500,10 +516,42 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
             )
     args.dual_head_output = args.cells_and_nuclei and not args.adaln
 
+    if args.mae:
+        # MAE reconstructs a fixed-channel input image; conditioning / channel
+        # invariance / dual-head segmentation don't apply.
+        if args.adaln:
+            raise ValueError("--mae is incompatible with --adaln.")
+        if args.channel_invariant:
+            raise ValueError("--mae requires a fixed input-channel backbone; --channel_invariant is not supported.")
+        if not args.model_str.lower().startswith(("maxvit", "maxxvit")):
+            raise ValueError(f"--mae currently supports maxvit backbones only, got model_str={args.model_str!r}")
+        if args.hotstart_training > 0:
+            # Hotstart swaps in the seed/instance segmentation losses, which MAE
+            # does not use; force it off (warn rather than error so a plain
+            # `--mae True` run, with hotstart at its default 10, just works).
+            import warnings
+            warnings.warn(
+                f"--mae does not use hotstart (it swaps in segmentation losses); "
+                f"forcing --hotstart_training 0 (was {args.hotstart_training})."
+            )
+            args.hotstart_training = 0
+        args.cells_and_nuclei = False
+        args.dual_head_output = False
+
     device = accelerator.device
     args.device = device
 
-    if args.loss_function == "instanseg_loss":
+    if args.mae:
+        from functools import partial
+        from instanseg.utils.loss.mae import MAEWrapper, mae_loss_fn
+
+        # No InstanSeg loss module: the backbone reconstructs the input
+        # (dim_out = dim_in) and mae_loss_fn computes the masked MSE.
+        method = None
+        dim_out = int(dim_in)
+        loss_fn = partial(mae_loss_fn, patch_size=args.mae_patch_size, norm_target=args.mae_norm_target)
+
+    elif args.loss_function == "instanseg_loss":
         from instanseg.utils.loss.instanseg_loss import InstanSeg
 
 
@@ -551,6 +599,11 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
 
     model = build_model_from_dict(args_dict, random_seed=args.rng_seed)
 
+    if args.mae:
+        # Wrap the dense backbone (image -> image) into a masked-reconstruction
+        # model. Parameter-free masking, so optimizer/DDP wiring is unchanged.
+        from instanseg.utils.loss.mae import MAEWrapper
+        model = MAEWrapper(model, patch_size=args.mae_patch_size, mask_ratio=args.mae_mask_ratio)
 
     try:
         from fvcore.nn import FlopCountAnalysis
@@ -576,7 +629,7 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         else:
             raise NotImplementedError("Optimizer not recognized", args.optimizer)
 
-    if args.loss_function in ["instanseg_loss"]:
+    if args.loss_function in ["instanseg_loss"] and not args.mae:
         from instanseg.utils.loss.instanseg_loss import has_pixel_classifier_model
 
         if not has_pixel_classifier_model(model):
@@ -705,7 +758,7 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         eff_max = min(args.max_batch_size,
                       args.length_of_epoch // per_rank,
                       (args.length_of_eval or args.max_batch_size) // per_rank)
-        local_bs = find_optimal_batch_size(model, method, probe_ds, args, device,
+        local_bs = find_optimal_batch_size(model, loss_fn, probe_ds, args, device,
                                            max_bs=max(2, eff_max), mem_fraction=args.bs_mem_fraction,
                                            compiled=bool(args.compile), amp_dtype=_amp,
                                            verbose=is_main)
@@ -762,13 +815,15 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
     model.to(device)
 
     # Re-point method device after Accelerator init (was constructed with cuda:0 default).
-    method.device = device
-    if hasattr(method, 'pixel_classifier') and method.pixel_classifier is not None:
-        method.pixel_classifier.to(device)
-    if hasattr(method, 'teacher_model') and method.teacher_model is not None:
-        method.teacher_model.to(device)
-    if hasattr(method, 'loss_temporal') and method.loss_temporal is not None:
-        method.loss_temporal.device = device
+    # MAE has no loss module (method is None) — the objective lives in the model wrapper.
+    if method is not None:
+        method.device = device
+        if hasattr(method, 'pixel_classifier') and method.pixel_classifier is not None:
+            method.pixel_classifier.to(device)
+        if hasattr(method, 'teacher_model') and method.teacher_model is not None:
+            method.teacher_model.to(device)
+        if hasattr(method, 'loss_temporal') and method.loss_temporal is not None:
+            method.loss_temporal.device = device
 
     model, optimizer = accelerator.prepare(model, optimizer)
     if not args._dataloader_was_sharded:
@@ -804,7 +859,7 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
     if args.fp16 and is_main:
         print("Mixed precision (bf16) training enabled via Accelerator")
 
-    if args.hotstart_training > 0 and not _preemptable_resuming:
+    if args.hotstart_training > 0 and not _preemptable_resuming and not args.mae:
         hot_epochs = args.hotstart_training
         hotstart_lr = 1e-3 * getattr(args, "_lr_scale_factor", 1.0)  # scale with batch like args.lr
         mask_str = f", mask_loss=ce" if args.mask_loss_fn is not None else ""
@@ -975,10 +1030,14 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
     if not is_main:
         return
 
-    from instanseg.utils.model_loader import load_model
-    model, model_dict = load_model(folder="", path=args.output_path) #Load model from checkpoint
-    model.eval()
-    model.to(device)
+    if not args.mae:
+        # Sanity-reload the exported segmentation checkpoint. Skipped for MAE:
+        # the saved weights are the MAEWrapper (backbone.* keys) and there is no
+        # segmentation export path for the reconstruction model yet.
+        from instanseg.utils.model_loader import load_model
+        model, model_dict = load_model(folder="", path=args.output_path) #Load model from checkpoint
+        model.eval()
+        model.to(device)
 
     df = pd.DataFrame({"train_loss": train_losses, "test_loss": test_losses, "f1_score": f1_list})
     df.to_csv(args.output_path / "experiment_metrics.csv", index=False, header=True)

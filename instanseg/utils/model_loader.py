@@ -111,6 +111,11 @@ def read_model_args_from_csv(path=r"../results/", folder=""):
         build_model_dictionary["adaln"] = False
     if "adaln_cond_dim" in build_model_dictionary.keys():
         build_model_dictionary["adaln_cond_dim"] = int(build_model_dictionary["adaln_cond_dim"])
+    # MAE pretraining: backbone reconstructs the input (out_channels = dim_in).
+    if "mae" in build_model_dictionary.keys():
+        build_model_dictionary["mae"] = bool(eval(str(build_model_dictionary["mae"]).capitalize()))
+    else:
+        build_model_dictionary["mae"] = False
 
     return build_model_dictionary
 
@@ -175,7 +180,13 @@ def build_model_from_dict(build_model_dictionary, random_seed = None):
             adaln = _adaln_raw if isinstance(_adaln_raw, bool) else bool(eval(str(_adaln_raw).capitalize()))
             n_seeds = build_model_dictionary["dim_seeds"]
 
-            if build_model_dictionary["cells_and_nuclei"] and not adaln:
+            _mae_raw = build_model_dictionary.get("mae", False)
+            _mae = _mae_raw if isinstance(_mae_raw, bool) else bool(eval(str(_mae_raw).capitalize()))
+
+            if _mae:
+                # MAE pretraining: a single head reconstructing the input image.
+                out_channels = [[dim_in]]
+            elif build_model_dictionary["cells_and_nuclei"] and not adaln:
                 if not multihead:
                     from itertools import chain
                     out_channels = [[build_model_dictionary["dim_coords"], build_model_dictionary["n_sigma"], n_seeds] for i in range(2)]
