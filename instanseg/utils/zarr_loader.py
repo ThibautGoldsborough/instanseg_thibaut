@@ -11,6 +11,7 @@ and the remaining augmentations run on the small tile via the existing
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import numpy as np
@@ -48,6 +49,52 @@ def _source_filter(source_dataset) -> set[str] | None:
     if isinstance(source_dataset, str):
         return {_norm_src(source_dataset)}
     return {_norm_src(s) for s in source_dataset}
+
+
+# A source token may carry a per-source sampling weight: ``name:0.1`` or
+# ``name(0.1)``. The number is a relative frequency multiplier (default 1.0);
+# weights need not sum to 1.
+_SRC_WEIGHT_RE = re.compile(r"^(.*?)(?::|\()\s*([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)\)?$")
+
+
+def _parse_source_token(tok: str) -> tuple[str, float | None]:
+    tok = tok.strip().replace("'", "").replace('"', "")
+    m = _SRC_WEIGHT_RE.match(tok)
+    if m:
+        return m.group(1).strip().lower(), float(m.group(2))
+    return tok.lower(), None
+
+
+def parse_source_dataset(raw) -> tuple[object, dict[str, float]]:
+    """Split ``--source_dataset`` into (clean source spec, per-source weights).
+
+    Accepts ``all`` | ``name`` | ``name:w`` | ``[n1, n2:w2, n3(w3)]`` (and an
+    already-parsed list). Returns ``(source_dataset, weights)`` where
+    ``source_dataset`` is what the rest of the pipeline expects (``"all"`` or a
+    single lowercased name or a list of lowercased names, weights stripped), and
+    ``weights`` maps ``_norm_src(name) -> float`` only for tokens that gave one.
+    """
+    if isinstance(raw, (list, tuple)):
+        tokens, bracket = list(raw), True
+    else:
+        s = str(raw).strip()
+        if "[" in s:
+            tokens, bracket = s.replace("[", "").replace("]", "").split(","), True
+        else:
+            tokens, bracket = [s], False
+
+    names: list[str] = []
+    weights: dict[str, float] = {}
+    for tok in tokens:
+        if not str(tok).strip():
+            continue
+        name, w = _parse_source_token(str(tok))
+        names.append(name)
+        if w is not None:
+            weights[_norm_src(name)] = w
+    if not bracket:
+        return (names[0] if names else "all"), weights
+    return names, weights
 
 
 def ensure_zarr_dataset(zarr_root: str | Path, data_dir: str | Path,
@@ -200,13 +247,38 @@ class ZarrSegmentationDataset(torch.utils.data.Dataset):
         return image.float(), label
 
 
-def _weighted_sampler(parent_datasets: list[str], num_samples: int | None):
+def _make_sampler(parent_datasets: list[str], num_samples: int | None,
+                  balance: bool, source_weights: dict[str, float] | None):
+    """Per-item sampler weighting.
+
+    ``balance`` (the ``-w`` flag) gives each source an equal share via
+    inverse-frequency weighting. ``source_weights`` applies a per-source relative
+    multiplier (default 1.0) on top — so with ``-w`` the source-level sampling
+    probability is proportional to its multiplier (the per-source counts cancel),
+    and without ``-w`` it scales the source's natural (size-proportional) share.
+    Returns a ``WeightedRandomSampler`` when balancing or any multiplier is in
+    play, else ``None`` (caller uses a plain ``RandomSampler`` — unchanged path).
+    """
     from torch.utils.data import WeightedRandomSampler
-    names, counts = np.unique(parent_datasets, return_counts=True)
-    freq = {n: c / counts.sum() for n, c in zip(names, counts)}
-    weights = np.array([1.0 / freq[n] for n in parent_datasets])
-    weights = weights / weights.sum()
-    return WeightedRandomSampler(weights, num_samples or len(weights))
+    parents = np.asarray(parent_datasets)
+    n = len(parents)
+    if balance:
+        names, counts = np.unique(parents, return_counts=True)
+        cnt = dict(zip(names.tolist(), counts.tolist()))
+        base = np.array([1.0 / cnt[p] for p in parents], dtype=np.float64)
+    else:
+        base = np.ones(n, dtype=np.float64)
+    has_mult = bool(source_weights)
+    if has_mult:
+        base = base * np.array([float(source_weights.get(_norm_src(p), 1.0))
+                                for p in parents], dtype=np.float64)
+    if not balance and not has_mult:
+        return None
+    total = base.sum()
+    if total <= 0:
+        raise ValueError("All sampling weights are zero — check --source_dataset weights.")
+    weights = torch.as_tensor(base / total, dtype=torch.double)
+    return WeightedRandomSampler(weights, num_samples or n, replacement=True)
 
 
 def get_zarr_loaders(args):
@@ -220,14 +292,17 @@ def get_zarr_loaders(args):
     train_data = ZarrSegmentationDataset(manifest_path, "Train", args, is_train=True)
     val_data = ZarrSegmentationDataset(manifest_path, "Validation", args, is_train=False)
 
-    if getattr(args, "weight", False):
-        train_sampler = _weighted_sampler(train_data.parent_datasets, args.length_of_epoch)
-        test_sampler = _weighted_sampler(val_data.parent_datasets, args.length_of_eval)
-    else:
-        if args.length_of_epoch is not None:
-            train_sampler = RandomSampler(train_data, num_samples=args.length_of_epoch)
-        else:
-            train_sampler = RandomSampler(train_data)
+    balance = bool(getattr(args, "weight", False))
+    source_weights = getattr(args, "source_weights", None)
+
+    train_sampler = _make_sampler(train_data.parent_datasets, args.length_of_epoch,
+                                  balance, source_weights)
+    if train_sampler is None:
+        train_sampler = (RandomSampler(train_data, num_samples=args.length_of_epoch)
+                         if args.length_of_epoch is not None else RandomSampler(train_data))
+    test_sampler = _make_sampler(val_data.parent_datasets, args.length_of_eval,
+                                 balance, source_weights)
+    if test_sampler is None:
         test_sampler = RandomSampler(val_data, num_samples=args.length_of_eval)
 
     loader_kwargs = {}

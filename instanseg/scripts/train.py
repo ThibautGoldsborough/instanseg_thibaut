@@ -20,7 +20,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("-d_p", "--data_path", type=str, default=r"../datasets", help="Path to the .pth file")
 parser.add_argument("-data", "--dataset", type=str, default="segmentation", help="Name of the dataset to load")
 parser.add_argument("-zarr", "--zarr_root", type=str, default=None, help="Root of the zarr dataset (manifest.parquet lives here). Defaults to <data_path>/zarr. Built once from the .pth sources if missing.")
-parser.add_argument('-source', '--source_dataset', default="all", type=str, help = "Which datasets to use for training. Input is 'all' or a list of datasets (e.g. [TNBC_2018,LyNSeC,IHC_TMA,CoNSeP])")
+parser.add_argument('-source', '--source_dataset', default="all", type=str, help = "Which datasets to use for training. Input is 'all' or a list of datasets (e.g. [TNBC_2018,LyNSeC,IHC_TMA,CoNSeP]). Append a per-source relative sampling weight as name:w or name(w) (default 1, need not sum to 1), e.g. [dsb_2018:0.1,open-ai] — mainly affects sampling with -w True.")
 parser.add_argument("-m_f", "--model_folder", type=str, default=None, help = "Name of the model to resume training. This must be a folder inside model_path")
 parser.add_argument("-m_p", "--model_path", type=str, default=r"../models", help = "Path to the folder containing the models")
 parser.add_argument("-o_p", "--output_path", type=str, default=r"../models", help = "Path to the folder where the results will be saved")
@@ -587,13 +587,14 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         if is_main:
             print(f"[preemptable] Restored model weights, will resume from epoch {_resume_epoch}")
 
-    if "[" in args.source_dataset:
-
-        args.source_dataset = [i.lower() for i in args.source_dataset.replace("[","").replace("]","").replace("'","").split(",")]
-        if is_main:
-            print(type(args.source_dataset), args.source_dataset)
-    else:
-        args.source_dataset = args.source_dataset.lower()
+    # Parse --source_dataset, stripping any per-source sampling weight
+    # (e.g. [dsb_2018:0.1, open-ai]); weights are kept in args.source_weights and
+    # applied by the dataloader sampler (mainly relevant with -w True).
+    from instanseg.utils.zarr_loader import parse_source_dataset
+    args.source_dataset, args.source_weights = parse_source_dataset(args.source_dataset)
+    if is_main:
+        print(f"source_dataset={args.source_dataset!r}"
+              + (f" source_weights={args.source_weights}" if args.source_weights else ""))
 
 
     # Lazy zarr dataset. Built once from the .pth sources on first use (only on
