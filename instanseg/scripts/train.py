@@ -50,6 +50,8 @@ parser.add_argument("-e", "--num_epochs", type=int, default=500)
 parser.add_argument('-len_epoch', '--length_of_epoch', default=1000, type=int, help = "Number of training samples per epoch")
 parser.add_argument('-len_eval', '--length_of_eval', default=200, type=int, help = "Number of validation samples per epoch")
 parser.add_argument("-lr", "--lr", type=float, default=0.001, help = "Learning rate")
+parser.add_argument('-lr_scaling', '--lr_scaling', default="sqrt", type=str, choices=["none", "sqrt", "linear"], help="Scale --lr by the effective (global) batch size relative to --base_batch_size: lr *= (eff_batch/base)^p, p=0.5 (sqrt, recommended for AdamW) or 1.0 (linear), 'none' disables. Applied after --find_batch_size resolves the batch. Existing warmup is kept.")
+parser.add_argument('-base_bs', '--base_batch_size', default=10, type=int, help="Reference (global) batch size at which --lr is the tuned value, for --lr_scaling. Default 10 (i.e. lr=1e-3 @ batch 10).")
 parser.add_argument("-optim", "--optimizer", type=str, default="adamw", help = "Optimizer to use, adam, sgd or adamw")
 parser.add_argument("-m", "--model_str", type=str, default="maxvit_base", help = "Model backbone to use")
 parser.add_argument("-s", "--save", type=bool, default=True, help = "Whether to save model outputs every time a new best F1 score is achieved")
@@ -70,7 +72,9 @@ parser.add_argument('-bg_weight', '--bg_weight', default=None, type= float, help
 parser.add_argument('-instance_loss_fn', '--instance_loss_fn', default="lovasz_hinge", type=str, help = "Loss function to use for instance segmentation: lovasz_hinge or dice_loss are supported. lovasz_hinge is a lot slower to start converging")
 parser.add_argument('-seed_loss_fn', '--seed_loss_fn', default="l1_distance", type=str, help = "Loss function to use for seed selection: ce, l1_distance, l2_distance, or l1_poisson. ce is much faster, but l1_distance is usually more accurate. l1_poisson uses Poisson field instead of EDT.")
 parser.add_argument('-mask_loss_fn', '--mask_loss_fn', default=None, type=str, help = "Loss function to use for the mask channel when dim_seeds=2: ce or dice are supported. If set, dim_seeds is forced to 2.")
-parser.add_argument('-anneal', '--cosineannealing', default=False, type=lambda x: (str(x).lower() == 'true'), help = "Whether to use cosine annealing for the learning rate")
+parser.add_argument('-anneal', '--cosineannealing', default=True, type=lambda x: (str(x).lower() == 'true'), help = "Cosine-anneal the LR over --num_epochs down to lr*1e-2 (ON by default; pairs with --warmup_epochs as warmup->cosine). Decay is paced to --num_epochs, so set -e to your real training length. Set False for a constant post-warmup LR. No effect on SAM/DINO (they use their own multi-stage schedule).")
+parser.add_argument('-warmup', '--warmup_epochs', default=10, type=int, help = "Linear LR warmup epochs, prepended to the schedule for ANY model (0 = off; default 10, on). Recommended when --lr_scaling raises the LR for large batches. Composes with --cosineannealing; for SAM/DINO models it sets the warmup length of their multi-stage schedule.")
+parser.add_argument('-warmup_phase', '--warmup_phase', default="hotstart", type=str, choices=["main", "hotstart"], help = "Where the --warmup_epochs ramp lives: 'hotstart' (default) ramps DURING the hotstart phase (then main starts at full LR); 'main' ramps the first epochs of MAIN training. 'hotstart' falls back to 'main' if --hotstart_training is 0.")
 parser.add_argument('-o_h', '--optimize_hyperparameters', default=False, type=lambda x: (str(x).lower() == 'true'), help = "Whether to optimize hyperparameters every 10 epochs")
 parser.add_argument('-hotstart', '--hotstart_training', default=10, type=int, help = "Number of epochs to train the model with ce before starting the main training loop (default=10)")
 parser.add_argument('-window', '--window_size', default=128, type=int, help = "Size of the window containing each instance")
@@ -107,6 +111,52 @@ parser.add_argument('-compile', '--compile', default=False, type=_bool, help="Wh
 parser.add_argument('-compile_mode', '--compile_mode', default="default", type=str, help="torch.compile mode: default, reduce-overhead, max-autotune")
 parser.add_argument('-time_dataloading', '--time_dataloading', default=False, type=_bool, help="Print a per-epoch timing breakdown (dataload wait vs GPU compute) to diagnose dataloader bottlenecks. Adds per-iter cuda syncs (slightly slows the run).")
 parser.add_argument('-shard_dataset_per_rank', '--shard_dataset_per_rank', default=True, type=_bool, help="Per-rank dataset sharding under multi-GPU DDP. Each rank sees 1/N of the data; total samples per epoch is preserved by scaling length_of_epoch.")
+
+
+def _launcher_cmdline() -> str | None:
+    """Best-effort: the launcher invocation (e.g. ``accelerate launch ...``,
+    ``torchrun``) by walking up the parent-process chain via /proc (Linux only).
+    accelerate/torchrun strip their own flags from sys.argv, so this is the only
+    way to record the full command. Returns None if not found / not on Linux."""
+    import shlex
+    try:
+        pid = os.getppid()
+        for _ in range(8):
+            if pid <= 1:
+                return None
+            parts = [p.decode() for p in
+                     Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\x00") if p]
+            if any(k in " ".join(parts) for k in
+                   ("accelerate", "torchrun", "torch.distributed", "deepspeed")):
+                return " ".join(shlex.quote(p) for p in parts)
+            status = Path(f"/proc/{pid}/status").read_text()
+            pid = int(next(l for l in status.splitlines()
+                           if l.startswith("PPid:")).split()[1])
+    except Exception:
+        return None
+    return None
+
+
+def save_run_command(output_path) -> None:
+    """Append the command used to launch this run to ``output_path/command.txt``
+    (the python invocation from sys.argv + a best-effort launcher line). Appends
+    so re-launches / preemptable resumes accumulate a history."""
+    import shlex, socket
+    from datetime import datetime
+    py_cmd = " ".join(shlex.quote(x) for x in [sys.executable, *sys.argv])
+    lines = [
+        f"# {datetime.now().isoformat(timespec='seconds')}  host={socket.gethostname()}",
+        f"# cwd: {os.getcwd()}",
+    ]
+    launcher = _launcher_cmdline()
+    if launcher:
+        lines.append(f"# launcher: {launcher}")
+    lines.append(py_cmd)
+    try:
+        with open(Path(output_path) / "command.txt", "a") as f:
+            f.write("\n".join(lines) + "\n\n")
+    except Exception as e:
+        print(f"[command.txt] could not save run command: {e}")
 
 
 def save_training_plot(train_losses, test_losses, f1_list, f1_list_cells, output_path, cells_and_nuclei=False, hotstart_epoch=None):
@@ -146,6 +196,48 @@ def save_training_plot(train_losses, test_losses, f1_list, f1_list_cells, output
 
     fig.savefig(output_path / "training_plot.png")
     plt.close(fig)
+
+
+def _build_scheduler(optimizer, args, warmup=None):
+    """Per-epoch LR scheduler with optional linear warmup (--warmup_epochs) for ANY
+    backbone, composed in front of the base schedule. Returns None for the plain
+    constant-LR + no-warmup case (preserves the legacy default).
+
+    ``warmup`` overrides the warmup length (else uses args.warmup_epochs); pass 0 to
+    suppress warmup in the main phase when it's been placed in hotstart instead.
+
+    - SAM/DINO models keep their multi-stage schedule (warmup + plateau + 2 decays);
+      warmup length = warmup or 10 (back-compat default there).
+    - else --cosineannealing -> cosine, optionally prefixed by a linear warmup.
+    - else -> linear warmup then constant, or None when warmup is off.
+    """
+    from torch.optim.lr_scheduler import (LambdaLR, CosineAnnealingLR, LinearLR, SequentialLR)
+    warmup = max(0, int(args.warmup_epochs if warmup is None else warmup))
+    max_epochs = max(1, args.num_epochs)
+    sam_like = args.model_str.lower() in ("cellposesam", "instanseg_sam", "instanseg_dino")
+
+    if sam_like:
+        we = warmup or 10
+        def lr_schedule(epoch):
+            if epoch < we:
+                return (epoch + 1) / we
+            elif epoch < max_epochs - 150:
+                return 1.0
+            elif epoch < max_epochs - 50:
+                return 0.1
+            return 0.01
+        return LambdaLR(optimizer, lr_lambda=lr_schedule)
+
+    if args.cosineannealing:
+        cos = CosineAnnealingLR(optimizer, T_max=max(1, max_epochs - warmup), eta_min=args.lr * 1e-2)
+        if warmup > 0:
+            warm = LinearLR(optimizer, start_factor=1.0 / warmup, end_factor=1.0, total_iters=warmup)
+            return SequentialLR(optimizer, [warm, cos], milestones=[warmup])
+        return cos
+
+    if warmup > 0:  # linear warmup then constant
+        return LambdaLR(optimizer, lr_lambda=lambda e: min(1.0, (e + 1) / warmup))
+    return None
 
 
 def main(model, loss_fn, train_loader, test_loader, num_epochs=1000, epoch_name='output_epoch',
@@ -338,6 +430,7 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         print("Saving results to {}".format(os.path.abspath(args.output_path)))
         if not os.path.exists(args.output_path):
             os.mkdir(args.output_path)
+        save_run_command(args.output_path)
     accelerator.wait_for_everyone()
 
     # Preemptable: detect existing checkpoint for auto-resume
@@ -552,30 +645,7 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
 
         optimizer = get_optimizer(params, args)
 
-    if args.cosineannealing:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=args.lr * 1e-2)
-    
-    elif args.model_str.lower() in ("cellposesam", "instanseg_sam", "instanseg_dino"):
-        from torch.optim.lr_scheduler import LambdaLR
-
-        def lr_schedule(epoch, warmup_epochs=10, max_epochs=args.num_epochs):
-            if epoch < warmup_epochs:
-                # Linear warmup from 0 to max_lr
-                return (epoch + 1) / warmup_epochs
-            elif epoch < max_epochs - 150:
-                # Max LR after warmup
-                return 1.0
-            elif epoch < max_epochs - 50:
-                # First decay stage (reduce by factor of 10)
-                return 0.1
-            else:
-                # Second decay stage (reduce by another factor of 10)
-                return 0.01
-
-        # Scheduler with the custom learning rate function
-        scheduler = LambdaLR(optimizer, lr_lambda=lambda epoch: lr_schedule(epoch))
-    else:
-        scheduler = None
+    scheduler = _build_scheduler(optimizer, args)
 
     # Preemptable: restore model weights from checkpoint (optimizer/scheduler restored later, phase-specifically)
     if _preemptable_resuming and _preemptable_checkpoint is not None:
@@ -651,6 +721,25 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         if is_main:
             print(f"[find_batch_size] using batch_size={args.batch_size}")
 
+    # --- LR scaling by effective (global) batch size --------------------------
+    # Done here (batch is final, whether from --find_batch_size or -bs) and before
+    # the training-phase optimizers are (re)created. Scales args.lr (and hotstart
+    # via _lr_scale_factor) from the (base_batch, lr) reference. The existing
+    # 10-epoch warmup + cosine schedule are unchanged.
+    n_proc = accelerator.num_processes if accelerator is not None else 1
+    eff_batch = args.batch_size * n_proc
+    if args.lr_scaling != "none" and args.base_batch_size > 0:
+        p = 0.5 if args.lr_scaling == "sqrt" else 1.0
+        args._lr_scale_factor = (eff_batch / args.base_batch_size) ** p
+    else:
+        args._lr_scale_factor = 1.0
+    _lr_before = args.lr
+    args.lr = args.lr * args._lr_scale_factor
+    if is_main:
+        print(f"[lr_scaling] {args.lr_scaling}: effective batch {eff_batch} "
+              f"(= {args.batch_size} x {n_proc} ranks), base {args.base_batch_size} "
+              f"-> lr {_lr_before:.3e} x {args._lr_scale_factor:.3f} = {args.lr:.3e}")
+
     # DDP sharding is handled by accelerator.prepare(train_loader, test_loader)
     # below — the lazy dataset needs no manual per-rank slicing.
     args._dataloader_was_sharded = False
@@ -717,7 +806,7 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
 
     if args.hotstart_training > 0 and not _preemptable_resuming:
         hot_epochs = args.hotstart_training
-        hotstart_lr = 1e-3
+        hotstart_lr = 1e-3 * getattr(args, "_lr_scale_factor", 1.0)  # scale with batch like args.lr
         mask_str = f", mask_loss=ce" if args.mask_loss_fn is not None else ""
         if is_main:
             print(f"Hotstart for {hot_epochs} epochs with seed_loss=l1_distance, instance_loss=dice_loss{mask_str}, lr={hotstart_lr}")
@@ -737,6 +826,18 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         else:
             optimizer = get_optimizer(model.parameters(), args, lr=hotstart_lr)
 
+        # --warmup_phase hotstart: ramp the LR DURING hotstart (up to hotstart_lr,
+        # over min(warmup_epochs, hot_epochs)) instead of in main. Built here so it
+        # is attached to the hotstart optimizer that main() actually steps.
+        if args.warmup_phase == "hotstart" and args.warmup_epochs > 0:
+            from torch.optim.lr_scheduler import LambdaLR
+            _we = min(args.warmup_epochs, hot_epochs)
+            scheduler = LambdaLR(optimizer, lr_lambda=lambda e: min(1.0, (e + 1) / _we))
+            if is_main:
+                print(f"[warmup] ramping LR over the first {_we} hotstart epochs (up to {hotstart_lr:.3e})")
+        else:
+            scheduler = None  # hotstart runs flat at hotstart_lr (warmup, if any, is in main)
+
         model, train_losses, test_losses, f1_list, f1_list_cells = main(model, loss_fn, train_loader, test_loader, num_epochs=hot_epochs, epoch_name='hotstart_epoch', scaler=scaler)
 
         # Unfreeze backbone weights after hotstart
@@ -753,23 +854,10 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
 
         optimizer = get_optimizer(filter(lambda p: p.requires_grad, model.parameters()), args)
 
-        # Recreate scheduler for the new optimizer
-        if args.model_str.lower() in ("cellposesam", "instanseg_sam", "instanseg_dino"):
-            from torch.optim.lr_scheduler import LambdaLR
-
-            def lr_schedule(epoch, warmup_epochs=10, max_epochs=args.num_epochs):
-                if epoch < warmup_epochs:
-                    return (epoch + 1) / warmup_epochs
-                elif epoch < max_epochs - 150:
-                    return 1.0
-                elif epoch < max_epochs - 50:
-                    return 0.1
-                else:
-                    return 0.01
-
-            scheduler = LambdaLR(optimizer, lr_lambda=lambda epoch: lr_schedule(epoch))
-        elif args.cosineannealing:
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=args.lr * 1e-2)
+        # Recreate scheduler for the new optimizer. Suppress main-phase warmup when
+        # it was placed in the hotstart phase instead (--warmup_phase hotstart).
+        _main_warmup = 0 if (args.warmup_phase == "hotstart" and args.hotstart_training > 0) else None
+        scheduler = _build_scheduler(optimizer, args, warmup=_main_warmup)
 
         mask_str = f", mask_loss={args.mask_loss_fn}" if args.mask_loss_fn is not None else ""
         if is_main:
@@ -837,20 +925,8 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
                     model.unfreeze_backbone()
 
             optimizer = get_optimizer(filter(lambda p: p.requires_grad, model.parameters()), args)
-            if args.model_str.lower() in ("cellposesam", "instanseg_sam", "instanseg_dino"):
-                from torch.optim.lr_scheduler import LambdaLR
-                def lr_schedule(epoch, warmup_epochs=10, max_epochs=args.num_epochs):
-                    if epoch < warmup_epochs:
-                        return (epoch + 1) / warmup_epochs
-                    elif epoch < max_epochs - 150:
-                        return 1.0
-                    elif epoch < max_epochs - 50:
-                        return 0.1
-                    else:
-                        return 0.01
-                scheduler = LambdaLR(optimizer, lr_lambda=lambda epoch: lr_schedule(epoch))
-            elif args.cosineannealing:
-                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=args.lr * 1e-2)
+            _main_warmup = 0 if (args.warmup_phase == "hotstart" and args.hotstart_training > 0) else None
+            scheduler = _build_scheduler(optimizer, args, warmup=_main_warmup)
 
             method.update_seed_loss(args.seed_loss_fn)
             method.update_instance_loss(args.instance_loss_fn)
