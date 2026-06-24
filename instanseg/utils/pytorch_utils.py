@@ -253,12 +253,14 @@ def instance_wise_edt(x: torch.Tensor, edt_type: str = 'auto') -> torch.Tensor:
 
         flat_labels = labels.reshape(-1)
         flat_edt = xedt.reshape(-1)
-        n_labels = int(flat_labels.max().item()) + 1
-        max_per_label = torch.zeros(n_labels, device=x.device, dtype=flat_edt.dtype)
+        # Compact ids via `unique` so the scatter is O(distinct labels), not
+        # O(max id value) — avoids a GPU spike on large/sparse un-renumbered ids.
+        uniq, inv = torch.unique(flat_labels, return_inverse=True)
+        max_per_label = torch.zeros(uniq.numel(), device=x.device, dtype=flat_edt.dtype)
         max_per_label.scatter_reduce_(
-            0, flat_labels, flat_edt, reduce='amax', include_self=False
+            0, inv, flat_edt, reduce='amax', include_self=False
         )
-        out = flat_edt / max_per_label[flat_labels].clamp_min(1e-6)
+        out = flat_edt / max_per_label[inv].clamp_min(1e-6)
         out[flat_labels == 0] = 0.0
         x = out.reshape(H, W)
     else:
