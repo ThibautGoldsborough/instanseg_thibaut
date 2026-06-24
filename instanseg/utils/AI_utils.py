@@ -104,8 +104,24 @@ def find_optimal_batch_size(model, loss_fn, dataset, args, device,
     opt_reserve = 2 * n_params * 4  # AdamW: 2 fp32 moments/param (probe skips optim.step)
     budget = mem_fraction * total_mem - opt_reserve
 
+    # Bias the probe pool toward the DENSEST images (most instances => most
+    # instance-loss crops + retained autograd graph). Loss memory scales with
+    # per-batch instance content, so probing average-density items underestimates
+    # worst-case batches and OOMs mid-epoch. Estimate instances/image from the
+    # manifest as H*W / median_instance_area; fall back to uniform random.
     rng = np.random.default_rng(0)
-    pool = [dataset[int(i)] for i in rng.integers(0, len(dataset), size=min(pool_size, len(dataset)))]
+    n = len(dataset)
+    rows = getattr(dataset, "rows", None)
+    pool_idx = None
+    if rows is not None and {"median_nucleus_area", "median_cell_area",
+                             "height", "width"}.issubset(rows.columns):
+        area = rows[["median_nucleus_area", "median_cell_area"]].min(axis=1)
+        area = area.fillna(area.max()).clip(lower=1.0)
+        density = (rows["height"] * rows["width"]) / area  # ~instances per image
+        pool_idx = np.argsort(density.to_numpy())[::-1][:min(pool_size, n)]
+    if pool_idx is None:
+        pool_idx = rng.integers(0, n, size=min(pool_size, n))
+    pool = [dataset[int(i)] for i in pool_idx]
 
     def _make_batch(bs):
         items = [pool[j % len(pool)] for j in range(bs)]

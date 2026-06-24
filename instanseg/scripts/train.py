@@ -1,4 +1,11 @@
 import os
+# The loss allocates wildly varying tensor sizes per iteration (instance/seed/crop
+# counts vary ~1000x across images), which fragments the CUDA caching allocator and
+# makes RESERVED memory creep up across an epoch -> mid-epoch OOM even when peak
+# *allocated* fits. expandable_segments lets the allocator grow/shrink segments
+# instead, largely eliminating that fragmentation. setdefault so a user value wins.
+# Must be set before the first CUDA allocation.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 # BEFORE any matplotlib import — silences Tk teardown errors under DDP.
 import matplotlib
 matplotlib.use("Agg")
@@ -38,6 +45,7 @@ parser.add_argument('--force_pseudo_pixel_size', default=False, type=lambda x: (
 parser.add_argument("-bs", "--batch_size", type=int, default=3)
 parser.add_argument('-find_bs', '--find_batch_size', default=False, type=lambda x: (str(x).lower() == 'true'), help="Before training, probe the largest batch size that fits in GPU memory (fwd+bwd, weights untouched) and use it. Overrides --batch_size. DDP-safe (min across ranks).")
 parser.add_argument('-max_bs', '--max_batch_size', default=512, type=int, help="Upper cap for --find_batch_size probing.")
+parser.add_argument('-bs_mem_frac', '--bs_mem_fraction', default=0.8, type=float, help="Fraction of GPU memory --find_batch_size targets. Lower (e.g. 0.8) for more headroom against DDP overhead / worst-case-density batches.")
 parser.add_argument("-e", "--num_epochs", type=int, default=500)
 parser.add_argument('-len_epoch', '--length_of_epoch', default=1000, type=int, help = "Number of training samples per epoch")
 parser.add_argument('-len_eval', '--length_of_eval', default=200, type=int, help = "Number of validation samples per epoch")
@@ -628,7 +636,7 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
                       args.length_of_epoch // per_rank,
                       (args.length_of_eval or args.max_batch_size) // per_rank)
         local_bs = find_optimal_batch_size(model, method, probe_ds, args, device,
-                                           max_bs=max(2, eff_max),
+                                           max_bs=max(2, eff_max), mem_fraction=args.bs_mem_fraction,
                                            compiled=bool(args.compile), amp_dtype=_amp,
                                            verbose=is_main)
         if accelerator is not None and accelerator.num_processes > 1:
