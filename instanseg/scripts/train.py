@@ -84,6 +84,8 @@ parser.add_argument('-mae', '--mae', default=False, type=lambda x: (str(x).lower
 parser.add_argument('-mae_mask_ratio', '--mae_mask_ratio', default=0.6, type=float, help = "MAE: fraction of input patches to mask (default 0.6).")
 parser.add_argument('-mae_patch_size', '--mae_patch_size', default=16, type=int, help = "MAE: patch size for masking and the reconstruction loss (must divide the crop size).")
 parser.add_argument('-mae_norm_target', '--mae_norm_target', default=True, type=lambda x: (str(x).lower() == 'true'), help = "MAE: normalize each target patch to zero-mean/unit-var before the loss (MAE-paper default).")
+parser.add_argument('-mae_init', '--mae_init', default="", type=str, help = "Fine-tune from an MAE checkpoint: path to its folder or model_weights.pth. Transfers backbone (encoder+decoder) weights into a fresh segmentation model (strict=False, shape-filtered: reconstruction heads + pixel_classifier stay random). Mutually exclusive with --model_folder and --mae.")
+parser.add_argument('-backbone_lr_scale', '--backbone_lr_scale', default=1.0, type=float, help = "Multiply the LR of the pretrained backbone (encoder/decoder) params by this factor; e.g. 0.1 for discriminative fine-tuning from --mae_init. 1.0 = uniform LR (no param groups).")
 parser.add_argument('-dim_coords', '--dim_coords', default=2, type=int, help = "Dimensionality of the coordinate system. Little support for anything but 2")
 parser.add_argument('-dim_seeds', '--dim_seeds', default=1, type=int, help = "Number of seed maps to produce. Little support for anything but 1")
 parser.add_argument('-norm', '--norm', default="BATCH", type=str, help = "Norm layer to use: None, INSTANCE, INSTANCE_INVARIANT, BATCH")
@@ -517,8 +519,7 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
     args.dual_head_output = args.cells_and_nuclei and not args.adaln
 
     if args.mae:
-        # MAE reconstructs a fixed-channel input image; conditioning / channel
-        # invariance / dual-head segmentation don't apply.
+        # MAE reconstructs a fixed-channel image: no conditioning / channel-invariance / dual head.
         if args.adaln:
             raise ValueError("--mae is incompatible with --adaln.")
         if args.channel_invariant:
@@ -526,27 +527,26 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         if not args.model_str.lower().startswith(("maxvit", "maxxvit")):
             raise ValueError(f"--mae currently supports maxvit backbones only, got model_str={args.model_str!r}")
         if args.hotstart_training > 0:
-            # Hotstart swaps in the seed/instance segmentation losses, which MAE
-            # does not use; force it off (warn rather than error so a plain
-            # `--mae True` run, with hotstart at its default 10, just works).
+            # Hotstart swaps in seg losses MAE doesn't use; warn+zero so a plain --mae run works.
             import warnings
-            warnings.warn(
-                f"--mae does not use hotstart (it swaps in segmentation losses); "
-                f"forcing --hotstart_training 0 (was {args.hotstart_training})."
-            )
+            warnings.warn(f"--mae does not use hotstart; forcing --hotstart_training 0 (was {args.hotstart_training}).")
             args.hotstart_training = 0
         args.cells_and_nuclei = False
         args.dual_head_output = False
+
+    if args.mae_init:
+        if args.mae:
+            raise ValueError("--mae_init fine-tunes a pretrained MAE model for segmentation; don't combine with --mae.")
+        if args.model_folder:
+            raise ValueError("--mae_init and --model_folder are mutually exclusive (warm-start from MAE vs resume a seg checkpoint).")
 
     device = accelerator.device
     args.device = device
 
     if args.mae:
+        # No InstanSeg loss module: backbone reconstructs the input (dim_out=dim_in).
         from functools import partial
-        from instanseg.utils.loss.mae import MAEWrapper, mae_loss_fn
-
-        # No InstanSeg loss module: the backbone reconstructs the input
-        # (dim_out = dim_in) and mae_loss_fn computes the masked MSE.
+        from instanseg.utils.loss.mae import mae_loss_fn
         method = None
         dim_out = int(dim_in)
         loss_fn = partial(mae_loss_fn, patch_size=args.mae_patch_size, norm_target=args.mae_norm_target)
@@ -600,8 +600,7 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
     model = build_model_from_dict(args_dict, random_seed=args.rng_seed)
 
     if args.mae:
-        # Wrap the dense backbone (image -> image) into a masked-reconstruction
-        # model. Parameter-free masking, so optimizer/DDP wiring is unchanged.
+        # Wrap backbone into a masked-reconstruction model (param-free masking).
         from instanseg.utils.loss.mae import MAEWrapper
         model = MAEWrapper(model, patch_size=args.mae_patch_size, mask_ratio=args.mae_mask_ratio)
 
@@ -629,11 +628,30 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         else:
             raise NotImplementedError("Optimizer not recognized", args.optimizer)
 
+    def trainable_params(model):
+        # Discriminative LR: backbone (encoder/decoder) at lr*backbone_lr_scale, rest
+        # (heads/pixel_classifier) at base lr. Scale 1.0 => plain iterator (no change).
+        if args.backbone_lr_scale == 1.0:
+            return filter(lambda p: p.requires_grad, model.parameters())
+        bb, rest = [], []
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                (bb if (".encoder." in f".{n}" or ".decoders." in f".{n}") else rest).append(p)
+        return [{"params": bb, "lr": args.lr * args.backbone_lr_scale}, {"params": rest}]
+
     if args.loss_function in ["instanseg_loss"] and not args.mae:
         from instanseg.utils.loss.instanseg_loss import has_pixel_classifier_model
 
         if not has_pixel_classifier_model(model):
             model = method.initialize_pixel_classifier(model, MLP_width = args.mlp_width)
+
+    # Warm-start backbone from an MAE checkpoint (before channel-invariant wrapping).
+    if args.mae_init:
+        from instanseg.utils.loss.mae import load_mae_backbone
+        _mae_path = Path(args.mae_init)
+        if not _mae_path.exists():
+            _mae_path = Path(args.model_path) / args.mae_init
+        model = load_mae_backbone(model, _mae_path, verbose=is_main)
 
     if args.model_folder:
         if args.model_folder == "None":
@@ -684,7 +702,7 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
             model.unfreeze_backbone()
             optimizer = get_optimizer(filter(lambda p: p.requires_grad, model.parameters()), args)
         else:
-            optimizer = get_optimizer(model.parameters(), args)
+            optimizer = get_optimizer(trainable_params(model), args)
 
     if args.channel_invariant:
         from instanseg.utils.models.ChannelInvariantNet import AdaptorNetWrapper, has_AdaptorNet

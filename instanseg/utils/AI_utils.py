@@ -431,10 +431,8 @@ def test_epoch(test_model,
         return float('nan'), np.full(n_cols, np.nan), time.time() - start
 
     if use_mae:
-        # MAE: report reconstruction loss only; F1 / overlays don't apply. Save
-        # diagnostic panels (original / masked / reconstruction / composite) for
-        # the first epochs or whenever the recon loss improves (best_f1 carries
-        # the prior best -loss, mirroring the segmentation save logic).
+        # Report recon loss only (no F1). Save panels on first epochs or when it
+        # improves (best_f1 holds the prior best -loss, mirroring the seg save).
         recon_loss = float(np.mean(test_loss))
         if (save_bool or (best_f1 is not None and -recon_loss > best_f1)) and is_main:
             from instanseg.utils.loss.mae import mae_make_panels
