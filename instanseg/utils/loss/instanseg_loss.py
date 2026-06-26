@@ -1887,6 +1887,9 @@ class InstanSeg_Torchscript(nn.Module):
     # Final so TorchScript constant-folds the `if self.is_adaln` branches and
     # only compiles the matching self.fcn(...) call signature (x vs x,cond).
     is_adaln: torch.jit.Final[bool]
+    # Final so the input-channel guard (fixed-channel MaxViT only) constant-folds.
+    adjust_input_channels: torch.jit.Final[bool]
+    backbone_dim_in: torch.jit.Final[int]
 
     def __init__(self, model,
                  cells_and_nuclei: bool = False,
@@ -1928,6 +1931,11 @@ class InstanSeg_Torchscript(nn.Module):
                     self.fcn = torch.jit.trace(model, example)
 
         self.is_adaln = is_adaln
+        # Non-channel-invariant MaxViT expects exactly `backbone_dim_in` channels
+        # (channel-invariant models take the plain-trace branch via AdaptorNet),
+        # so only that path gets the runtime input-channel guard.
+        self.adjust_input_channels = hasattr(model, '_pad_multiple') and hasattr(model, '_run')
+        self.backbone_dim_in = int(backbone_dim_in)
 
         #from instanseg.utils.models.CellposeSam import SAM_UNet_inference
         #self.fcn = SAM_UNet_inference(self.fcn)
@@ -2379,6 +2387,20 @@ class InstanSeg_Torchscript(nn.Module):
         resolve_cell_and_nucleus = args.get('resolve_cell_and_nucleus', torch.tensor(resolve_cell_and_nucleus)).item()
         precomputed_seeds = args.get('precomputed_seeds', precomputed_seeds)
         tta = bool(args.get('tta', torch.tensor(tta)).item())
+
+        # Fixed-channel MaxViT input guard: match the input to backbone_dim_in.
+        if self.adjust_input_channels:
+            C = x.shape[1]
+            if C != self.backbone_dim_in:
+                if C == 1:
+                    x = x.repeat(1, self.backbone_dim_in, 1, 1)  # grayscale -> triplicate
+                elif C < self.backbone_dim_in:
+                    pad = torch.zeros((x.shape[0], self.backbone_dim_in - C, x.shape[2], x.shape[3]),
+                                      dtype=x.dtype, device=x.device)
+                    x = torch.cat([x, pad], dim=1)  # zero-pad missing channels
+                else:
+                    raise ValueError("Input has more channels (" + str(C) + ") than the model expects (" +
+                                     str(self.backbone_dim_in) + "); select channels before inference.")
 
         torch.clamp_max_(x, 3) #Safety check, please normalize inputs properly!
         torch.clamp_min_(x, -2)

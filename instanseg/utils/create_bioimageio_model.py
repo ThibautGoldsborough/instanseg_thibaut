@@ -185,10 +185,21 @@ def export_bioimageio(torchsript: torch.jit._script.RecursiveScriptModule,
     input_crop,_ = Augmenter.torch_rescale(input_tensor,labels=None,current_pixel_size=pixel_size,requested_pixel_size=model_pixel_size_tmp,crop = True, random_seed=1)
     input_crop = input_crop.unsqueeze(0) # add batch dimension
     if input_crop.shape[1] != dim_in and not model_dict["channel_invariant"]:
+        # Match the test image to dim_in, mirroring the torchscript input guard:
+        # keep real channels (don't zero the input or the output is empty and
+        # bioimageio rejects the all-zero test tensor).
+        C = input_crop.shape[1]
         if dim_in == 1:
             input_crop = input_crop[:,1:2]
+        elif C == 1:
+            input_crop = input_crop.repeat(1, dim_in, 1, 1)  # grayscale -> triplicate
+        elif C < dim_in:
+            pad = torch.zeros((1, dim_in - C, input_crop.shape[2], input_crop.shape[3]),
+                              dtype=input_crop.dtype, device=input_crop.device)
+            input_crop = torch.cat([input_crop, pad], dim=1)  # zero-pad missing channels
         else:
-            input_crop = torch.zeros((1,dim_in,input_crop.shape[2],input_crop.shape[3]),dtype=torch.float32, device = input_crop.device)
+            raise ValueError(f"Test image has {C} channels but model expects {dim_in}; "
+                             "select channels before exporting.")
 
     print("Input tensor shape: ", input_crop.shape)
 

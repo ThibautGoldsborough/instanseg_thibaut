@@ -401,6 +401,9 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         else:
             raise ValueError(f"Argument {key} not recognized")
 
+    # Was --lr explicitly set? Decides honor-vs-keep lr on a --model_folder resume.
+    args._lr_explicit = ('-lr' in sys.argv or '--lr' in sys.argv or 'lr' in kwargs)
+
 
     from instanseg.utils.utils import plot_average, _choose_device
     from instanseg.utils.model_loader import build_model_from_dict, load_model_weights
@@ -689,7 +692,22 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
                           "(discarded saved optimizer state)")
             else:
                 optimizer = get_optimizer(model.parameters(),args)
+                # load_state_dict overwrites param-group lr with the checkpoint's, so
+                # by default --lr is dropped (and lr_scaling would compound on it).
+                # Explicit --lr => keep moments but reset the base lr; else keep the
+                # checkpoint lr and skip scaling.
+                _fresh_lrs = [g['lr'] for g in optimizer.param_groups]
                 optimizer.load_state_dict(model_dict['optimizer_state_dict'])
+                if args._lr_explicit:
+                    for g, lr in zip(optimizer.param_groups, _fresh_lrs):
+                        g['lr'] = lr
+                        g.pop('initial_lr', None)
+                    if is_main:
+                        print(f"--model_folder resume: honoring --lr={args.lr} (kept moments)")
+                else:
+                    args._keep_resumed_lr = True
+                    if is_main:
+                        print("--model_folder resume: keeping checkpoint lr (pass -lr to override)")
 
         if is_main:
             print("Resuming training from epoch", model_dict['epoch'])
@@ -810,6 +828,22 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
         print(f"[lr_scaling] {args.lr_scaling}: effective batch {eff_batch} "
               f"(= {args.batch_size} x {n_proc} ranks), base {args.base_batch_size} "
               f"-> lr {_lr_before:.3e} x {args._lr_scale_factor:.3f} = {args.lr:.3e}")
+
+    # The no-hotstart optimizer/scheduler were built (above) with the unscaled lr and
+    # are never rebuilt later, so apply the scale to them here. The hotstart>0 path
+    # rebuilds its main optimizer after this block, so it already picks it up; the
+    # preemptable path restores/rebuilds its own optimizer (skip both).
+    if (args._lr_scale_factor != 1.0 and args.hotstart_training == 0
+            and not _preemptable_resuming
+            and not getattr(args, "_keep_resumed_lr", False)):
+        # Scale the BASE lr (the first scheduler may already have lowered g["lr"] for
+        # warmup; "initial_lr" holds the true base). Keep initial_lr so the rebuilt
+        # scheduler recaptures the scaled base; eta_min reads the now-scaled args.lr.
+        for g in optimizer.param_groups:
+            base = g.get("initial_lr", g["lr"]) * args._lr_scale_factor
+            g["initial_lr"] = base
+            g["lr"] = base
+        scheduler = _build_scheduler(optimizer, args)
 
     # DDP sharding is handled by accelerator.prepare(train_loader, test_loader)
     # below — the lazy dataset needs no manual per-rank slicing.
