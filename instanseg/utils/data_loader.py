@@ -120,7 +120,7 @@ def get_image(img_object):
     import os
     from pathlib import Path
 
-    if type(img_object) == str:
+    if isinstance(img_object, (str, Path)):
 
         data_path = os.environ["INSTANSEG_DATASET_PATH"]
 

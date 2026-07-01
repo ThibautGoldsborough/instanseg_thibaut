@@ -146,9 +146,9 @@ class InstanSeg_UNet(nn.Module):
 
         # out_channels should be a list of lists [[2,2,1],[2,2,1]] means two decoders, each with 3 output blocks. The output will be of shape 10.
 
-        if type(out_channels) == int:
+        if isinstance(out_channels, int):
             out_channels = [[out_channels]]
-        if type(out_channels[0]) == int:
+        if isinstance(out_channels[0], int):
             out_channels = [out_channels]
             
         self.decoders = nn.ModuleList([Decoder(layers,out_channel,norm, act, dropout = dropout) for out_channel in out_channels])

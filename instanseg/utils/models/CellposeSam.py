@@ -41,9 +41,9 @@ class SAM_UNet(nn.Module):
 
         layers = layers[::-1]
 
-        if type(out_channels) == int:
+        if isinstance(out_channels, int):
             out_channels = [[out_channels]]
-        if type(out_channels[0]) == int:
+        if isinstance(out_channels[0], int):
             out_channels = [out_channels]
 
         self.decoders = nn.ModuleList([

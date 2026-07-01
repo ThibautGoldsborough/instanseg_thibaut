@@ -403,7 +403,7 @@ def test_epoch(test_model,
                 global_step_test += 1
                 continue
 
-            if type(output) == list:
+            if isinstance(output, list):
                 output = output[0]
 
             if labels.type() != 'torch.cuda.FloatTensor' and labels.type() != 'torch.FloatTensor':
@@ -661,7 +661,7 @@ def optimize_hyperparameters(model,postprocessing_fn,
 
                 mean_f1 = _robust_average_precision(torch.stack(gt_masks),torch.stack(pred_masks),threshold = threshold)
 
-                if type(mean_f1) == list:
+                if not np.isscalar(mean_f1):
                     mean_f1 = np.nanmean(mean_f1)
 
                 return 1 - mean_f1
@@ -691,7 +691,7 @@ def optimize_hyperparameters(model,postprocessing_fn,
 
                 mean_f1 = _robust_average_precision(gt_masks,pred_masks,threshold = threshold)
 
-                if type(mean_f1) == list:
+                if not np.isscalar(mean_f1):
                     mean_f1 = np.nanmean(mean_f1)
 
                 return 1 - mean_f1

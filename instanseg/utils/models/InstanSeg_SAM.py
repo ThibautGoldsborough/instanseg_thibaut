@@ -113,9 +113,9 @@ class InstanSeg_SAM(nn.Module):
         ])
 
         # Multi-head decoders
-        if type(out_channels) == int:
+        if isinstance(out_channels, int):
             out_channels = [[out_channels]]
-        if type(out_channels[0]) == int:
+        if isinstance(out_channels[0], int):
             out_channels = [out_channels]
 
         self.decoders = nn.ModuleList([

@@ -421,7 +421,7 @@ def save_image_with_label_overlay(im: np.ndarray,
         lab_overlay = np.zeros((lab.shape[0], lab.shape[1], 3))
         lab_overlay[lab > 0, 2] = 1
     else:
-        if type(label_colors) == str:
+        if isinstance(label_colors, str):
             label_colors = _color_name_to_rgb(label_colors)
         lab_overlay = np.zeros((lab.shape[0], lab.shape[1], 3))
         lab_overlay[lab > 0] = label_colors

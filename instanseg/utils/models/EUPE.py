@@ -136,9 +136,9 @@ class EUPE(nn.Module):
         self.stage0_proj = nn.Conv2d(dims[0], dec_layers[3], 1)
         self.stride2_proj = nn.Conv2d(block1_ch, dec_layers[4], 1)
 
-        if type(out_channels) == int:
+        if isinstance(out_channels, int):
             out_channels = [[out_channels]]
-        if type(out_channels[0]) == int:
+        if isinstance(out_channels[0], int):
             out_channels = [out_channels]
 
         self.decoders = nn.ModuleList([
