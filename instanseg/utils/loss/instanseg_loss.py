@@ -1205,7 +1205,7 @@ class InstanSeg(nn.Module):
             self.dim_out = self.dim_out * 2
         self.cells_and_nuclei = cells_and_nuclei
         self.window_size = window_size
-        self.num_instance_cap = 12
+        self.num_instance_cap = 24
         self.bg_weight = bg_weight
         self.seed_merging = seed_merging
 
