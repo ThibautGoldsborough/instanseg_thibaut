@@ -6,7 +6,7 @@ import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
 
-from instanseg.utils.pytorch_utils import torch_sparse_onehot, torch_fastremap, remap_values, torch_onehot
+from instanseg.utils.pytorch_utils import torch_sparse_onehot, torch_fastremap, remap_values, torch_onehot, _sparse_mm_dense
 
 def get_intersection_over_union(label: torch.Tensor, return_lab: bool = True) -> torch.Tensor:
 
@@ -29,7 +29,7 @@ def get_intersection_over_nucleus_area(label: torch.Tensor, return_lab: bool = F
     label = torch.stack((torch_fastremap(label[0,0]),torch_fastremap(label[0,1])))[None]
     nuclei_onehot = torch_sparse_onehot(label[0, 0], flatten=True)[0]
     cell_onehot = torch_sparse_onehot(label[0, 1], flatten=True)[0]
-    intersection = torch.sparse.mm(nuclei_onehot, cell_onehot.T).to_dense()
+    intersection = _sparse_mm_dense(nuclei_onehot, cell_onehot)
     sparse_sum1 = torch.sparse.sum(nuclei_onehot, dim=(1,))[None].to_dense()
     nuclei_area = sparse_sum1.T
 
@@ -48,7 +48,7 @@ def get_intersection_over_cell_area(label: torch.Tensor, return_lab = False) -> 
     label = torch.stack((torch_fastremap(label[0,0]),torch_fastremap(label[0,1])))[None]
     nuclei_onehot = torch_sparse_onehot(label[0, 0], flatten=True)[0]
     cell_onehot = torch_sparse_onehot(label[0, 1], flatten=True)[0]
-    intersection = torch.sparse.mm(cell_onehot, nuclei_onehot.T).to_dense()
+    intersection = _sparse_mm_dense(cell_onehot, nuclei_onehot)
     sparse_sum1 = torch.sparse.sum(cell_onehot, dim=(1,))[None].to_dense()
     cell_area = sparse_sum1.T
     if return_lab:

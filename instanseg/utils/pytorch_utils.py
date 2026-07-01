@@ -179,13 +179,36 @@ def fast_iou(onehot: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
     return intersection / union
 
 
+def _sparse_mm_dense(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Compute torch.sparse.mm(a, b.T) densified, falling back to CPU when the
+    GPU cuSPARSE SpGEMM runs out of workspace on dense images with very many
+    objects.
+
+    The `cusparseSpGEMM_workEstimation ... insufficient resources` / OOM errors
+    are raised at the API level before any kernel launches, so the CUDA context
+    is not poisoned and the op can be safely retried on CPU (slower but has no
+    such workspace limit). These IoU calls run in per-image postprocessing /
+    metrics with no DDP collectives in scope, so a local fallback does not
+    desync ranks."""
+    try:
+        return torch.sparse.mm(a, b.T).to_dense()
+    except RuntimeError as e:
+        msg = str(e).lower()
+        if not any(k in msg for k in ("insufficient resources", "cusparse", "out of memory")):
+            raise
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        device = a.device
+        return torch.sparse.mm(a.cpu().coalesce(), b.cpu().coalesce().T).to_dense().to(device)
+
+
 def fast_sparse_iou(sparse_onehot: torch.Tensor) -> torch.Tensor:
 
-    intersection = torch.sparse.mm(sparse_onehot, sparse_onehot.T).to_dense()
+    intersection = _sparse_mm_dense(sparse_onehot, sparse_onehot)
 
     if torch.isnan(intersection).any() or torch.isinf(intersection).any():
         print("Warning: Intersection contains NaN or Inf values. This may indicate an issue with the input sparse tensor.")
-    
+
 
     sparse_sum = torch.sparse.sum(sparse_onehot, dim=(1,))[None].to_dense()
     union = sparse_sum.T + sparse_sum - intersection
@@ -202,11 +225,11 @@ def fast_sparse_intersection_over_minimum_area(sparse_onehot: torch.Tensor) -> t
         torch.Tensor: A dense tensor of shape (N, N) containing the IoMA values.
     """
     # Compute intersection
-    intersection = torch.sparse.mm(sparse_onehot, sparse_onehot.T).to_dense()
+    intersection = _sparse_mm_dense(sparse_onehot, sparse_onehot)
 
     if torch.isnan(intersection).any() or torch.isinf(intersection).any():
         print("Warning: Intersection contains NaN or Inf values. This may indicate an issue with the input sparse tensor.")
-    
+
     # Compute the area (sum of ones for each row)
     sparse_sum = torch.sparse.sum(sparse_onehot, dim=(1,)).to_dense()
     
@@ -419,7 +442,7 @@ def fast_sparse_dual_iou(onehot1: torch.Tensor, onehot2: torch.Tensor) -> torch.
     """
     # onehot1 and onehot2 are C1,H*W and C2,H*W
 
-    intersection = torch.sparse.mm(onehot1, onehot2.T).to_dense()
+    intersection = _sparse_mm_dense(onehot1, onehot2)
     sparse_sum1 = torch.sparse.sum(onehot1, dim=(1,))[None].to_dense()
     sparse_sum2 = torch.sparse.sum(onehot2, dim=(1,))[None].to_dense()
     union = sparse_sum1.T + sparse_sum2 - intersection
