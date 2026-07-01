@@ -1642,7 +1642,7 @@ class InstanSeg(nn.Module):
         if self.cells_and_nuclei:
             loss = loss / 2
 
-        if type(loss) != torch.Tensor:
+        if not isinstance(loss, torch.Tensor):
             loss = spatial_emb * 0
 
         # Store component losses for logging. Keep them as detached tensors (no
