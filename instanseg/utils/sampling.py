@@ -1,11 +1,13 @@
 """
 Self-embedding extraction + Leiden clustering + UMAP visualization.
 
-Called from train.py after hotstart when -cluster_sample is set. Hooks a named
-tap module on the training model, runs eval-augmented train images through the
-real forward pass N times (each pass gets a fresh random crop + flip from the
-eval aug pipeline, averaged per image), and clusters the resulting embeddings
-with Leiden.
+Called from train.py when ``-cluster_sample N`` is set (initially before main
+training and then every N epochs). Hooks a named tap module on the training
+model, runs an eval-augmented view of the *zarr* Train split through the real
+forward pass, and clusters the resulting embeddings with Leiden. The per-image
+cluster labels are written to ``embeddings.pkl`` and consumed by
+``zarr_loader.get_zarr_loaders`` (aligned by manifest ``rel_path``) to
+inverse-cluster-frequency weight the training sampler.
 """
 
 import pickle
@@ -44,6 +46,15 @@ def _img_to_thumbnail(img_tensor, size=48):
     return img.permute(1, 2, 0).numpy()
 
 
+def _raw_image(dataset, idx):
+    """Full-resolution image (CHW) for thumbnail plotting, from either the zarr
+    dataset (``raw_view``) or the legacy in-RAM dataset (``.X``)."""
+    if hasattr(dataset, "raw_view"):
+        img, _ = dataset.raw_view(idx)
+        return img
+    return dataset.X[idx]
+
+
 def _plot_umap_thumbnails(adata, dataset, output_path, n_per_cluster=3):
     """Scatter UMAP with image thumbnails, subsampled n_per_cluster images per Leiden cluster."""
     import matplotlib.pyplot as plt
@@ -63,7 +74,7 @@ def _plot_umap_thumbnails(adata, dataset, output_path, n_per_cluster=3):
     ax.scatter(umap_coords[:, 0], umap_coords[:, 1], s=4, c="lightgrey", alpha=0.4)
 
     for idx in sampled_indices:
-        raw_img = dataset.X[idx]
+        raw_img = _raw_image(dataset, idx)
         thumb = _img_to_thumbnail(raw_img, size=48)
         im = OffsetImage(thumb, zoom=1.0)
         ab = AnnotationBbox(im, umap_coords[idx], frameon=True, pad=0.1,
@@ -103,7 +114,7 @@ def _plot_cluster_grid(adata, dataset, output_path, n_cols=10, thumb_size=64):
             ax.set_xticks([])
             ax.set_yticks([])
             if col < len(chosen):
-                raw_img = dataset.X[chosen[col]]
+                raw_img = _raw_image(dataset, chosen[col])
                 thumb = _img_to_thumbnail(raw_img, size=thumb_size)
                 ax.imshow(thumb)
             else:
@@ -136,47 +147,31 @@ def _find_embedding_tap(model: torch.nn.Module) -> torch.nn.Module:
     )
 
 
-def _build_eval_dataset(train_dataset, args):
-    """Wrap the same images as ``train_dataset`` with eval-mode augmentations.
+def _build_eval_dataset(args):
+    """Eval-augmented view of the zarr Train split.
 
-    Eval augs are deterministic preprocessing (percentile normalize, resize to
-    tile_size, channel shaping to dim_in) — no random flips/jitter — so
-    embeddings are stable across runs and match what the model sees on
-    validation data.
+    Reuses ``ZarrSegmentationDataset`` with ``is_train=False``: the reader
+    percentile-normalizes and resizes to ``tile_size`` and the crop position is
+    a fixed per-item pseudo-random window (deterministic across calls), so the
+    embedding for image ``i`` is stable and reproducible, and ``rows[i]`` lines
+    up with the training dataset's ``rows[i]`` (identical manifest filtering).
     """
-    from instanseg.utils.AI_utils import Segmentation_Dataset
-    from instanseg.utils.augmentation_config import get_augmentation_dict
-
-    aug_dict = get_augmentation_dict(
-        args.dim_in,
-        nuclei_channel=None,
-        amount=args.transform_intensity,
-        pixel_size=args.requested_pixel_size,
-        augmentation_type=args.augmentation_type,
-        use_instance_channels=args.use_instance_channels,
-    )
-    return Segmentation_Dataset(
-        train_dataset.X,
-        train_dataset.Y,
-        metadata=train_dataset.metadata,
-        size=(args.tile_size, args.tile_size),
-        augmentation_dict=aug_dict["test"],
-        debug=False,
-        dim_in=args.dim_in,
-        cells_and_nuclei=args.cells_and_nuclei,
-        random_seed=args.rng_seed,
-        target_segmentation=args.target_segmentation,
-        channel_invariant=args.channel_invariant,
-    )
+    from instanseg.utils.zarr_loader import ZarrSegmentationDataset
+    return ZarrSegmentationDataset(args.manifest_path, "Train", args, is_train=False)
 
 
-def run_sampling(args, train_loader, train_meta, device, model, n_tta_passes: int = 3):
-    """Cluster train images using the training model itself, save to embeddings.pkl.
+def run_sampling(args, device, model, n_tta_passes: int = 1):
+    """Cluster train images using the training model itself; write embeddings.pkl.
 
-    Hooks the model's ``get_embedding_tap()`` submodule and runs the real
-    forward pass on eval-augmented train images. Wrappers (DataParallel stripped,
-    AdaptorNet kept) pass through naturally. Output is consumed by get_loaders
-    when args.weight is set.
+    Hooks the model's ``get_embedding_tap()`` submodule and runs the real forward
+    pass over an eval-augmented view of the zarr Train split. Wrappers
+    (DataParallel stripped, AdaptorNet kept) pass through naturally. The Leiden
+    ``cluster_labels`` (with their manifest ``rel_paths`` for alignment) are
+    consumed by ``zarr_loader.get_zarr_loaders`` to weight the training sampler.
+
+    ``n_tta_passes`` averages several forward passes; with the deterministic eval
+    crop the passes are identical, so it defaults to 1 (kept for parity / future
+    stochastic-crop variants).
     """
     output_path = Path(args.output_path)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -186,19 +181,18 @@ def run_sampling(args, train_loader, train_meta, device, model, n_tta_passes: in
     print(f"Using training model ({type(full_model).__name__}) for embeddings, "
           f"tap={type(tap).__name__}")
 
-    # Eval-augmented sequential loader so embedding i ↔ dataset image i.
-    # Workers parallelize the CPU-bound augs (percentile-normalize, rescale,
-    # random crop); persistent_workers avoids worker respawn between TTA passes.
+    # Eval-augmented sequential loader so embedding i ↔ dataset row i.
     from torch.utils.data import DataLoader
-    eval_dataset = _build_eval_dataset(train_loader.dataset, args)
+    from instanseg.utils.AI_utils import collate_fn
+    eval_dataset = _build_eval_dataset(args)
     num_workers = max(1, args.num_workers)
     seq_loader = DataLoader(
-        eval_dataset, batch_size=train_loader.batch_size, shuffle=False,
-        collate_fn=train_loader.collate_fn, num_workers=num_workers,
+        eval_dataset, batch_size=args.batch_size, shuffle=False,
+        collate_fn=collate_fn, num_workers=num_workers,
         persistent_workers=True,
     )
 
-    print(f"Extracting embeddings ({n_tta_passes} TTA passes via eval aug pipeline) ...")
+    print(f"Extracting embeddings ({n_tta_passes} pass(es) via eval aug pipeline) ...")
     was_training = full_model.training
     full_model.eval()
 
@@ -207,9 +201,8 @@ def run_sampling(args, train_loader, train_meta, device, model, n_tta_passes: in
         captured["out"] = out
     handle = tap.register_forward_hook(_hook)
 
-    # Each pass through the loader re-samples random crop + flips + pixel-size
-    # jitter from the eval aug pipeline, so averaging over passes gives
-    # crop/flip-invariant embeddings aligned with the training distribution.
+    # Eval crops are deterministic per item, so passes are identical (n=1 by
+    # default); the loop is kept for a future stochastic-crop variant.
     pass_arrays = []
     try:
         with torch.no_grad():
@@ -231,10 +224,8 @@ def run_sampling(args, train_loader, train_meta, device, model, n_tta_passes: in
     embeddings = np.mean(np.stack(pass_arrays, axis=0), axis=0)
     print(f"Embeddings shape: {embeddings.shape}")
 
-    parent_datasets = [
-        (meta["parent_dataset"] if meta is not None and "parent_dataset" in meta else "unknown")
-        for meta in train_meta
-    ]
+    parent_datasets = list(eval_dataset.parent_datasets)
+    rel_paths = eval_dataset.rows["rel_path"].tolist()
 
     embeddings = (embeddings - embeddings.mean(axis=0, keepdims=True)) / np.clip(
         embeddings.std(axis=0, keepdims=True), 1e-8, None
@@ -258,8 +249,8 @@ def run_sampling(args, train_loader, train_meta, device, model, n_tta_passes: in
     sc.pl.umap(adata, color="leiden", save="_cluster.png", show=False)
     sc.pl.umap(adata, color="parent_dataset", save="_dataset.png", show=False)
 
-    _plot_umap_thumbnails(adata, train_loader.dataset, output_path, n_per_cluster=10)
-    _plot_cluster_grid(adata, train_loader.dataset, output_path, n_cols=10)
+    _plot_umap_thumbnails(adata, eval_dataset, output_path, n_per_cluster=10)
+    _plot_cluster_grid(adata, eval_dataset, output_path, n_cols=10)
     print(f"UMAP plots saved to {output_path}/")
 
     save_path = output_path / "embeddings.pkl"
@@ -268,6 +259,6 @@ def run_sampling(args, train_loader, train_meta, device, model, n_tta_passes: in
             "embeddings": embeddings,
             "cluster_labels": cluster_labels,
             "parent_datasets": parent_datasets[:len(embeddings)],
-            "metadata": train_meta,
+            "rel_paths": rel_paths[:len(embeddings)],
         }, f)
     print(f"Embeddings saved to {save_path}")

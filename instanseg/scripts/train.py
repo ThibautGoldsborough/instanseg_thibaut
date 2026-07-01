@@ -975,15 +975,32 @@ def instanseg_training(segmentation_dataset: Dict = None, **kwargs):
             method.update_mask_loss(args.mask_loss_fn)
         method.reset_uncertainty_weights()
 
-        # Leiden cluster-weighted resampling depended on the in-RAM dataset +
-        # the old get_loaders; not yet ported to the lazy zarr pipeline.
-        if args.cluster_sample:
-            raise NotImplementedError(
-                "--cluster_sample (Leiden cluster-weighted sampling) is not yet "
-                "supported by the zarr data pipeline. Use --weight for "
-                "parent-dataset frequency balancing, or set --cluster_sample 0.")
-
+    # Leiden cluster-weighted resampling (ported to the zarr pipeline): cluster
+    # the Train split with the model's own embeddings and inverse-cluster-freq
+    # weight the sampler. --cluster_sample N: cluster once before main training
+    # and refresh every N main-training epochs (0 = off).
     _resample_kwargs = {}
+    if args.cluster_sample and method is not None:
+        from instanseg.utils.sampling import run_sampling
+
+        def _cluster_resample_loader():
+            # Main process runs the model to build embeddings.pkl; all ranks then
+            # rebuild the train loader, which reads the same file → identical
+            # cluster weights → consistent DDP sharding via accelerator.prepare.
+            if is_main:
+                run_sampling(args, device, accelerator.unwrap_model(model))
+            accelerator.wait_for_everyone()
+            new_train, _ = get_zarr_loaders(args)
+            return accelerator.prepare(new_train)
+
+        _resample_kwargs = {'resample_fn': _cluster_resample_loader,
+                            'resample_interval': args.cluster_sample}
+        # Initial clustering for fresh runs (a preemptable resume reuses the
+        # existing embeddings.pkl, already picked up by get_zarr_loaders above).
+        if not _preemptable_resuming:
+            if is_main:
+                print("[cluster_sample] Initial embedding clustering before main training")
+            train_loader = _cluster_resample_loader()
 
     if _preemptable_resuming and _preemptable_checkpoint is not None:
         _ckpt = _preemptable_checkpoint

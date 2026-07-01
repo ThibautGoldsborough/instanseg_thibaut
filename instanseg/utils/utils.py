@@ -148,9 +148,16 @@ def percentile_normalize(img: Union[np.ndarray, torch.Tensor],
         for c in range(img.shape[-1]):
             im_temp = img[::subsampling_factor, ::subsampling_factor, c]
             if img.is_cuda or img.is_mps:
-                (p_min, p_max) = torch.quantile(im_temp,
+                # torch.quantile sorts and errors above ~2**24 elements; cap the
+                # input by strided subsampling (a percentile over millions of
+                # samples is unaffected). Small images pass through unchanged.
+                flat = im_temp.reshape(-1)
+                _MAXQ = 8_000_000
+                if flat.numel() > _MAXQ:
+                    flat = flat[:: (flat.numel() // _MAXQ + 1)]
+                (p_min, p_max) = torch.quantile(flat,
                                                 torch.tensor([percentile / 100, (100 - percentile) / 100],
-                                                             device=im_temp.device))
+                                                             device=flat.device))
             else:
                 (p_min, p_max) = np.percentile(im_temp.cpu(), [percentile, 100 - percentile])
             img[:, :, c] = (img[:, :, c] - p_min) / max(epsilon, p_max - p_min)

@@ -132,6 +132,81 @@ def ensure_zarr_dataset(zarr_root: str | Path, data_dir: str | Path,
     return zarr_root / "manifest.parquet"
 
 
+def canonical_split(s: str) -> str:
+    """Map a split name to the canonical capitalisation used in the manifest/.pth
+    keys ('Train'/'Validation'/'Test'), so `-set test`/`val` etc. just work."""
+    return {"train": "Train", "validation": "Validation", "val": "Validation",
+            "test": "Test"}.get(str(s).strip().lower(), str(s))
+
+
+def _shape_full_label(nuc, cell, target: str, H: int, W: int):
+    """Shape a full-resolution label like data_loader._format_labels: NC -> a
+    (2,H,W) (nucleus, cell) stack with the all-(-1) sentinel for an absent channel;
+    single target -> a (H,W) map (or sentinel)."""
+    sentinel = np.zeros((H, W), np.int32) - 1
+    if "N" in target and "C" in target:
+        return np.stack((nuc if nuc is not None else sentinel,
+                         cell if cell is not None else sentinel))
+    if target == "C":
+        return cell if cell is not None else sentinel
+    return nuc if nuc is not None else sentinel
+
+
+def read_full_items(manifest_path, split: str, source_dataset="all",
+                    target_segmentation: str = "N"):
+    """Read FULL (uncropped) image + label + metadata per item for inference/eval
+    (test.py), matching the legacy ``data_loader._read_images_from_pth`` output.
+
+    Returns ``(images, labels, metas)``: images are native-resolution ``(C,H,W)``
+    numpy arrays in their RAW stored dtype (NOT normalized — the caller normalizes,
+    reproducing the old behaviour); labels follow ``_format_labels`` shaping; metas
+    carry parent_dataset / image_modality / pixel_size / nuclei_channels /
+    channel_names / name. Raises if the split has no items (e.g. ``Test`` was never
+    built — training only builds Train/Validation).
+    """
+    from instanseg.utils.zarr_dataset import open_item
+    root = Path(manifest_path).parent
+    split = canonical_split(split)
+    m = pd.read_parquet(manifest_path)
+    m = m[m["split"] == split]
+    srcs = _source_filter(source_dataset)
+    if srcs is not None:
+        m = m[m["parent_dataset"].map(_norm_src).isin(srcs)]
+    if target_segmentation == "N":
+        m = m[m["has_nucleus"]]
+    elif target_segmentation == "C":
+        m = m[m["has_cell"]]
+    else:
+        m = m[m["has_nucleus"] | m["has_cell"]]
+    if len(m) == 0:
+        raise ValueError(
+            f"No items in the zarr manifest for split={split!r}, source={source_dataset!r}, "
+            f"target={target_segmentation!r}. If this split was never built (training builds "
+            f"only Train/Validation), rebuild including it:\n  uv run python -m "
+            f"instanseg.scripts.build_zarr_dataset --out {root} --all --splits {split}")
+
+    images, labels, metas = [], [], []
+    for _, row in m.iterrows():
+        group, attrs = open_item(root / row["rel_path"])
+        img = np.asarray(group["0"])  # (C, H, W), raw dtype
+        names = set(group["labels"].attrs.get("labels", []))
+        nuc = np.asarray(group["labels/nucleus/0"]).astype(np.int32) if "nucleus" in names else None
+        cell = np.asarray(group["labels/cell/0"]).astype(np.int32) if "cell" in names else None
+        H, W = img.shape[-2:]
+        fn = row.get("file_name")
+        metas.append({
+            "parent_dataset": row["parent_dataset"],
+            "image_modality": attrs.get("modality"),
+            "pixel_size": attrs.get("pixel_size"),
+            "nuclei_channels": attrs.get("nuclei_channels"),
+            "channel_names": attrs.get("channel_names"),
+            "name": fn if isinstance(fn, str) and fn else Path(row["rel_path"]).name,
+        })
+        images.append(img)
+        labels.append(_shape_full_label(nuc, cell, target_segmentation, H, W))
+    return images, labels, metas
+
+
 class ZarrSegmentationDataset(torch.utils.data.Dataset):
     def __init__(self, manifest_path: str | Path, split: str, args, is_train: bool):
         self.root = Path(manifest_path).parent
@@ -247,22 +322,68 @@ class ZarrSegmentationDataset(torch.utils.data.Dataset):
         return image.float(), label
 
 
+def _load_cluster_labels(args, train_data) -> np.ndarray | None:
+    """Per-train-row Leiden cluster labels from ``<output_path>/embeddings.pkl``,
+    aligned to ``train_data.rows`` by manifest ``rel_path``.
+
+    Returns ``None`` (cluster weighting off) when the file is absent, has no
+    labels, or does not line up with the current train split (e.g. the
+    ``--source_dataset`` filter changed since the clustering run) — a safe
+    fall-back to the normal sampler rather than risk misaligned weights.
+    """
+    import pickle
+    import warnings
+    emb_path = Path(args.output_path) / "embeddings.pkl"
+    if not emb_path.exists():
+        return None
+    with open(emb_path, "rb") as f:
+        cd = pickle.load(f)
+    labels = cd.get("cluster_labels")
+    if labels is None:
+        return None
+    labels = np.asarray(labels)
+    train_rel = train_data.rows["rel_path"].tolist()
+    rel_paths = cd.get("rel_paths")
+    if rel_paths is not None and len(rel_paths) == len(labels):
+        rel2c = dict(zip(rel_paths, labels.tolist()))
+        aligned = [rel2c.get(rp) for rp in train_rel]
+        if all(a is not None for a in aligned):
+            return np.asarray(aligned)
+        warnings.warn("[cluster_sample] some train rows are absent from embeddings.pkl "
+                      "(source/filter changed since clustering?); ignoring cluster weights.")
+        return None
+    if len(labels) == len(train_rel):  # positional fall-back (no rel_paths saved)
+        return labels
+    warnings.warn("[cluster_sample] embeddings.pkl does not align with the train split; "
+                  "ignoring cluster weights.")
+    return None
+
+
 def _make_sampler(parent_datasets: list[str], num_samples: int | None,
-                  balance: bool, source_weights: dict[str, float] | None):
+                  balance: bool, source_weights: dict[str, float] | None,
+                  cluster_labels: np.ndarray | None = None):
     """Per-item sampler weighting.
 
-    ``balance`` (the ``-w`` flag) gives each source an equal share via
-    inverse-frequency weighting. ``source_weights`` applies a per-source relative
-    multiplier (default 1.0) on top — so with ``-w`` the source-level sampling
-    probability is proportional to its multiplier (the per-source counts cancel),
-    and without ``-w`` it scales the source's natural (size-proportional) share.
-    Returns a ``WeightedRandomSampler`` when balancing or any multiplier is in
+    ``cluster_labels`` (from ``--cluster_sample``), when given, sets the base
+    weight to inverse cluster frequency (each Leiden cluster gets ~equal sampled
+    mass) and takes priority over ``balance``. Otherwise ``balance`` (the ``-w``
+    flag) gives each source an equal share via inverse-frequency weighting.
+    ``source_weights`` applies a per-source relative multiplier (default 1.0) on
+    top — so with ``-w`` the source-level sampling probability is proportional to
+    its multiplier (the per-source counts cancel), and without ``-w`` it scales
+    the source's natural (size-proportional) share. Returns a
+    ``WeightedRandomSampler`` when clustering, balancing, or any multiplier is in
     play, else ``None`` (caller uses a plain ``RandomSampler`` — unchanged path).
     """
     from torch.utils.data import WeightedRandomSampler
     parents = np.asarray(parent_datasets)
     n = len(parents)
-    if balance:
+    if cluster_labels is not None:
+        labs = np.asarray(cluster_labels)
+        names, counts = np.unique(labs, return_counts=True)
+        cnt = dict(zip(names.tolist(), counts.tolist()))
+        base = np.array([1.0 / cnt[l] for l in labs.tolist()], dtype=np.float64)
+    elif balance:
         names, counts = np.unique(parents, return_counts=True)
         cnt = dict(zip(names.tolist(), counts.tolist()))
         base = np.array([1.0 / cnt[p] for p in parents], dtype=np.float64)
@@ -272,7 +393,7 @@ def _make_sampler(parent_datasets: list[str], num_samples: int | None,
     if has_mult:
         base = base * np.array([float(source_weights.get(_norm_src(p), 1.0))
                                 for p in parents], dtype=np.float64)
-    if not balance and not has_mult:
+    if cluster_labels is None and not balance and not has_mult:
         return None
     total = base.sum()
     if total <= 0:
@@ -295,8 +416,14 @@ def get_zarr_loaders(args):
     balance = bool(getattr(args, "weight", False))
     source_weights = getattr(args, "source_weights", None)
 
+    # Leiden cluster-frequency weighting (train only) when --cluster_sample is on
+    # and a clustering has been run (embeddings.pkl present). Val keeps the plain
+    # source/balance weighting.
+    cluster_labels = (_load_cluster_labels(args, train_data)
+                      if getattr(args, "cluster_sample", 0) else None)
+
     train_sampler = _make_sampler(train_data.parent_datasets, args.length_of_epoch,
-                                  balance, source_weights)
+                                  balance, source_weights, cluster_labels)
     if train_sampler is None:
         train_sampler = (RandomSampler(train_data, num_samples=args.length_of_epoch)
                          if args.length_of_epoch is not None else RandomSampler(train_data))

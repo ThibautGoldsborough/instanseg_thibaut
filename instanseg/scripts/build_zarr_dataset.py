@@ -458,6 +458,71 @@ def incremental_build(out: Path, data_dir: Path = Path("instanseg/datasets"),
     return _rebuild_manifest(out, state)
 
 
+def ensure_splits(out: Path, data_dir: Path = Path("instanseg/datasets"),
+                  monolith_name: str = "segmentation_dataset.pth",
+                  splits: list[str] = ("Test",), requested: list[str] | None = None,
+                  verbose: bool = True) -> Path:
+    """ADD ``splits`` to already-built sources without re-converting other splits.
+
+    The incremental build keys staleness on a source's provenance .pth, not on
+    which splits were built, so it can't add (e.g.) ``Test`` to a source already
+    built for Train/Validation. This builds ONLY ``splits`` for each requested
+    source (None = every built source) and MERGES the rows into the source's
+    existing fragment (replacing those splits if already present), leaving the
+    other splits' items + rows untouched, then rebuilds the manifest.
+    """
+    out = Path(out)
+    data_dir = Path(data_dir)
+    os.environ.setdefault("INSTANSEG_DATASET_PATH", str(data_dir.resolve()))
+    splits = list(splits)
+    parts_by_norm, monolith = resolve_sources(data_dir, monolith_name)
+    state = _load_state(out)
+    if state is None:
+        state = _migrate_from_manifest(out, parts_by_norm, monolith)
+    if not state:
+        raise SystemExit(f"No built sources at {out}; run a normal build first.")
+
+    sources = list(state.keys()) if requested is None else [_norm(s) for s in requested]
+    by_pth: dict[Path, set[str]] = {}
+    for s in sources:
+        if s not in state:
+            if verbose:
+                print(f"[zarr] {s} not built yet — skip (run a full build for it first)", flush=True)
+            continue
+        prov = state[s].get("provenance")
+        p = Path(prov) if prov else parts_by_norm.get(s, monolith)
+        by_pth.setdefault(p, set()).add(s)
+
+    for pth, keep in by_pth.items():
+        if not pth.exists():
+            print(f"[zarr] skipping missing source file {pth}", flush=True)
+            continue
+        if verbose:
+            print(f"[zarr] adding splits {splits} for {sorted(keep)} from {pth.name} ...", flush=True)
+        rows_by_src = _build_one_pth(pth, out, keep, splits, verbose)
+        for s in keep:
+            new_rows = rows_by_src.get(s, [])
+            fp = _frag_path(out, s)
+            if fp.exists():
+                existing = pd.read_parquet(fp)
+                existing = existing[~existing["split"].isin(splits)]  # replace these splits
+                merged = (pd.concat([existing, pd.DataFrame(new_rows)], ignore_index=True)
+                          if new_rows else existing)
+            else:
+                merged = pd.DataFrame(new_rows)
+            _write_fragment(out, s, merged)
+            folder = new_rows[0]["rel_path"].split("/")[0] if new_rows else state.get(s, {}).get("folder")
+            state[s] = {**_provenance(pth), "folder": folder, "n_items": int(len(merged))}
+        _save_state(out, state)
+
+    mp = _rebuild_manifest(out, state)
+    if verbose:
+        m = pd.read_parquet(mp)
+        print(f"\n[zarr] manifest now has {len(m)} items across splits:")
+        print(m.groupby("split").size())
+    return mp
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", required=True, type=Path, help="Output dataset root.")
@@ -470,8 +535,16 @@ def main() -> None:
     ap.add_argument("--datasets", nargs="*", default=None,
                     help="Keep only these parent_dataset values (case-insensitive).")
     ap.add_argument("--splits", nargs="*", default=["Train", "Validation"])
+    ap.add_argument("--add-splits", nargs="*", default=None,
+                    help="ADD these splits (e.g. Test) to already-built sources without "
+                         "re-converting the others. Uses --datasets to limit sources (else all built).")
     ap.add_argument("--limit", type=int, default=None, help="Max items per split (prototype).")
     args = ap.parse_args()
+
+    if args.add_splits:
+        ensure_splits(out=args.out, data_dir=args.data_dir, monolith_name=args.monolith_name,
+                      splits=args.add_splits, requested=args.datasets)
+        return
 
     run_build(out=args.out, data_dir=args.data_dir, monolith_name=args.monolith_name,
               all_sources=args.all,
