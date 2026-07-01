@@ -214,7 +214,8 @@ def run_sampling(args, device, model, n_tta_passes: int = 1):
                     feat = captured["out"]
                     while feat.ndim > 2:
                         feat = feat.mean(dim=-1)
-                    pass_feats.append(feat.cpu().numpy())
+                    # bf16 autocast → cast to fp32 (numpy has no bf16 dtype)
+                    pass_feats.append(feat.detach().float().cpu().numpy())
                 pass_arrays.append(np.concatenate(pass_feats, axis=0))
     finally:
         handle.remove()
